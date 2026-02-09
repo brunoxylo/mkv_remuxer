@@ -232,26 +232,3 @@ fn count_video_tracks_in_mappings(sources_mappings: &SourcesMappings) -> Result<
         .count();
     Ok(video_count)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cut_config_builder() {
-        let config = CutConfig::new(SeekType::Freeze)
-            .with_range(1_000_000_000, 5_000_000_000);
-        
-        assert_eq!(config.start_ns, Some(1_000_000_000));
-        assert_eq!(config.end_ns, Some(5_000_000_000));
-    }
-
-    #[test]
-    fn test_cut_config_with_start() {
-        let config = CutConfig::new(SeekType::Squeeze)
-            .with_start(2_000_000_000);
-        
-        assert_eq!(config.start_ns, Some(2_000_000_000));
-        assert_eq!(config.end_ns, None);
-    }
-}

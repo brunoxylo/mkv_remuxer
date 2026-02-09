@@ -5,6 +5,7 @@ use mkv_element::{ClusterBlock, prelude::*};
 use mkv_element::io::blocking_impl::*;
 use log::debug;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -393,6 +394,15 @@ impl FileSource {
     }
 }
 
+impl fmt::Display for FileSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FileSource",
+        )
+    }
+}
+
 impl Source for FileSource {
     fn get_tracks(&self) -> Result<Tracks> {
         Ok(self.tracks.clone())
@@ -521,3 +531,4 @@ impl Source for FileSource {
         Ok((start_offset, end_offset))
     }
 }
+

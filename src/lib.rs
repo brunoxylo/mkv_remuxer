@@ -16,7 +16,7 @@ pub use source::{Source, SeekType};
 pub use sink::{Sink, FileSink};
 pub use source_mappings::SourcesMappings;
 pub use metling_pot::MeltingPot;
-pub use block_ext::{ClusterBlockExt, LacingMode};
+pub use block_ext::{ClusterBlockExt};
 pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper};
 pub use remuxer::{remux, CutConfig, TrackMapping, RemuxStats};
 

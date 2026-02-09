@@ -4,30 +4,6 @@ use mkv_element::io::blocking_impl::*;
 use std::io::Cursor;
 use crate::Error;
 
-/// Lacing mode used in a block
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LacingMode {
-    /// No lacing
-    None = 0b00,
-    /// Xiph lacing
-    Xiph = 0b01,
-    /// Fixed-size lacing
-    FixedSize = 0b10,
-    /// EBML lacing
-    Ebml = 0b11,
-}
-
-impl LacingMode {
-    fn from_bits(bits: u8) -> Self {
-        match bits & 0b0000_0110 >> 1 {
-            0b00 => LacingMode::None,
-            0b01 => LacingMode::Xiph,
-            0b10 => LacingMode::FixedSize,
-            0b11 => LacingMode::Ebml,
-            _ => unreachable!(),
-        }
-    }
-}
 
 /// Helper function to get VINT length from first byte
 fn vint_length(byte: u8) -> usize {
@@ -59,9 +35,6 @@ pub trait ClusterBlockExt {
     
     /// Check if the invisible flag is set (codec should decode but not display)
     fn is_invisible(&self) -> Result<bool, Error>;
-    
-    /// Get the lacing mode used in this block
-    fn lacing_mode(&self) -> Option<LacingMode>;
     
     /// Check if this block is discardable
     fn is_discardable(&self) -> Result<bool, Error>;
@@ -134,11 +107,6 @@ impl ClusterBlockExt for ClusterBlock {
         let flags = self.flags_byte()?;
         // Invisible flag is bit 3 (0x08)
         Ok((flags & 0x08) != 0)
-    }
-    
-    fn lacing_mode(&self) -> Option<LacingMode> {
-        let flags = self.flags_byte().ok()?;
-        Some(LacingMode::from_bits(flags))
     }
     
     fn is_discardable(&self) -> Result<bool, Error> {
@@ -325,19 +293,5 @@ impl TracksExt for Tracks {
         self.track_entry.iter()
             .find(|te| te.track_number.0 == track_number)
             .map(|te| TrackKind::from_u64(te.track_type.0))
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lacing_mode_from_bits() {
-        assert_eq!(LacingMode::from_bits(0b0000_0000), LacingMode::None);
-        assert_eq!(LacingMode::from_bits(0b0000_0010), LacingMode::Xiph);
-        assert_eq!(LacingMode::from_bits(0b0000_0100), LacingMode::FixedSize);
-        assert_eq!(LacingMode::from_bits(0b0000_0110), LacingMode::Ebml);
     }
 }
