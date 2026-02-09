@@ -1,4 +1,4 @@
-# playground-element
+# rust mkv_remuxer
 
 A high-performance Rust-based MKV/WebM remuxer with advanced seeking and cutting capabilities.  
 Still highly buggy and in experimental state.
