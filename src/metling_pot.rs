@@ -111,3 +111,180 @@ impl MeltingPot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::Sink;
+    use crate::source::Initialized;
+    use crate::source::InputSource;
+    use crate::source::Uninitialized;
+    use crate::test_utils;
+    use std::collections::HashMap;
+
+    fn setup_melting_pot(source: InputSource<Uninitialized>) -> Result<(MeltingPot, u64)> {
+        let source = source.initialize(None)?;
+        let timescale = source.get_target_timecode_scale()?;
+
+        let mut mappings = SourcesMappings::new(vec![source])?;
+        mappings.add_all_tracks()?;
+
+        Ok((MeltingPot::new(mappings), timescale))
+    }
+
+    struct MockSink {
+        num_clusters: usize,
+        num_blocks: usize,
+    }
+
+    impl MockSink {
+        fn new() -> Self {
+            Self {
+                num_clusters: 0,
+                num_blocks: 0,
+            }
+        }
+    }
+
+    impl Sink for MockSink {
+        fn initialize(
+            &mut self,
+            _tracks: &Tracks,
+            _info: &Info,
+            _chapters: Option<&Chapters>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {
+            self.num_clusters += 1;
+            for block in &cluster.blocks {
+                self.num_blocks += 1;
+                let _ = block.track_number()?;
+            }
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_melting_pot_monotonicity() -> Result<()> {
+        for source in test_utils::sources_implementations() {
+            let (mut mp, timescale) = setup_melting_pot(source)?;
+            let mut last_ts_per_track: HashMap<u64, i64> = HashMap::new();
+
+            while let Some(cluster) = mp.generate_next_cluster()? {
+                let cluster_ts = cluster.timestamp.0 as i64;
+                for block in cluster.blocks {
+                    let track_num = block.track_number()?;
+                    let ts = block.timestamp_ns(cluster_ts, timescale)?;
+
+                    if let Some(&last_ts) = last_ts_per_track.get(&track_num) {
+                        assert!(
+                            ts >= last_ts,
+                            "Track {} timestamp regressed: {} -> {}",
+                            track_num,
+                            last_ts,
+                            ts
+                        );
+                    }
+                    last_ts_per_track.insert(track_num, ts);
+                }
+            }
+            assert!(!last_ts_per_track.is_empty(), "No blocks were processed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_melting_pot_non_negative_timestamps() -> Result<()> {
+        for source in test_utils::sources_implementations() {
+            let (mut mp, timescale) = setup_melting_pot(source)?;
+            let mut block_count = 0;
+
+            while let Some(cluster) = mp.generate_next_cluster()? {
+                let cluster_ts = cluster.timestamp.0 as i64;
+                for block in cluster.blocks {
+                    let track_num = block.track_number()?;
+                    let ts = block.timestamp_ns(cluster_ts, timescale)?;
+                    assert!(
+                        ts >= 0,
+                        "Track {} has negative timestamp: {}",
+                        track_num,
+                        ts
+                    );
+                    block_count += 1;
+                }
+            }
+            assert!(block_count > 0, "No blocks were processed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_melting_pot_valid_track_numbers() -> Result<()> {
+        for source in test_utils::sources_implementations() {
+            let (mut mp, _) = setup_melting_pot(source)?;
+            let num_mapped_tracks = mp.sources_mappings.get_current_mappings().len() as u64;
+            let mut seen_tracks = HashMap::new();
+
+            while let Some(cluster) = mp.generate_next_cluster()? {
+                for block in cluster.blocks {
+                    let track_num = block.track_number()?;
+                    assert!(
+                        track_num > 0 && track_num <= num_mapped_tracks,
+                        "Invalid track number {} (max expected: {})",
+                        track_num,
+                        num_mapped_tracks
+                    );
+                    seen_tracks.insert(track_num, true);
+                }
+            }
+            assert_eq!(
+                seen_tracks.len() as u64,
+                num_mapped_tracks,
+                "Not all mapped tracks were seen in output"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_melting_pot_cluster_ordering() -> Result<()> {
+        for source in test_utils::sources_implementations() {
+            let (mut mp, _) = setup_melting_pot(source)?;
+            let mut last_cluster_ts = 0;
+
+            while let Some(cluster) = mp.generate_next_cluster()? {
+                let current_ts = cluster.timestamp.0;
+                assert!(
+                    current_ts >= last_cluster_ts,
+                    "Cluster timestamps are not monotonic: {} -> {}",
+                    last_cluster_ts,
+                    current_ts
+                );
+                last_cluster_ts = current_ts;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_melting_pot_sink_integration() -> Result<()> {
+        for source in test_utils::sources_implementations() {
+            let (mut mp, _) = setup_melting_pot(source)?;
+            let mut mock_sink = MockSink::new();
+
+            while let Some(cluster) = mp.generate_next_cluster()? {
+                mock_sink.write_cluster(&cluster, 0)?;
+            }
+
+            assert!(mock_sink.num_clusters > 0);
+            assert!(mock_sink.num_blocks > 0);
+        }
+        Ok(())
+    }
+}

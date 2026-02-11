@@ -188,6 +188,9 @@ impl InputSource<Initialized> {
 }
 
 #[cfg(test)]
+use crate::test_utils;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::Error;
@@ -208,14 +211,11 @@ mod tests {
     ];
 
     fn test_file_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("test.webm")
+        test_utils::test_file_path()
     }
 
     fn sources_implementations() -> Vec<InputSource<Uninitialized>> {
-        vec![
-            FileSource::new(test_file_path()).unwrap().into(),
-            // Add other Source implementations here as needed
-        ]
+        test_utils::sources_implementations()
     }
 
     fn validate_stream(mut source: InputSource<Initialized>, max_ts_ns: Option<u64>) -> Result<()> {

@@ -1,24 +1,23 @@
-
-
-mod error;
-pub mod source;
-pub mod sink;
-mod source_mappings;
-mod metling_pot;
 mod block_ext;
 mod cluster_warpper;
+mod error;
+mod metling_pot;
 mod remuxer;
+pub mod sink;
+pub mod source;
+mod source_mappings;
+mod test_utils;
 
 // Re-exports
-pub use error::{Error, Result};
-pub use mkv_element;
-pub use source::{Source, SeekType};
-pub use sink::{Sink, FileSink};
-pub use source_mappings::SourcesMappings;
-pub use metling_pot::MeltingPot;
-pub use block_ext::{ClusterBlockExt};
+pub use block_ext::ClusterBlockExt;
 pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper};
-pub use remuxer::{remux, CutConfig, TrackMapping, RemuxStats};
+pub use error::{Error, Result};
+pub use metling_pot::MeltingPot;
+pub use mkv_element;
+pub use remuxer::{CutConfig, RemuxStats, TrackMapping, remux};
+pub use sink::{FileSink, Sink};
+pub use source::{SeekType, Source};
+pub use source_mappings::SourcesMappings;
 
 use mkv_element::prelude::*;
 
