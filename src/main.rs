@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{info, debug, error};
+use log::{debug, error, info};
 use log4rs;
-use mkv_remuxer::*;
-use mkv_remuxer::source::{FileSource, InputSource, SeekType};
 use mkv_remuxer::sink::{FileSink, OutputSink};
+use mkv_remuxer::source::{FileSource, InputSource, SeekType};
+use mkv_remuxer::*;
 
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_PKG_NAME"))]
@@ -71,7 +71,9 @@ fn init_logging(verbose: bool) -> Result<()> {
 
     let console = ConsoleAppender::builder()
         .target(Target::Stderr)
-        .encoder(Box::new(PatternEncoder::new("{d(%Y-%m-%d %H:%M:%S)} [{l}] {m}{n}")))
+        .encoder(Box::new(PatternEncoder::new(
+            "{d(%Y-%m-%d %H:%M:%S)} [{l}] {m}{n}",
+        )))
         .build();
 
     let config = Config::builder()
@@ -104,11 +106,16 @@ fn main() -> Result<()> {
         "squeeze" => SeekType::Squeeze,
         "snap" => SeekType::SnapNearestKeyframe,
         "dirty" => SeekType::DirtyCut,
-        _ => anyhow::bail!("Invalid seek mode: {}. Valid options: freeze, squeeze, snap, dirty", args.seek_mode),
+        _ => anyhow::bail!(
+            "Invalid seek mode: {}. Valid options: freeze, squeeze, snap, dirty",
+            args.seek_mode
+        ),
     };
 
     // Parse start time
-    let start_ns = args.start.as_ref()
+    let start_ns = args
+        .start
+        .as_ref()
         .map(|s| parse_time(s))
         .transpose()
         .context("Failed to parse start time")?;
@@ -148,8 +155,10 @@ fn main() -> Result<()> {
     let track_mappings = if !args.mappings.is_empty() {
         let mut mappings = Vec::new();
         for mapping_str in &args.mappings {
-            mappings.push(parse_mapping(mapping_str)
-                .with_context(|| format!("Failed to parse mapping: {}", mapping_str))?);
+            mappings.push(
+                parse_mapping(mapping_str)
+                    .with_context(|| format!("Failed to parse mapping: {}", mapping_str))?,
+            );
         }
         Some(mappings)
     } else {
@@ -183,14 +192,18 @@ fn main() -> Result<()> {
         cut_config,
         track_mappings,
         args.timescale,
-    ).context("Remux operation failed")?;
+    )
+    .context("Remux operation failed")?;
 
     // Print statistics
     info!("✓ Remux completed successfully!");
     info!("  Blocks processed: {}", stats.blocks_processed);
     info!("  Output tracks: {}", stats.track_count);
     if stats.duration_ns > 0 {
-        info!("  Duration: {:.3}s", stats.duration_ns as f64 / 1_000_000_000.0);
+        info!(
+            "  Duration: {:.3}s",
+            stats.duration_ns as f64 / 1_000_000_000.0
+        );
     }
 
     Ok(())
@@ -200,61 +213,54 @@ fn main() -> Result<()> {
 /// Supports formats: "5s", "1m30s", "90", "1:30", "1:30.5"
 fn parse_time(time_str: &str) -> Result<u64> {
     let time_str = time_str.trim();
-    
+
     // Try MM:SS or MM:SS.mmm format
     if time_str.contains(':') {
         let parts: Vec<&str> = time_str.split(':').collect();
         if parts.len() == 2 {
-            let minutes: f64 = parts[0].parse()
-                .context("Invalid minutes in time format")?;
-            let seconds: f64 = parts[1].parse()
-                .context("Invalid seconds in time format")?;
+            let minutes: f64 = parts[0].parse().context("Invalid minutes in time format")?;
+            let seconds: f64 = parts[1].parse().context("Invalid seconds in time format")?;
             let total_seconds = minutes * 60.0 + seconds;
             return Ok((total_seconds * 1_000_000_000.0) as u64);
         } else if parts.len() == 3 {
             // HH:MM:SS format
-            let hours: f64 = parts[0].parse()
-                .context("Invalid hours in time format")?;
-            let minutes: f64 = parts[1].parse()
-                .context("Invalid minutes in time format")?;
-            let seconds: f64 = parts[2].parse()
-                .context("Invalid seconds in time format")?;
+            let hours: f64 = parts[0].parse().context("Invalid hours in time format")?;
+            let minutes: f64 = parts[1].parse().context("Invalid minutes in time format")?;
+            let seconds: f64 = parts[2].parse().context("Invalid seconds in time format")?;
             let total_seconds = hours * 3600.0 + minutes * 60.0 + seconds;
             return Ok((total_seconds * 1_000_000_000.0) as u64);
         }
     }
-    
+
     // Try formats with unit suffixes: "5s", "1m30s", etc.
     if time_str.contains('s') || time_str.contains('m') || time_str.contains('h') {
         let mut total_ns = 0u64;
         let mut current_num = String::new();
-        
+
         for ch in time_str.chars() {
             if ch.is_ascii_digit() || ch == '.' {
                 current_num.push(ch);
             } else if ch == 'h' {
-                let hours: f64 = current_num.parse()
-                    .context("Invalid number before 'h'")?;
+                let hours: f64 = current_num.parse().context("Invalid number before 'h'")?;
                 total_ns += (hours * 3600.0 * 1_000_000_000.0) as u64;
                 current_num.clear();
             } else if ch == 'm' {
-                let minutes: f64 = current_num.parse()
-                    .context("Invalid number before 'm'")?;
+                let minutes: f64 = current_num.parse().context("Invalid number before 'm'")?;
                 total_ns += (minutes * 60.0 * 1_000_000_000.0) as u64;
                 current_num.clear();
             } else if ch == 's' {
-                let seconds: f64 = current_num.parse()
-                    .context("Invalid number before 's'")?;
+                let seconds: f64 = current_num.parse().context("Invalid number before 's'")?;
                 total_ns += (seconds * 1_000_000_000.0) as u64;
                 current_num.clear();
             }
         }
-        
+
         return Ok(total_ns);
     }
-    
+
     // Try plain number (assume seconds)
-    let seconds: f64 = time_str.parse()
+    let seconds: f64 = time_str
+        .parse()
         .context("Invalid time format. Use formats like: 5s, 1m30s, 90, 1:30")?;
     Ok((seconds * 1_000_000_000.0) as u64)
 }
@@ -265,12 +271,14 @@ fn parse_mapping(mapping_str: &str) -> Result<TrackMapping> {
     if parts.len() != 2 {
         anyhow::bail!("Invalid mapping format. Expected 'source:track' (e.g., '0:1')");
     }
-    
-    let source_index: u64 = parts[0].parse()
+
+    let source_index: u64 = parts[0]
+        .parse()
         .context("Invalid source index in mapping")?;
-    let track_number: u64 = parts[1].parse()
+    let track_number: u64 = parts[1]
+        .parse()
         .context("Invalid track number in mapping")?;
-    
+
     Ok((source_index, track_number))
 }
 
@@ -309,4 +317,3 @@ mod tests {
         assert_eq!(track, 1);
     }
 }
-

@@ -1,8 +1,7 @@
 use crate::Result;
 use mkv_element::prelude::*;
-use std::marker::PhantomData;
 use std::fmt::Display;
-
+use std::marker::PhantomData;
 
 mod file_source;
 pub use file_source::FileSource;
@@ -19,8 +18,8 @@ pub enum SeekType {
     /// (fast, not exact, nice) Seek to the nearest keyframe before or after the target timestamp
     SnapNearestKeyframe,
     /// (slow on client, exact, nice) Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 0
-    Squeeze, 
-     /// (fast, exact, ugly) Move the next keyframe to timestamp 0 (while omitting frames in between), freezing the video from start until the original next keyframes position
+    Squeeze,
+    /// (fast, exact, ugly) Move the next keyframe to timestamp 0 (while omitting frames in between), freezing the video from start until the original next keyframes position
     Freeze,
     // (fast, exact, ugly) Just cut at the exact timestamp, without respecting keyframe boundaries (may cause playback issues)
     DirtyCut,
@@ -30,15 +29,15 @@ pub trait Source: Display {
     /// Get the track information from the source
     /// Returns the Tracks element containing all audio/video/subtitle tracks
     fn get_tracks(&self) -> Result<Tracks>;
-    
+
     /// Get chapter information from the source
     /// Returns None if the source has no chapters
     fn get_chapters(&self) -> Result<Option<Chapters>>;
-    
+
     /// Get segment metadata/info from the source
     /// Returns the Info element with duration, title, timestamps, etc.
     fn get_info(&self) -> Result<Info>;
-    
+
     /// Get the next block/frame of data from the source
     /// Returns None when end of stream is reached
     fn get_next_cluster(&mut self) -> Result<Option<Cluster>>;
@@ -50,9 +49,14 @@ pub trait Source: Display {
     fn get_target_timecode_scale(&self) -> Result<u64>;
     fn initialize(&mut self, output_time_scale: Option<u64>) -> Result<()>;
     /// set start and end position in ns for the source (for seeking)
-    /// Returns the offset to the reference keyframe for start and end position
-    fn initialize_with_cut(&mut self, output_time_scale: Option<u64>, seek_type: SeekType, start_ns: Option<u64>, end_ns: Option<u64>) -> Result<(u64, u64)>;
-    
+    /// Returns the offset to the reference keyframe from the specified start position in ns
+    fn initialize_with_cut(
+        &mut self,
+        output_time_scale: Option<u64>,
+        seek_type: SeekType,
+        start_ns: Option<u64>,
+        end_ns: Option<u64>,
+    ) -> Result<i64>;
 }
 
 /// Wrapper struct that uses the typestate pattern to prevent misuse
@@ -76,33 +80,36 @@ impl InputSource<Uninitialized> {
             _state: PhantomData,
         }
     }
-    
+
     /// Create multiple uninitialized input sources from a vec of concrete Source implementations
     pub fn from_vec<T: Source + 'static>(sources: Vec<T>) -> Vec<Self> {
-        sources.into_iter()
+        sources
+            .into_iter()
             .map(|source| Self::new(Box::new(source)))
             .collect()
     }
-    
+
     /// Create multiple uninitialized input sources from a vec of boxed trait objects
     pub fn from_boxed_vec(sources: Vec<Box<dyn Source>>) -> Vec<Self> {
-        sources.into_iter()
-            .map(Self::new)
-            .collect()
+        sources.into_iter().map(Self::new).collect()
     }
-    
+
     /// Create multiple uninitialized input sources from an array of concrete Source implementations
     pub fn from_array<T: Source + 'static, const N: usize>(sources: [T; N]) -> Vec<Self> {
-        sources.into_iter()
+        sources
+            .into_iter()
             .map(|source| Self::new(Box::new(source)))
             .collect()
     }
 
     /// Initialize the source with optional custom time scale
-    pub fn initialize(mut self, output_time_scale: Option<u64>) -> Result<InputSource<Initialized>> {
+    pub fn initialize(
+        mut self,
+        output_time_scale: Option<u64>,
+    ) -> Result<InputSource<Initialized>> {
         // Delegate to the inner Source implementation
         self.inner.initialize(output_time_scale)?;
-        
+
         // Transition to initialized state
         Ok(InputSource {
             inner: self.inner,
@@ -117,10 +124,12 @@ impl InputSource<Uninitialized> {
         seek_type: SeekType,
         start_ns: Option<u64>,
         end_ns: Option<u64>,
-    ) -> Result<(InputSource<Initialized>, (u64, u64))> {
+    ) -> Result<(InputSource<Initialized>, i64)> {
         // Delegate to the inner Source implementation
-        let offsets = self.inner.initialize_with_cut(time_scale, seek_type, start_ns, end_ns)?;
-        
+        let offsets = self
+            .inner
+            .initialize_with_cut(time_scale, seek_type, start_ns, end_ns)?;
+
         // Transition to initialized state
         Ok((
             InputSource {
@@ -151,27 +160,27 @@ impl InputSource<Initialized> {
     pub fn get_tracks(&self) -> Result<Tracks> {
         self.inner.get_tracks()
     }
-    
+
     /// Get chapter information from the source
     pub fn get_chapters(&self) -> Result<Option<Chapters>> {
         self.inner.get_chapters()
     }
-    
+
     /// Get segment metadata/info from the source
     pub fn get_info(&self) -> Result<Info> {
         self.inner.get_info()
     }
-    
+
     /// Get the next block/frame of data from the source
     pub fn get_next_cluster(&mut self) -> Result<Option<Cluster>> {
         self.inner.get_next_cluster()
     }
-    
+
     /// Get the source's timecode scale (nanoseconds per time unit)
     pub fn get_own_timecode_scale(&self) -> Result<u64> {
         self.inner.get_own_timecode_scale()
     }
-    
+
     /// Get the target timecode scale for output (nanoseconds per time unit)
     pub fn get_target_timecode_scale(&self) -> Result<u64> {
         self.inner.get_target_timecode_scale()
@@ -181,15 +190,15 @@ impl InputSource<Initialized> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_ext::{ClusterBlockExt, TrackKind, TracksExt};
     use crate::Error;
+    use crate::block_ext::{ClusterBlockExt, TrackKind, TracksExt};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     const ONE_SEC_NS: u64 = 1_000_000_000;
     const CUT_START_NS: u64 = 5_000_000_000;
     const CUT_END_NS: u64 = 15_000_000_000;
-    const CUT_MAX_NS: u64 = 10_000_000_000;
+    const CUT_MAX_NS: u64 = CUT_END_NS - CUT_START_NS;
 
     const SEEK_TYPES: [SeekType; 4] = [
         SeekType::Freeze,
@@ -233,12 +242,7 @@ mod tests {
                 saw_audio_video = true;
 
                 let ts = block.timestamp_ns(cluster_ticks, timecode_scale)?;
-                assert!(
-                    ts >= 0,
-                    "track {} has negative timestamp {}",
-                    track_num,
-                    ts
-                );
+                assert!(ts >= 0, "track {} has negative timestamp {}", track_num, ts);
                 if let Some(prev) = last_by_track.get(&track_num) {
                     assert!(
                         ts >= *prev,
@@ -253,7 +257,7 @@ mod tests {
 
                 if let Some(max_ts) = max_ts_ns {
                     assert!(
-                        ts as u64 <= max_ts+100_000_000, // allow 100ms tolerance for cut accuracy
+                        ts as u64 <= max_ts + 100_000_000, // allow 100ms tolerance for cut accuracy
                         "track {} timestamp {} exceeds {}",
                         track_num,
                         ts,
@@ -280,7 +284,7 @@ mod tests {
     fn test_source_monotonic_and_start_times() -> Result<()> {
         assert!(test_file_path().exists(), "missing test.webm in repo root");
 
-        for mut source in sources_implementations() {
+        for source in sources_implementations() {
             let source = source.initialize(None)?;
             let source_str = source.to_string();
             validate_stream(source, None)
@@ -298,13 +302,17 @@ mod tests {
             println!("Testing seek type: {:?}", seek_type);
             for mut source in sources_implementations() {
                 print!("  Source Implementation: {}... ", source);
-                let (source, _) = source.initialize_with_cut(
+                let (source, offset) = source.initialize_with_cut(
                     None,
                     seek_type.clone(),
                     Some(CUT_START_NS),
                     Some(CUT_END_NS),
                 )?;
-                validate_stream(source, Some(CUT_MAX_NS))?;
+                let mut max_ts = CUT_MAX_NS;
+                if matches!(seek_type, SeekType::SnapNearestKeyframe) {
+                    max_ts = (max_ts as i64 - offset) as u64;
+                }
+                validate_stream(source, Some(max_ts))?;
             }
         }
 

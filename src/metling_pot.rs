@@ -1,9 +1,9 @@
-use mkv_element::prelude::*;
-use crate::{ClusterBlockExt, Cluster, ClusterReadWrapper, ClusterWriteWrapper, Result, SourcesMappings};
-use log::{debug, warn};
 use crate::Error;
-
-
+use crate::{
+    Cluster, ClusterBlockExt, ClusterReadWrapper, ClusterWriteWrapper, Result, SourcesMappings,
+};
+use log::{debug, warn};
+use mkv_element::prelude::*;
 
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
@@ -17,9 +17,9 @@ impl MeltingPot {
         let initial_clusters = (0..num_sources).map(|_| None).collect();
         Self {
             sources_mappings,
-            clusters: initial_clusters
+            clusters: initial_clusters,
         }
-    }       
+    }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
         let timescale = self.sources_mappings.get_time_scale()?;
         let mut output_cluster = ClusterWriteWrapper::new(0, timescale);
@@ -27,10 +27,13 @@ impl MeltingPot {
         loop {
             iteration += 1;
             if iteration % 10000 == 0 {
-                warn!("MeltingPot loop iteration {}, this might indicate a problem", iteration);
+                warn!(
+                    "MeltingPot loop iteration {}, this might indicate a problem",
+                    iteration
+                );
             }
             let mut all_sources_finished = true;
-            // Get the next cluster from each source if not already 
+            // Get the next cluster from each source if not already
             for (index, source) in self.sources_mappings.sources.iter_mut().enumerate() {
                 if self.clusters[index].is_none() {
                     self.clusters[index] = source.get_next_cluster()?.map(ClusterReadWrapper::new);
@@ -49,7 +52,7 @@ impl MeltingPot {
                 }
             }
             // find the block with the lowest timestamp among all input clusters
-            let mut lowest_timestamp_ns :i64 = i64::MAX;
+            let mut lowest_timestamp_ns: i64 = i64::MAX;
             let mut lowest_cluster_index = None;
             for (index, cluster_wrapper) in self.clusters.iter_mut().enumerate() {
                 if let Some(cluster) = cluster_wrapper {
@@ -69,9 +72,12 @@ impl MeltingPot {
                         Err(Error::InvalidBlockData(_)) => {
                             *cluster_wrapper = None; // treat cluster with invalid block data as finished
                             debug!("Cluster {} reached end", index);
-                        }   
+                        }
                         Err(e) => {
-                            warn!("Failed to get current absolute timestamp for cluster {}: {:?}", index, e);
+                            warn!(
+                                "Failed to get current absolute timestamp for cluster {}: {:?}",
+                                index, e
+                            );
                         }
                     }
                 }
@@ -82,7 +88,10 @@ impl MeltingPot {
                     if let Some(block) = input_cluster.next() {
                         let input_track_index = block.track_number()?;
                         // only add the block to the output cluster if its track is mapped to an output track (otherwise we just skip it)
-                        if let Some(output_trackindex) = self.sources_mappings.is_track_mapped(lowest_index as u64, input_track_index) {
+                        if let Some(output_trackindex) = self
+                            .sources_mappings
+                            .is_track_mapped(lowest_index as u64, input_track_index)
+                        {
                             // yes we are writing into the input clusters buffer, but this is fine since we will never read from it again and it saves us from having to clone the block
                             block.set_track_number(output_trackindex)?;
                             output_cluster.add_block(&block, lowest_timestamp_ns)?
@@ -94,7 +103,10 @@ impl MeltingPot {
                 }
             } else {
                 // No valid block found but sources aren't finished - this shouldn't happen
-                warn!("No valid block found in iteration {}, all_sources_finished={}", iteration, all_sources_finished);
+                warn!(
+                    "No valid block found in iteration {}, all_sources_finished={}",
+                    iteration, all_sources_finished
+                );
             }
         }
     }
