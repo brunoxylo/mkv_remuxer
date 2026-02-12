@@ -140,7 +140,8 @@ impl ClusterExt for Cluster {
             .filter_map(|(i, block)| {
                 if let Ok(true) = block.is_keyframe() {
                     if let Ok(block_track_num) = block.track_number() {
-                        if block_track_num == track_num { // is block for the right track?
+                        if block_track_num == track_num {
+                            // is block for the right track?
                             if let Ok(block_ts_ns) =
                                 block.timestamp_ns(self.timestamp.0 as i64, timecode_scale)
                             {

@@ -8,6 +8,7 @@ use mkv_element::prelude::*;
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
     clusters: Vec<Option<ClusterReadWrapper>>,
+    cluster_info: Vec<(u64, u64)>, // (timestamp in ticks, size in bytes)
 }
 
 impl MeltingPot {
@@ -18,12 +19,14 @@ impl MeltingPot {
         Self {
             sources_mappings,
             clusters: initial_clusters,
+            cluster_info: Vec::new(),
         }
     }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
         let timescale = self.sources_mappings.get_time_scale()?;
-        let mut output_cluster = ClusterWriteWrapper::new(0, timescale);
         let mut iteration = 0;
+        let mut output_cluster: Option<ClusterWriteWrapper> = None;
+
         loop {
             iteration += 1;
             if iteration % 10000 == 0 {
@@ -42,15 +45,25 @@ impl MeltingPot {
                     all_sources_finished = false;
                 }
             }
+
             // condition to exit loop
-            if all_sources_finished || output_cluster.is_limit_reached() {
-                if output_cluster.is_empty() {
+            if all_sources_finished {
+                if let Some(o_cluster) = output_cluster {
+                    if o_cluster.is_empty() {
+                        debug!("No more clusters available");
+                        return Ok(None);
+                    } else {
+                        let timestamp = o_cluster.cluster().timestamp.0;
+                        let size = o_cluster.size_bytes();
+                        self.cluster_info.push((timestamp, size));
+                        return Ok(Some(o_cluster.finish()));
+                    }
+                } else {
                     debug!("No more clusters available");
                     return Ok(None);
-                } else {
-                    return Ok(Some(output_cluster.finish()));
                 }
             }
+
             // find the block with the lowest timestamp among all input clusters
             let mut lowest_timestamp_ns: i64 = i64::MAX;
             let mut lowest_cluster_index = None;
@@ -82,32 +95,113 @@ impl MeltingPot {
                     }
                 }
             }
-            // add the block with the lowest timestamp to the output cluster
-            if let Some(lowest_index) = lowest_cluster_index {
-                if let Some(input_cluster) = &mut self.clusters[lowest_index] {
-                    if let Some(block) = input_cluster.next() {
-                        let input_track_index = block.track_number()?;
-                        // only add the block to the output cluster if its track is mapped to an output track (otherwise we just skip it)
-                        if let Some(output_trackindex) = self
-                            .sources_mappings
-                            .is_track_mapped(lowest_index as u64, input_track_index)
-                        {
-                            // yes we are writing into the input clusters buffer, but this is fine since we will never read from it again and it saves us from having to clone the block
-                            block.set_track_number(output_trackindex)?;
-                            output_cluster.add_block(&block, lowest_timestamp_ns)?
-                        };
-                    } else {
-                        // No more blocks in this cluster, set to None to fetch next cluster from source in next iteration
-                        self.clusters[lowest_index] = None;
-                    }
-                }
-            } else {
-                // No valid block found but sources aren't finished - this shouldn't happen
-                warn!(
-                    "No valid block found in iteration {}, all_sources_finished={}",
-                    iteration, all_sources_finished
-                );
+            // not yet initialized
+            if output_cluster.is_none() && lowest_cluster_index.is_some() {
+                output_cluster = Some(ClusterWriteWrapper::new(
+                    lowest_timestamp_ns as u64,
+                    timescale,
+                ));
             }
+
+            if let Some(mut o_cluster) = output_cluster.take() {
+                // add the block with the lowest timestamp to the output cluster
+                if let Some(lowest_index) = lowest_cluster_index {
+                    if let Some(input_cluster) = &mut self.clusters[lowest_index] {
+                        if let Some(block) = input_cluster.next() {
+                            let input_track_index = block.track_number()?;
+                            // only add the block to the output cluster if its track is mapped to an output track (otherwise we just skip it)
+                            if let Some(output_trackindex) = self
+                                .sources_mappings
+                                .is_track_mapped(lowest_index as u64, input_track_index)
+                            {
+                                // yes we are writing into the input clusters buffer, but this is fine since we will never read from it again and it saves us from having to clone the block
+                                block.set_track_number(output_trackindex)?;
+                                match o_cluster.add_block(&block, lowest_timestamp_ns) {
+                                    Ok(_) => {}
+                                    Err(Error::ClusterIsFull(_)) => {
+                                        // Cluster is full, break the inner loop and start a new cluster
+                                        let timestamp = o_cluster.cluster().timestamp.0;
+                                        let size = o_cluster.size_bytes();
+                                        self.cluster_info.push((timestamp, size));
+                                        return Ok(Some(o_cluster.finish()));
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            };
+                        } else {
+                            // No more blocks in this cluster, set to None to fetch next cluster from source in next iteration
+                            self.clusters[lowest_index] = None;
+                        }
+                    }
+                } else {
+                    // No valid block found but sources aren't finished - this shouldn't happen
+                    warn!(
+                        "No valid block found in iteration {}, all_sources_finished={}",
+                        iteration, all_sources_finished
+                    );
+                }
+                //put it back by we dont want to recreate it
+                output_cluster = Some(o_cluster);
+            }
+        }
+    }
+    /// Generate cues for the clusters that have been generated so far.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster_start_offset` - The offset of the first cluster in the output file.
+    /// * `max_lenght_bytes` - The maximum length of the cues in bytes. If None, all clusters will be included.
+    pub fn get_cues(&self, cluster_start_offset: u64, max_lenght_bytes: Option<u64>) -> Cues {
+        let mut cues = Cues {
+            crc32: None,
+            cue_point: Vec::new(),
+            void: None,
+        };
+        let mut current_offset = cluster_start_offset;
+        for (timestamp, size) in &self.cluster_info {
+            let mut cue_point = CuePoint {
+                crc32: None,
+                cue_time: CueTime(*timestamp),
+                cue_track_positions: Vec::new(),
+                void: None,
+            };
+
+            // Add track position for the first mapped track (convention for cues)
+            // or just track 1 if we don't know better.
+            // Usually, track 1 is the video track in MKV.
+            cue_point.cue_track_positions.push(CueTrackPositions {
+                cue_track: CueTrack(1),
+                cue_cluster_position: CueClusterPosition(current_offset),
+                cue_relative_position: None,
+                cue_duration: None,
+                cue_block_number: None,
+                cue_codec_state: CueCodecState(0),
+                cue_reference: Vec::new(),
+                void: None,
+                crc32: None,
+            });
+            if let Some(max_lenght_bytes) = max_lenght_bytes {
+                if current_offset + size > cluster_start_offset + max_lenght_bytes {
+                    break;
+                }
+            }
+            cues.cue_point.push(cue_point);
+            current_offset += size;
+        }
+        cues
+    }
+    pub fn get_current_duration(&self) -> u64 {
+        self.cluster_info.iter().map(|(_, size)| size).sum()
+    }
+    pub fn get_final_duration(&self) -> Option<u64> {
+        let mut max_duration_ns = 0;
+        for source in &self.sources_mappings.sources {
+            max_duration_ns = max_duration_ns.max(source.get_duration().unwrap_or(0));
+        }
+        if max_duration_ns > 0 {
+            Some(max_duration_ns)
+        } else {
+            None
         }
     }
 }
@@ -162,6 +256,9 @@ mod tests {
                 self.num_blocks += 1;
                 let _ = block.track_number()?;
             }
+            Ok(())
+        }
+        fn write_cues(&mut self, cues: &Cues) -> Result<()> {
             Ok(())
         }
 
@@ -284,6 +381,64 @@ mod tests {
 
             assert!(mock_sink.num_clusters > 0);
             assert!(mock_sink.num_blocks > 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_melting_pot_cluster_limits() -> Result<()> {
+        use crate::cluster_warpper::CLUSTER_MAX_DURATION_NS;
+        use crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES;
+
+        let mut num_clusters = 0;
+        let mut block_counter = 0;
+
+        for source in test_utils::sources_implementations() {
+            let (mut mp, timescale) = setup_melting_pot(source)?;
+
+            while let Some(cluster) = mp.generate_next_cluster()? {
+                num_clusters += 1;
+                let cluster_ts = cluster.timestamp.0 as i64;
+                let mut min_ts = i64::MAX;
+                let mut max_ts = i64::MIN;
+                let mut bytes_counter = 0;
+
+                for block in &cluster.blocks {
+                    let ts = block.timestamp_ns(cluster_ts, timescale)?;
+                    min_ts = min_ts.min(ts);
+                    max_ts = max_ts.max(ts);
+                    bytes_counter += block.get_data()?.len() as u64;
+                    block_counter += 1;
+                }
+
+                if !cluster.blocks.is_empty() {
+                    let duration = (max_ts - min_ts) as u64;
+                    assert!(
+                        duration <= CLUSTER_MAX_DURATION_NS,
+                        "Cluster duration {}ns exceeds limit {}ns",
+                        duration,
+                        CLUSTER_MAX_DURATION_NS
+                    );
+                }
+
+                // Size check - we can't easily check encoded size without re-encoding,
+                // but we know MeltingPot uses ClusterWriteWrapper which tracks it.
+                // For this test, we'll just check duration as it's the most critical limit.
+                assert!(
+                    bytes_counter <= CLUSTER_MAX_SIZE_BYTES,
+                    "Cluster size {} bytes exceeds limit {} bytes",
+                    bytes_counter,
+                    CLUSTER_MAX_SIZE_BYTES
+                );
+            }
+            assert!(block_counter > 0);
+            assert!(num_clusters > 0);
+            assert!(
+                block_counter / num_clusters > 5,
+                "Too few blocks per cluster: {} / {}",
+                block_counter,
+                num_clusters
+            );
         }
         Ok(())
     }

@@ -1,8 +1,8 @@
-use crate::{Result, Error};
-use crate::source::{SeekType, InputSource, Uninitialized};
-use crate::sink::OutputSink;
-use crate::source_mappings::SourcesMappings;
 use crate::metling_pot::MeltingPot;
+use crate::sink::OutputSink;
+use crate::source::{InputSource, SeekType, Uninitialized};
+use crate::source_mappings::SourcesMappings;
+use crate::{Error, Result};
 use log::{debug, info, warn};
 
 /// Configuration for cutting/seeking behavior
@@ -54,47 +54,47 @@ pub struct RemuxStats {
 }
 
 /// Remux multiple input sources into a single output sink
-/// 
+///
 /// # Arguments
 /// * `sources` - List of uninitialized input sources
 /// * `output_sink` - Uninitialized output sink
 /// * `cut_config` - Optional cut configuration (start/end times and seek type)
 /// * `mappings` - Optional track mappings. If None, defaults to first video + all audio/subtitle tracks
 /// * `target_timescale` - Optional target timescale for output (nanoseconds per tick)
-/// 
+///
 /// # Returns
 /// * `RemuxStats` - Statistics about the remuxing operation
-/// 
+///
 /// # Errors
 /// * Returns error if SnapNearestKeyframe is used with more than 1 output video stream
 /// * Returns error if sources have incompatible timescales
 /// * Returns error if track mappings are invalid
-/// 
+///
 /// # Example
 /// ```no_run
 /// use playground_element::*;
 /// use playground_element::source::{FileSource, InputSource};
 /// use playground_element::sink::{FileSink, OutputSink};
-/// 
+///
 /// # fn main() -> Result<()> {
 /// // Create input sources
 /// let source1 = InputSource::from(FileSource::new("input1.mkv")?);
 /// let source2 = InputSource::from(FileSource::new("input2.mkv")?);
-/// 
+///
 /// // Create output sink
 /// let output = OutputSink::from(FileSink::new("output.mkv")?);
-/// 
+///
 /// // Simple remux with default mappings (first video + all audio/subtitle)
 /// let stats = remux(vec![source1, source2], output, None, None, None)?;
 /// println!("Processed {} blocks", stats.blocks_processed);
-/// 
+///
 /// // Remux with cutting
 /// let source3 = InputSource::from(FileSource::new("input3.mkv")?);
 /// let output2 = OutputSink::from(FileSink::new("output2.mkv")?);
 /// let cut = CutConfig::new(SeekType::Freeze)
 ///     .with_range(5_000_000_000, 15_000_000_000); // 5s to 15s
 /// let stats = remux(vec![source3], output2, Some(cut), None, None)?;
-/// 
+///
 /// // Remux with custom track mappings
 /// // Map track 1 from source 0 and track 2 from source 1
 /// let mappings = vec![(0, 1), (1, 2)];
@@ -112,10 +112,10 @@ pub fn remux(
     target_timescale: Option<u64>,
 ) -> Result<RemuxStats> {
     debug!("Starting remux process with {} sources", sources.len());
-    
+
     // Step 1: Initialize sources
     let mut initialized_sources = Vec::new();
-    
+
     for (idx, source) in sources.into_iter().enumerate() {
         debug!("Initializing source {}", idx);
         let initialized = if let Some(ref cut_config) = cut_config {
@@ -162,7 +162,10 @@ pub fn remux(
         if matches!(cut_config.seek_type, SeekType::SnapNearestKeyframe) {
             let video_count = count_video_tracks_in_mappings(&sources_mappings)?;
             if video_count > 1 {
-                warn!("SnapNearestKeyframe cannot be used with {} video streams", video_count);
+                warn!(
+                    "SnapNearestKeyframe cannot be used with {} video streams",
+                    video_count
+                );
                 return Err(Error::InvalidConfig(format!(
                     "SnapNearestKeyframe seek type cannot be used with {} video streams (>1). \
                     Use Squeeze, Freeze, or DirtyCut instead, or reduce to single video track.",
@@ -174,19 +177,22 @@ pub fn remux(
 
     // Step 5: Get output tracks metadata
     let output_tracks = sources_mappings.get_output_tracks_metadata()?;
-    debug!("Output will have {} tracks", output_tracks.track_entry.len());
-    
+    debug!(
+        "Output will have {} tracks",
+        output_tracks.track_entry.len()
+    );
+
     // Step 6: Get info and chapters from first source
-    let info = sources_mappings.sources.first()
+    let info = sources_mappings
+        .sources
+        .first()
         .ok_or_else(|| Error::MissingElement("No sources available".to_string()))?
         .get_info()?;
-    
-    let chapters = sources_mappings.sources.first()
-        .and_then(|s| s.get_chapters().ok().flatten());
 
-    // Step 7: Initialize output sink
-    debug!("Initializing output sink");
-    let mut output_sink = output_sink.initialize(&output_tracks, &info, chapters.as_ref())?;
+    let chapters = sources_mappings
+        .sources
+        .first()
+        .and_then(|s| s.get_chapters().ok().flatten());
 
     // Step 8: Create MeltingPot and process clusters
     debug!("Starting cluster processing");
@@ -194,13 +200,22 @@ pub fn remux(
     let mut blocks_processed = 0u64;
     let mut clusters_written = 0u64;
 
+    // Step 7: Initialize output sink
+    let duration = melting_pot.get_final_duration().unwrap_or(0);
+    debug!("Initializing output sink");
+    let mut output_sink =
+        output_sink.initialize_simple(&output_tracks, duration, info.timestamp_scale.0)?;
+
     loop {
         match melting_pot.generate_next_cluster()? {
             Some(cluster) => {
                 blocks_processed += cluster.blocks.len() as u64;
                 clusters_written += 1;
                 if clusters_written % 100 == 0 {
-                    debug!("Processed {} clusters, {} blocks", clusters_written, blocks_processed);
+                    debug!(
+                        "Processed {} clusters, {} blocks",
+                        clusters_written, blocks_processed
+                    );
                 }
                 output_sink.write_cluster(&cluster, 0)?;
             }
@@ -215,11 +230,17 @@ pub fn remux(
     debug!("Finalizing output");
     output_sink.finalize()?;
 
-    info!("Remux completed: {} clusters, {} blocks", clusters_written, blocks_processed);
+    info!(
+        "Remux completed: {} clusters, {} blocks",
+        clusters_written, blocks_processed
+    );
 
     Ok(RemuxStats {
         blocks_processed,
-        duration_ns: info.duration.map(|d| (d.0 * info.timestamp_scale.0 as f64) as u64).unwrap_or(0),
+        duration_ns: info
+            .duration
+            .map(|d| (d.0 * info.timestamp_scale.0 as f64) as u64)
+            .unwrap_or(0),
         track_count: output_tracks.track_entry.len(),
     })
 }
@@ -227,7 +248,9 @@ pub fn remux(
 /// Helper function to count video tracks in current mappings
 fn count_video_tracks_in_mappings(sources_mappings: &SourcesMappings) -> Result<usize> {
     let output_tracks = sources_mappings.get_output_tracks_metadata()?;
-    let video_count = output_tracks.track_entry.iter()
+    let video_count = output_tracks
+        .track_entry
+        .iter()
         .filter(|track| track.track_type.0 == 1) // 1 = video track type
         .count();
     Ok(video_count)

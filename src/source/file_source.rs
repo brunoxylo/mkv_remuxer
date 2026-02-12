@@ -629,6 +629,24 @@ impl Source for FileSource {
         Ok(self.info.clone())
     }
 
+    fn get_cut_positions(&self) -> (u64, Option<u64>) {
+        (
+            self.cut_parameters.start_ns.unwrap_or(0),
+            self.cut_parameters.end_ns,
+        )
+    }
+
+    fn get_duration(&self) -> Option<u64> {
+        let start_ns = self.cut_parameters.start_ns.unwrap_or(0);
+        match self.cut_parameters.end_ns {
+            Some(end_ns) => Some(end_ns - start_ns),
+            None => match self.info.duration {
+                Some(duration) => Some((duration.0 * self.timecode_scale as f64) as u64 - start_ns),
+                None => None,
+            },
+        }
+    }
+
     fn get_next_cluster(&mut self) -> Result<Option<Cluster>> {
         if self.finished {
             return Ok(None);
@@ -722,10 +740,7 @@ impl Source for FileSource {
         };
 
         let video_tracks = self.tracks.get_all_video_tracks();
-        let duration_ns = match self.info.duration {
-            Some(dur) => Some((dur.0 * self.timecode_scale as f64) as u64),
-            None => None,
-        };
+        let duration_ns = self.get_duration();
         let orig_end_ns: Option<u64> = match end_ns {
             Some(end) => Some(end),
             None => match duration_ns {

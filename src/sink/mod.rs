@@ -1,5 +1,5 @@
-use crate::Result;
 use crate::APP_NAME;
+use crate::Result;
 use mkv_element::prelude::*;
 use std::marker::PhantomData;
 
@@ -13,11 +13,19 @@ pub struct Initialized;
 /// Represents a sink/destination for MKV data (output file or stream)
 pub trait Sink {
     /// Initialize the output with EBML header and segment info
-    fn initialize(&mut self, tracks: &Tracks, info: &Info, chapters: Option<&Chapters>) -> Result<()>;
-    
+    fn initialize(
+        &mut self,
+        tracks: &Tracks,
+        info: &Info,
+        chapters: Option<&Chapters>,
+    ) -> Result<()>;
+
     /// Write a cluster to the output
     fn write_cluster(&mut self, cluster: &Cluster, track_number: u64) -> Result<()>;
-    
+
+    //crite the mkv cues
+    fn write_cues(&mut self, cues: &Cues) -> Result<()>;
+
     /// Finalize the output (write cues, seek head, close file)
     fn finalize(&mut self) -> Result<()>;
 }
@@ -39,18 +47,18 @@ impl OutputSink<Uninitialized> {
     }
 
     /// Initialize the sink with EBML header and segment info
-    /// 
+    ///
     /// Consumes the uninitialized sink and returns an initialized one.
     /// This state transition ensures initialization can only happen once.
     pub fn initialize(
-        mut self, 
-        tracks: &Tracks, 
-        info: &Info, 
-        chapters: Option<&Chapters>
+        mut self,
+        tracks: &Tracks,
+        info: &Info,
+        chapters: Option<&Chapters>,
     ) -> Result<OutputSink<Initialized>> {
         // Delegate to the inner Sink implementation
         self.inner.initialize(tracks, info, chapters)?;
-        
+
         // Transition to initialized state
         Ok(OutputSink {
             inner: self.inner,
@@ -58,7 +66,12 @@ impl OutputSink<Uninitialized> {
         })
     }
 
-    pub fn initialize_simple(self, tracks: &Tracks, duration_ns: u64, timecode_scale: u64) -> Result<OutputSink<Initialized>> {
+    pub fn initialize_simple(
+        self,
+        tracks: &Tracks,
+        duration_ns: u64,
+        timecode_scale: u64,
+    ) -> Result<OutputSink<Initialized>> {
         let info = Info {
             timestamp_scale: TimestampScale(timecode_scale),
             muxing_app: MuxingApp(APP_NAME.to_string()),
@@ -101,5 +114,8 @@ impl OutputSink<Initialized> {
     }
     pub fn finalize(mut self) -> Result<()> {
         self.inner.finalize()
+    }
+    pub fn write_cues(&mut self, cues: &Cues) -> Result<()> {
+        self.inner.write_cues(cues)
     }
 }

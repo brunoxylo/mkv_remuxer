@@ -45,6 +45,9 @@ pub trait Source: Display {
     /// fuction to get the sources timescale (nanoseconds per time unit)
     fn get_own_timecode_scale(&self) -> Result<u64>;
 
+    fn get_cut_positions(&self) -> (u64, Option<u64>);
+    fn get_duration(&self) -> Option<u64>;
+
     // function to get target timecode scale for output (nanoseconds per time unit)
     fn get_target_timecode_scale(&self) -> Result<u64>;
     fn initialize(&mut self, output_time_scale: Option<u64>) -> Result<()>;
@@ -184,6 +187,14 @@ impl InputSource<Initialized> {
     /// Get the target timecode scale for output (nanoseconds per time unit)
     pub fn get_target_timecode_scale(&self) -> Result<u64> {
         self.inner.get_target_timecode_scale()
+    }
+
+    pub fn get_cut_positions(&self) -> (u64, Option<u64>) {
+        self.inner.get_cut_positions()
+    }
+
+    pub fn get_duration(&self) -> Option<u64> {
+        self.inner.get_duration()
     }
 }
 
