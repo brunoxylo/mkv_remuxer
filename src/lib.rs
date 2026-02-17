@@ -6,11 +6,11 @@ mod remuxer;
 pub mod sink;
 pub mod source;
 mod source_mappings;
-mod test_utils;
+pub mod test_utils;
 
 // Re-exports
 pub use block_ext::ClusterBlockExt;
-pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper};
+pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper, CLUSTER_MAX_DURATION_NS, CLUSTER_MAX_SIZE_BYTES};
 pub use error::{Error, Result};
 pub use metling_pot::MeltingPot;
 pub use mkv_element;
@@ -18,6 +18,7 @@ pub use remuxer::{CutConfig, RemuxStats, TrackMapping, remux};
 pub use sink::{FileSink, Sink};
 pub use source::{SeekType, Source};
 pub use source_mappings::SourcesMappings;
+pub use test_utils::{validate_mkv_output, get_input_duration_ns, MkvValidationReport, ValidationStats};
 
 use mkv_element::prelude::*;
 

@@ -151,7 +151,7 @@ impl MeltingPot {
     ///
     /// * `cluster_start_offset` - The offset of the first cluster in the output file.
     /// * `max_lenght_bytes` - The maximum length of the cues in bytes. If None, all clusters will be included.
-    pub fn get_cues(&self, cluster_start_offset: u64, max_lenght_bytes: Option<u64>) -> Cues {
+    pub fn get_cues(&self, cluster_start_offset: u64) -> Cues {
         let mut cues = Cues {
             crc32: None,
             cue_point: Vec::new(),
@@ -180,11 +180,6 @@ impl MeltingPot {
                 void: None,
                 crc32: None,
             });
-            if let Some(max_lenght_bytes) = max_lenght_bytes {
-                if current_offset + size > cluster_start_offset + max_lenght_bytes {
-                    break;
-                }
-            }
             cues.cue_point.push(cue_point);
             current_offset += size;
         }
@@ -257,6 +252,10 @@ mod tests {
                 let _ = block.track_number()?;
             }
             Ok(())
+        }
+
+        fn get_clusters_start_offset(&self) -> Result<u64> {
+            Ok(10)
         }
         fn write_cues(&mut self, cues: &Cues) -> Result<()> {
             Ok(())

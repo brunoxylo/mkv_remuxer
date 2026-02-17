@@ -190,8 +190,7 @@ fn main() -> Result<()> {
         sources,
         output_sink,
         cut_config,
-        track_mappings,
-        args.timescale,
+        track_mappings
     )
     .context("Remux operation failed")?;
 

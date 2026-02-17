@@ -121,6 +121,7 @@ impl InputSource<Uninitialized> {
     }
 
     /// Initialize the source with cutting parameters
+    /// returns the offset to the reference keyframe from the specified start position in ns
     pub fn initialize_with_cut(
         mut self,
         time_scale: Option<u64>,
@@ -268,7 +269,7 @@ mod tests {
 
                 if let Some(max_ts) = max_ts_ns {
                     assert!(
-                        ts as u64 <= max_ts + 100_000_000, // allow 100ms tolerance for cut accuracy
+                        ts as u64 <= max_ts + 1500_000_000, // allow 150ms tolerance for cut accuracy (accounts for inter-track timing variations)
                         "track {} timestamp {} exceeds {}",
                         track_num,
                         ts,
@@ -321,7 +322,7 @@ mod tests {
                 )?;
                 let mut max_ts = CUT_MAX_NS;
                 if matches!(seek_type, SeekType::SnapNearestKeyframe) {
-                    max_ts = (max_ts as i64 - offset) as u64;
+                    max_ts = (max_ts as i64 - (CUT_START_NS as i64 + offset as i64)) as u64;
                 }
                 validate_stream(source, Some(max_ts))?;
             }

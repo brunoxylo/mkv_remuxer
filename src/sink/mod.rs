@@ -26,6 +26,8 @@ pub trait Sink {
     //crite the mkv cues
     fn write_cues(&mut self, cues: &Cues) -> Result<()>;
 
+    fn get_clusters_start_offset(&self) -> Result<u64>;
+
     /// Finalize the output (write cues, seek head, close file)
     fn finalize(&mut self) -> Result<()>;
 }
@@ -112,10 +114,151 @@ impl OutputSink<Initialized> {
     pub fn write_cluster(&mut self, cluster: &Cluster, track_number: u64) -> Result<()> {
         self.inner.write_cluster(cluster, track_number)
     }
+    pub fn get_clusters_start_offset(&self) -> Result<u64> {
+        self.inner.get_clusters_start_offset()
+    }
     pub fn finalize(mut self) -> Result<()> {
         self.inner.finalize()
     }
     pub fn write_cues(&mut self, cues: &Cues) -> Result<()> {
         self.inner.write_cues(cues)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remux;
+    use crate::source::{FileSource, InputSource, SeekType};
+    use crate::test_utils::{test_file_path, validate_mkv_output};
+    use crate::CutConfig;
+
+    #[test]
+    fn test_remux_german_audio_from_20s() -> Result<()> {
+        // Setup: Create output path in temp directory
+        let temp_dir = std::env::temp_dir();
+        let output_path = temp_dir.join(format!("test_german_audio.mkv"));
+        
+        // Create input source from test.webm (uninitialized)
+        let input_path = test_file_path();
+        let source = FileSource::new(&input_path)?;
+        let input_source = InputSource::from(source);
+        
+        // Create output sink (uninitialized)
+        let output_sink = FileSink::new(&output_path)?;
+        let output = OutputSink::from(output_sink);
+        
+        // Configure cutting: from 20 seconds to the end
+        let start_ns = 20_000_000_000u64; // 20 seconds in nanoseconds
+        let cut_config = CutConfig::new(SeekType::SnapNearestKeyframe)
+            .with_start(start_ns);
+        
+        // We need to pre-check for German audio tracks manually
+        // Initialize source temporarily to check tracks
+        let temp_source = FileSource::new(&input_path)?;
+        let temp_input = InputSource::from(temp_source);
+        let initialized_temp = temp_input.initialize(None)?;
+        let tracks = initialized_temp.get_tracks()?;
+        
+
+        let mut output_mappings = Vec::new();
+        let mut has_video_track = false;
+        // add fisrt video track to mappings as well
+        for track in &tracks.track_entry {
+            if track.track_type.0 == crate::block_ext::TrackKind::Video {
+                output_mappings.insert(0, (0u64, track.track_number.0));
+                has_video_track = true;
+                break;
+            }
+        }
+        if !has_video_track {
+            panic!("Test file does not contain any video tracks. Please provide a test file with video for this test.");
+        }
+
+        // Look for German audio track
+        for track in &tracks.track_entry {
+            if track.track_type.0 == crate::block_ext::TrackKind::Audio {
+                let lang = track.language.0.as_str();
+                if lang == "ger" || lang == "deu" || lang == "de" {
+                    output_mappings.push((0u64, track.track_number.0));
+                }
+            }
+        }
+        // If test.webm doesn't have German audio, try any audio track for testing
+        if output_mappings.is_empty() {
+            panic!("Test file does not contain any German audio tracks. Please provide a test file with German audio for this test.");
+        }
+        
+        // Perform remuxing with custom mappings
+        let stats = remux(
+            vec![input_source],
+            output, 
+            Some(cut_config), 
+            Some(output_mappings.clone())
+        )?;
+        
+        // Validate we processed some blocks
+        assert!(stats.blocks_processed > 0, "Should have processed at least some blocks");
+        assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
+
+
+        let input_duration_ns = initialized_temp.get_duration().unwrap();
+        // Validate the output using our comprehensive validation method
+        let validation_report = validate_mkv_output(&output_path, true, Some(input_duration_ns), false, true)?;
+        
+        // Print report for debugging
+        if !validation_report.is_valid() {
+            eprintln!("{}", validation_report.summary());
+            for error in &validation_report.errors {
+                eprintln!("ERROR: {}", error);
+            }
+            for warning in &validation_report.warnings {
+                eprintln!("WARNING: {}", warning);
+            }
+        }
+        
+        // Assert all validations passed
+        assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
+        assert!(validation_report.timestamps_plausible, "Timestamps should be plausible");
+        assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
+        assert!(validation_report.cluster_duration_valid, 
+            "Cluster durations should not exceed {} ns", 
+            crate::cluster_warpper::CLUSTER_MAX_DURATION_NS);
+        assert!(validation_report.cluster_size_valid, 
+            "Cluster sizes should not exceed {} bytes", 
+            crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES);
+        
+        // Cues validation might be less strict, just warn if invalid
+        if !validation_report.cues_valid {
+            eprintln!("Warning: Cues validation failed");
+        }
+        
+        // Overall validation
+        assert!(validation_report.is_valid(), "Overall MKV validation should pass");
+        
+        // Cleanup
+        //let _ = std::fs::remove_file(&output_path);
+        
+        Ok(())
+    }
+
+    #[test]
+    fn validate_input_file() -> Result<()> {
+        let input_path = test_file_path();
+        let report =  validate_mkv_output(&input_path, true, None, false, false)?;
+        print!("Input file validation report:\n{}", report.summary());
+                // Print report for debugging
+        if !report.is_valid() {
+            eprintln!("{}", report.summary());
+            for error in &report.errors {
+                eprintln!("ERROR: {}", error);
+            }
+            for warning in &report.warnings {
+                eprintln!("WARNING: {}", warning);
+            }
+        }
+        assert!(report.is_valid(), "Input file should be valid");
+        Ok(())
+
     }
 }

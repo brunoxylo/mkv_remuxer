@@ -2,7 +2,7 @@ use super::{SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::{Error, Result};
 use core::time;
-use log::debug;
+use log::{debug, info};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::{ClusterBlock, prelude::*};
 use std::collections::HashMap;
@@ -349,6 +349,7 @@ impl FileSource {
                     let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
                     if let Some(end) = self.cut_parameters.end_ns {
                         if abs_ns as u64 > end {
+                            //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
                             continue;
                         }
                     } // only output after desired keyframe
@@ -360,6 +361,7 @@ impl FileSource {
                         cluster.timestamp.0 as i64,
                         self.output_timecode_scale,
                     )?;
+                    //print!("pushing block with: {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale)?);
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
@@ -637,13 +639,9 @@ impl Source for FileSource {
     }
 
     fn get_duration(&self) -> Option<u64> {
-        let start_ns = self.cut_parameters.start_ns.unwrap_or(0);
-        match self.cut_parameters.end_ns {
-            Some(end_ns) => Some(end_ns - start_ns),
-            None => match self.info.duration {
-                Some(duration) => Some((duration.0 * self.timecode_scale as f64) as u64 - start_ns),
+             match self.info.duration {
+                Some(duration) => Some((duration.0 * self.timecode_scale as f64) as u64),
                 None => None,
-            },
         }
     }
 
@@ -741,6 +739,7 @@ impl Source for FileSource {
 
         let video_tracks = self.tracks.get_all_video_tracks();
         let duration_ns = self.get_duration();
+        print!("Orig duration: {} ns", duration_ns.unwrap_or(0));
         let orig_end_ns: Option<u64> = match end_ns {
             Some(end) => Some(end),
             None => match duration_ns {
@@ -750,6 +749,7 @@ impl Source for FileSource {
         };
         // update duration when  end is known
         if let Some(orig_end) = orig_end_ns {
+            print!("Orig_end: {} ns, start_ns: {}", orig_end, start_ns.unwrap_or(0));
             self.info.duration = Some(Duration(
                 (orig_end - start_ns.unwrap_or(0)) as f64 / self.output_timecode_scale as f64,
             ));

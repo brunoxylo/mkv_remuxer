@@ -109,12 +109,12 @@ pub fn remux(
     output_sink: OutputSink<crate::sink::Uninitialized>,
     cut_config: Option<CutConfig>,
     mappings: Option<Vec<TrackMapping>>,
-    target_timescale: Option<u64>,
 ) -> Result<RemuxStats> {
     debug!("Starting remux process with {} sources", sources.len());
 
     // Step 1: Initialize sources
     let mut initialized_sources = Vec::new();
+    let mut target_timescale = None;
 
     for (idx, source) in sources.into_iter().enumerate() {
         debug!("Initializing source {}", idx);
@@ -131,8 +131,13 @@ pub fn remux(
             // Initialize without cut
             source.initialize(target_timescale)?
         };
+        if target_timescale.is_none() { // use first source's timescale as target timescale for all sources (required for cutting and syncing)
+            target_timescale = Some(initialized.get_own_timecode_scale()?);
+        }
         initialized_sources.push(initialized);
     }
+
+    let target_timescale = target_timescale.ok_or_else(|| Error::MissingElement("No sources provided".to_string()))?;
 
     debug!("Initialized {} sources", initialized_sources.len());
 
@@ -204,7 +209,7 @@ pub fn remux(
     let duration = melting_pot.get_final_duration().unwrap_or(0);
     debug!("Initializing output sink");
     let mut output_sink =
-        output_sink.initialize_simple(&output_tracks, duration, info.timestamp_scale.0)?;
+        output_sink.initialize_simple(&output_tracks, duration, target_timescale)?;
 
     loop {
         match melting_pot.generate_next_cluster()? {
@@ -226,7 +231,13 @@ pub fn remux(
         }
     }
 
-    // Step 9: Finalize output
+    // Step 9: Write cues
+    debug!("Writing cues");
+    let output_clusters_offset = output_sink.get_clusters_start_offset()?;
+    let cues = melting_pot.get_cues(output_clusters_offset);
+    output_sink.write_cues(&cues)?;
+
+    // Step 10: Finalize output
     debug!("Finalizing output");
     output_sink.finalize()?;
 

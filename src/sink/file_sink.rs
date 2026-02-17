@@ -12,6 +12,7 @@ pub struct FileSink {
     writer: BufWriter<File>,
     segment_started: bool,
     segment_start_offset: u64,
+    clusters_start_offset: u64,
     cues_offset: u64,
     reserved_cues_size: u64,
 }
@@ -25,6 +26,7 @@ impl FileSink {
             writer,
             segment_started: false,
             segment_start_offset: 0,
+            clusters_start_offset: 0,
             cues_offset: 0,
             reserved_cues_size: 0,
         })
@@ -91,10 +93,19 @@ impl Sink for FileSink {
         void.write_to(&mut self.writer)?;
 
         self.writer.flush()?;
-        let cluster_start_offset = self.writer.stream_position()?;
 
+        self.clusters_start_offset = self.writer.stream_position()?;
         self.segment_started = true;
         Ok(())
+    }
+
+    fn get_clusters_start_offset(&self) -> Result<u64> {
+        if self.clusters_start_offset == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "Cannot get clusters offset before initialize() is called".to_string(),
+            ));
+        }
+        Ok(self.clusters_start_offset)
     }
 
     fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {
@@ -123,18 +134,43 @@ impl Sink for FileSink {
         // Seek to the reserved space
         self.writer.seek(SeekFrom::Start(self.cues_offset))?;
 
-        // Write the cues
+        // Try to serialize cues and truncate if necessary
+        let mut cues_to_write = cues.clone();
         let mut cues_buf = Vec::new();
-        cues.write_to(&mut cues_buf)?;
+        cues_to_write.write_to(&mut cues_buf)?;
 
+        // If cues are too large, truncate cue points until they fit
         if cues_buf.len() as u64 > self.reserved_cues_size {
-            warn!(
-                "Generated cues ({} bytes) exceed reserved space ({} bytes)",
-                cues_buf.len(),
-                self.reserved_cues_size
-            );
-            // We still write it, but it will overwrite following data (bad!)
-            // Better to use a smaller cues set or larger reservation.
+            let original_count = cues_to_write.cue_point.len();
+            
+            // Iteratively remove cue points from the end until it fits
+            while cues_buf.len() as u64 > self.reserved_cues_size && !cues_to_write.cue_point.is_empty() {
+                cues_to_write.cue_point.pop();
+                cues_buf.clear();
+                cues_to_write.write_to(&mut cues_buf)?;
+            }
+            
+            let kept_count = cues_to_write.cue_point.len();
+            let removed_count = original_count - kept_count;
+            
+            if removed_count > 0 {
+                warn!(
+                    "Truncated cues: removed {} of {} cue points to fit in reserved space ({} bytes). Final size: {} bytes",
+                    removed_count,
+                    original_count,
+                    self.reserved_cues_size,
+                    cues_buf.len()
+                );
+            }
+            
+            // If even an empty cues structure doesn't fit, we have a problem
+            if cues_buf.len() as u64 > self.reserved_cues_size {
+                return Err(crate::Error::InvalidConfig(format!(
+                    "Reserved cues space ({} bytes) is too small even for empty cues structure ({} bytes)",
+                    self.reserved_cues_size,
+                    cues_buf.len()
+                )));
+            }
         }
 
         self.writer.write_all(&cues_buf)?;
