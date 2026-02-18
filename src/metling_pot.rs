@@ -137,9 +137,9 @@ impl MeltingPot {
             }
         }
     }
-    pub fn get_final_duration(&self) -> Option<u64> {
+    pub fn get_final_duration(& mut self) -> Option<u64> {
         let mut max_duration_ns = 0;
-        for source in &self.sources_mappings.sources {
+        for source in &mut self.sources_mappings.sources {
             max_duration_ns = max_duration_ns.max(source.get_duration().unwrap_or(0));
         }
         if max_duration_ns > 0 {

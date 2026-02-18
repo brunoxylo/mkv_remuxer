@@ -4,40 +4,7 @@ use crate::source::{InputSource, SeekType, Uninitialized};
 use crate::source_mappings::SourcesMappings;
 use crate::{Error, Result};
 use log::{debug, info, warn};
-
-/// Configuration for cutting/seeking behavior
-#[derive(Debug, Clone)]
-pub struct CutConfig {
-    pub seek_type: SeekType,
-    pub start_ns: Option<u64>,
-    pub end_ns: Option<u64>,
-}
-
-impl CutConfig {
-    pub fn new(seek_type: SeekType) -> Self {
-        Self {
-            seek_type,
-            start_ns: None,
-            end_ns: None,
-        }
-    }
-
-    pub fn with_start(mut self, start_ns: u64) -> Self {
-        self.start_ns = Some(start_ns);
-        self
-    }
-
-    pub fn with_end(mut self, end_ns: u64) -> Self {
-        self.end_ns = Some(end_ns);
-        self
-    }
-
-    pub fn with_range(mut self, start_ns: u64, end_ns: u64) -> Self {
-        self.start_ns = Some(start_ns);
-        self.end_ns = Some(end_ns);
-        self
-    }
-}
+use crate ::source::CutConfig;
 
 /// Track mapping specification: (source_index, track_number)
 pub type TrackMapping = (u64, u64);
@@ -242,10 +209,7 @@ pub fn remux(
 
     Ok(RemuxStats {
         blocks_processed,
-        duration_ns: info
-            .duration
-            .map(|d| (d.0 * info.timestamp_scale.0 as f64) as u64)
-            .unwrap_or(0),
+        duration_ns: duration,
         track_count: output_tracks.track_entry.len(),
     })
 }

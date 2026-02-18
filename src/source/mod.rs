@@ -3,7 +3,10 @@ use mkv_element::prelude::*;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+mod cluster_cache;
 mod file_source;
+
+pub use cluster_cache::ClusterOfInterestCache;
 pub use file_source::FileSource;
 
 // Typestate marker types
@@ -46,7 +49,7 @@ pub trait Source: Display {
     fn get_own_timecode_scale(&self) -> Result<u64>;
 
     fn get_cut_positions(&self) -> (u64, Option<u64>);
-    fn get_duration(&self) -> Option<u64>;
+    fn get_duration(& mut self) -> Result<u64>;
 
     // function to get target timecode scale for output (nanoseconds per time unit)
     fn get_target_timecode_scale(&self) -> Result<u64>;
@@ -194,7 +197,7 @@ impl InputSource<Initialized> {
         self.inner.get_cut_positions()
     }
 
-    pub fn get_duration(&self) -> Option<u64> {
+    pub fn get_duration(&mut self) -> Result<u64> {
         self.inner.get_duration()
     }
 }
@@ -330,5 +333,39 @@ mod tests {
         }
 
         Ok(())
+    }
+}
+
+/// Configuration for cutting/seeking behavior
+#[derive(Debug, Clone)]
+pub struct CutConfig {
+    pub seek_type: SeekType,
+    pub start_ns: Option<u64>,
+    pub end_ns: Option<u64>,
+}
+
+impl CutConfig {
+    pub fn new(seek_type: SeekType) -> Self {
+        Self {
+            seek_type,
+            start_ns: None,
+            end_ns: None,
+        }
+    }
+
+    pub fn with_start(mut self, start_ns: u64) -> Self {
+        self.start_ns = Some(start_ns);
+        self
+    }
+
+    pub fn with_end(mut self, end_ns: u64) -> Self {
+        self.end_ns = Some(end_ns);
+        self
+    }
+
+    pub fn with_range(mut self, start_ns: u64, end_ns: u64) -> Self {
+        self.start_ns = Some(start_ns);
+        self.end_ns = Some(end_ns);
+        self
     }
 }

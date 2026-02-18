@@ -22,10 +22,11 @@
             },
             "args": [
                 "-i", "${workspaceFolder}/test.webm",
-                "--to", "20s",
+                "--to", "15s",
+                "--ss", "5s",
                 "-m", "0:1",
                 "-m", "0:3",
-                "--seek-mode", "snap",
+                "--seek-mode", "freeze",
                 "/tmp/output_debug.mkv"
             ],
             "cwd": "${workspaceFolder}"

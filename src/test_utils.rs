@@ -298,6 +298,33 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                                 cluster_min_ts_ns = cluster_min_ts_ns.min(block_ts_ns);
                                 cluster_max_ts_ns = cluster_max_ts_ns.max(block_ts_ns);
 
+                                // Check for negative timestamps
+                                if block_ts_ns < 0 {
+                                    report.timestamps_plausible = false;
+                                    report.errors.push(format!(
+                                        "Negative timestamp: {} ns in cluster {} (block {})",
+                                        block_ts_ns,
+                                        report.stats.total_clusters,
+                                        report.stats.total_blocks
+                                    ));
+                                }
+
+                                // Check if timestamp exceeds duration
+                                if let Some(duration_ns) = report.stats.output_duration_ns {
+                                    if block_ts_ns > duration_ns as i64 {
+                                        report.timestamps_plausible = false;
+                                        report.errors.push(format!(
+                                            "Timestamp {} ns ({:.3}s) exceeds duration {} ns ({:.3}s) in cluster {} (block {})",
+                                            block_ts_ns,
+                                            block_ts_ns as f64 / 1_000_000_000.0,
+                                            duration_ns,
+                                            duration_ns as f64 / 1_000_000_000.0,
+                                            report.stats.total_clusters,
+                                            report.stats.total_blocks
+                                        ));
+                                    }
+                                }
+
                                 // Check timestamp plausibility
                                 if let Some(last_ts) = last_timestamp_ns {
                                     if require_strict_monotonic {

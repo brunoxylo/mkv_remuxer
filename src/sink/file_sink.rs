@@ -93,12 +93,15 @@ impl Sink for FileSink {
         println!("Reserving {} bytes for cues (estimated {} cue points, total duration {} ns)", estimated_cues_size, num_clusters, duration_ns);
 
         self.cues_offset = self.writer.stream_position()?;
-        self.reserved_cues_size = estimated_cues_size;
-
+        
         let void = Void {
             size: estimated_cues_size,
         };
         void.write_to(&mut self.writer)?;
+        
+        // Record the ACTUAL total space occupied by the Void element (header + data)
+        let end_of_reserved_space = self.writer.stream_position()?;
+        self.reserved_cues_size = end_of_reserved_space - self.cues_offset;
 
         self.writer.flush()?;
 
@@ -222,15 +225,39 @@ impl Sink for FileSink {
             // If we have remaining reserved space, fill it with Void
             if (cues_buf.len() as u64) < self.reserved_cues_size {
                 let remaining = self.reserved_cues_size - cues_buf.len() as u64;
-                // A Void element with 0 size payload takes 1 (ID) + 1 (VINT size) = 2 bytes
-                if remaining >= 2 {
-                    let void = Void {
-                        size: remaining - 2,
+                
+                // Calculate correct Void payload size by trial
+                // We need: void_header_size + payload_size = remaining
+                // Start with remaining-2 and adjust if header size would be bigger
+                let mut void_payload_size = remaining.saturating_sub(2);
+                
+                // Test if this size fits by serializing to a temp buffer
+                loop {
+                    let test_void = Void {
+                        size: void_payload_size,
                     };
-                    void.write_to(&mut self.writer)?;
-                } else {
-                    // Just pad with zeros if space is too small for Void element
-                    self.writer.write_all(&vec![0u8; remaining as usize])?;
+                    let mut temp_buf = Vec::new();
+                    if test_void.write_to(&mut temp_buf).is_ok() {
+                        if temp_buf.len() as u64 <= remaining {
+                            // This size works
+                            self.writer.write_all(&temp_buf)?;
+                            
+                            // Pad any remaining bytes with zeros
+                            let pad_bytes = remaining - temp_buf.len() as u64;
+                            if pad_bytes > 0 {
+                                self.writer.write_all(&vec![0u8; pad_bytes as usize])?;
+                            }
+                            break;
+                        }
+                    }
+                    
+                    // If we get here, the Void was too large. Reduce payload and try again.
+                    if void_payload_size == 0 {
+                        // Can't fit a Void at all, just pad with zeros
+                        self.writer.write_all(&vec![0u8; remaining as usize])?;
+                        break;
+                    }
+                    void_payload_size = void_payload_size.saturating_sub(1);
                 }
             }
             

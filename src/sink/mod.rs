@@ -121,13 +121,13 @@ mod tests {
     use crate::remux;
     use crate::source::{FileSource, InputSource, SeekType};
     use crate::test_utils::{test_file_path, validate_mkv_output};
-    use crate::CutConfig;
+    use crate::source::CutConfig;
 
-    #[test]
-    fn test_remux_german_audio_from_20s() -> Result<()> {
+    fn run_remux_test_with_seek_type(seek_type: SeekType) -> Result<()> {
         // Setup: Create output path in temp directory
         let temp_dir = std::env::temp_dir();
-        let output_path = temp_dir.join(format!("test_german_audio.mkv"));
+        let seek_type_name = format!("{:?}", seek_type);
+        let output_path = temp_dir.join(format!("test_german_audio_{}.mkv", seek_type_name));
         
         // Create input source from test.webm (uninitialized)
         let input_path = test_file_path();
@@ -140,14 +140,14 @@ mod tests {
         
         // Configure cutting: from 20 seconds to the end
         let start_ns = 20_000_000_000u64; // 20 seconds in nanoseconds
-        let cut_config = CutConfig::new(SeekType::SnapNearestKeyframe)
+        let cut_config = CutConfig::new(seek_type.clone())
             .with_start(start_ns);
         
         // We need to pre-check for German audio tracks manually
         // Initialize source temporarily to check tracks
         let temp_source = FileSource::new(&input_path)?;
         let temp_input = InputSource::from(temp_source);
-        let initialized_temp = temp_input.initialize(None)?;
+        let mut initialized_temp = temp_input.initialize(None)?;
         let tracks = initialized_temp.get_tracks()?;
         
 
@@ -224,12 +224,32 @@ mod tests {
         }
         
         // Overall validation
-        assert!(validation_report.is_valid(), "Overall MKV validation should pass");
+        assert!(validation_report.is_valid(), "Overall MKV validation should pass for SeekType::{:?}", seek_type);
         
         // Cleanup
         //let _ = std::fs::remove_file(&output_path);
         
         Ok(())
+    }
+
+    #[test]
+    fn test_remux_german_audio_snap_nearest_keyframe() -> Result<()> {
+        run_remux_test_with_seek_type(SeekType::SnapNearestKeyframe)
+    }
+
+    #[test]
+    fn test_remux_german_audio_squeeze() -> Result<()> {
+        run_remux_test_with_seek_type(SeekType::Squeeze)
+    }
+
+    #[test]
+    fn test_remux_german_audio_freeze() -> Result<()> {
+        run_remux_test_with_seek_type(SeekType::Freeze)
+    }
+
+    #[test]
+    fn test_remux_german_audio_dirty_cut() -> Result<()> {
+        run_remux_test_with_seek_type(SeekType::DirtyCut)
     }
 
     #[test]
