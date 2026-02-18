@@ -23,11 +23,6 @@ pub trait Sink {
     /// Write a cluster to the output
     fn write_cluster(&mut self, cluster: &Cluster, track_number: u64) -> Result<()>;
 
-    //crite the mkv cues
-    fn write_cues(&mut self, cues: &Cues) -> Result<()>;
-
-    fn get_clusters_start_offset(&self) -> Result<u64>;
-
     /// Finalize the output (write cues, seek head, close file)
     fn finalize(&mut self) -> Result<()>;
 }
@@ -114,14 +109,8 @@ impl OutputSink<Initialized> {
     pub fn write_cluster(&mut self, cluster: &Cluster, track_number: u64) -> Result<()> {
         self.inner.write_cluster(cluster, track_number)
     }
-    pub fn get_clusters_start_offset(&self) -> Result<u64> {
-        self.inner.get_clusters_start_offset()
-    }
     pub fn finalize(mut self) -> Result<()> {
         self.inner.finalize()
-    }
-    pub fn write_cues(&mut self, cues: &Cues) -> Result<()> {
-        self.inner.write_cues(cues)
     }
 }
 

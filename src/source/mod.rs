@@ -13,7 +13,7 @@ pub struct Uninitialized;
 /// Marker type indicating the source has been initialized
 pub struct Initialized;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SeekType {
     /// (fast, not exact, nice) Seek to the nearest keyframe before or after the target timestamp
     SnapNearestKeyframe,
@@ -321,8 +321,9 @@ mod tests {
                     Some(CUT_END_NS),
                 )?;
                 let mut max_ts = CUT_MAX_NS;
+                println!("our offset is {}", offset);
                 if matches!(seek_type, SeekType::SnapNearestKeyframe) {
-                    max_ts = (max_ts as i64 - (CUT_START_NS as i64 + offset as i64)) as u64;
+                    max_ts = (max_ts as i64 - offset as i64) as u64;
                 }
                 validate_stream(source, Some(max_ts))?;
             }

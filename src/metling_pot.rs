@@ -8,7 +8,6 @@ use mkv_element::prelude::*;
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
     clusters: Vec<Option<ClusterReadWrapper>>,
-    cluster_info: Vec<(u64, u64)>, // (timestamp in ticks, size in bytes)
 }
 
 impl MeltingPot {
@@ -19,7 +18,6 @@ impl MeltingPot {
         Self {
             sources_mappings,
             clusters: initial_clusters,
-            cluster_info: Vec::new(),
         }
     }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
@@ -53,9 +51,6 @@ impl MeltingPot {
                         debug!("No more clusters available");
                         return Ok(None);
                     } else {
-                        let timestamp = o_cluster.cluster().timestamp.0;
-                        let size = o_cluster.size_bytes();
-                        self.cluster_info.push((timestamp, size));
                         return Ok(Some(o_cluster.finish()));
                     }
                 } else {
@@ -120,9 +115,6 @@ impl MeltingPot {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
                                         // Cluster is full, break the inner loop and start a new cluster
-                                        let timestamp = o_cluster.cluster().timestamp.0;
-                                        let size = o_cluster.size_bytes();
-                                        self.cluster_info.push((timestamp, size));
                                         return Ok(Some(o_cluster.finish()));
                                     }
                                     Err(e) => return Err(e),
@@ -144,49 +136,6 @@ impl MeltingPot {
                 output_cluster = Some(o_cluster);
             }
         }
-    }
-    /// Generate cues for the clusters that have been generated so far.
-    ///
-    /// # Arguments
-    ///
-    /// * `cluster_start_offset` - The offset of the first cluster in the output file.
-    /// * `max_lenght_bytes` - The maximum length of the cues in bytes. If None, all clusters will be included.
-    pub fn get_cues(&self, cluster_start_offset: u64) -> Cues {
-        let mut cues = Cues {
-            crc32: None,
-            cue_point: Vec::new(),
-            void: None,
-        };
-        let mut current_offset = cluster_start_offset;
-        for (timestamp, size) in &self.cluster_info {
-            let mut cue_point = CuePoint {
-                crc32: None,
-                cue_time: CueTime(*timestamp),
-                cue_track_positions: Vec::new(),
-                void: None,
-            };
-
-            // Add track position for the first mapped track (convention for cues)
-            // or just track 1 if we don't know better.
-            // Usually, track 1 is the video track in MKV.
-            cue_point.cue_track_positions.push(CueTrackPositions {
-                cue_track: CueTrack(1),
-                cue_cluster_position: CueClusterPosition(current_offset),
-                cue_relative_position: None,
-                cue_duration: None,
-                cue_block_number: None,
-                cue_codec_state: CueCodecState(0),
-                cue_reference: Vec::new(),
-                void: None,
-                crc32: None,
-            });
-            cues.cue_point.push(cue_point);
-            current_offset += size;
-        }
-        cues
-    }
-    pub fn get_current_duration(&self) -> u64 {
-        self.cluster_info.iter().map(|(_, size)| size).sum()
     }
     pub fn get_final_duration(&self) -> Option<u64> {
         let mut max_duration_ns = 0;
@@ -251,13 +200,6 @@ mod tests {
                 self.num_blocks += 1;
                 let _ = block.track_number()?;
             }
-            Ok(())
-        }
-
-        fn get_clusters_start_offset(&self) -> Result<u64> {
-            Ok(10)
-        }
-        fn write_cues(&mut self, cues: &Cues) -> Result<()> {
             Ok(())
         }
 

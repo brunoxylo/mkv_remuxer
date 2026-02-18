@@ -231,13 +231,7 @@ pub fn remux(
         }
     }
 
-    // Step 9: Write cues
-    debug!("Writing cues");
-    let output_clusters_offset = output_sink.get_clusters_start_offset()?;
-    let cues = melting_pot.get_cues(output_clusters_offset);
-    output_sink.write_cues(&cues)?;
-
-    // Step 10: Finalize output
+    // Step 9: Finalize output (writes cues internally)
     debug!("Finalizing output");
     output_sink.finalize()?;
 

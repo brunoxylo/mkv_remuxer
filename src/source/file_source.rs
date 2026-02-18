@@ -164,6 +164,7 @@ pub struct FileSource {
     cut_parameters: CutParameters,
     /// position in the file where our first cluster of interest starts (usually around the specified cut start position)
     initial_cluster_pos: ClusterOfInterestCache,
+    first_video_track_num: Option<u64>,
     finished: bool,
 }
 
@@ -226,6 +227,13 @@ impl FileSource {
         let initial_cluster_pos = initial_cluster_pos
             .ok_or_else(|| Error::InvalidConfig("No clusters found".to_string()))?;
 
+        let first_video_track_num = tracks
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfig("Missing Tracks element".to_string()))?
+            .get_all_video_tracks()
+            .first()
+            .cloned();
+
         Ok(Self {
             file,
             timecode_scale,
@@ -241,6 +249,7 @@ impl FileSource {
             },
             initial_cluster_pos,
             finished: false,
+            first_video_track_num,
         })
     }
 
@@ -325,7 +334,17 @@ impl FileSource {
         let orig_cluster_ns = cluster.get_timestamp_ms(self.timecode_scale) as i64;
 
         // Shift cluster timestamp
-        let shift_reference = self.cut_parameters.start_ns.unwrap_or(0);
+        let shift_reference =  if self.cut_parameters.seek_type == SeekType::SnapNearestKeyframe {
+            if let Some(video_track_num) = self.first_video_track_num {
+                self.initial_cluster_pos
+                    .get_closest_keyframe_timestamp_ns(video_track_num,  self.cut_parameters.start_ns.unwrap_or(0) as i64)?
+            } else {
+                // no video tracks, use cut start as reference for shifting 
+                self.cut_parameters.start_ns.unwrap_or(0) as i64
+            }
+        } else {
+            self.cut_parameters.start_ns.unwrap_or(0) as i64
+        };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
         cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
         let shifted_cluster_ticks = cluster.timestamp.0 as i64;
@@ -334,15 +353,6 @@ impl FileSource {
 
         let result = match self.cut_parameters.seek_type {
             SeekType::SnapNearestKeyframe => {
-                let start_ns = self.cut_parameters.start_ns.unwrap_or(0) as i64;
-                let vid_tr = self.tracks.get_all_video_tracks();
-                let video_track_num = vid_tr.first();
-                let nearest_keyframe_pos = if let Some(track_num) = video_track_num {
-                    self.initial_cluster_pos
-                        .get_closest_keyframe_timestamp_ns(*track_num, start_ns)?
-                } else {
-                    start_ns
-                };
                 // Simple: just shift timestamps, but we still need to respect end_ns
                 let mut filtered = Vec::with_capacity(cluster.blocks.len());
                 for mut block in cluster.blocks {
@@ -353,15 +363,15 @@ impl FileSource {
                             continue;
                         }
                     } // only output after desired keyframe
-                    if abs_ns < nearest_keyframe_pos {
+                    if abs_ns < shift_reference {
                         continue;
                     }
                     block.set_timestamp_ns(
-                        abs_ns - nearest_keyframe_pos,
+                        abs_ns - shift_reference,
                         cluster.timestamp.0 as i64,
                         self.output_timecode_scale,
                     )?;
-                    //print!("pushing block with: {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale)?);
+                    print!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?, abs_ns, self.cut_parameters.end_ns, shift_reference);
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;

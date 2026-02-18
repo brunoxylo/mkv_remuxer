@@ -413,6 +413,13 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
     } else {
         report.warnings.push("No Cues element found in file".to_string());
     }
+    if report.stats.total_clusters == 0 {
+        report.errors.push("No clusters found in file".to_string());
+    }
+    if report.stats.total_blocks == 0 {
+        report.errors.push("No blocks found in file".to_string());
+    }
+
 
     Ok(report)
 }
@@ -497,6 +504,8 @@ impl MkvValidationReport {
             && self.cluster_size_valid
             && self.cues_valid
             && self.duration_valid
+            && self.stats.total_clusters > 0
+            && self.stats.total_blocks > 0
     }
 
     /// Returns a summary string of the validation
