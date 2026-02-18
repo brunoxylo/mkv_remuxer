@@ -337,7 +337,7 @@ impl FileSource {
         let shift_reference =  if self.cut_parameters.seek_type == SeekType::SnapNearestKeyframe {
             if let Some(video_track_num) = self.first_video_track_num {
                 self.initial_cluster_pos
-                    .get_closest_keyframe_timestamp_ns(video_track_num,  self.cut_parameters.start_ns.unwrap_or(0) as i64)?
+                    .get_closest_keyframe_timestamp_ns(video_track_num, self.cut_parameters.start_ns.unwrap_or(0) as i64)?
             } else {
                 // no video tracks, use cut start as reference for shifting 
                 self.cut_parameters.start_ns.unwrap_or(0) as i64
@@ -523,6 +523,8 @@ impl FileSource {
                             self.output_timecode_scale,
                         )?;
                         filtered.push(block);
+                    } else { // just add to output if no start specified
+                        filtered.push(cluster.blocks[i].clone());
                     }
                 }
             }

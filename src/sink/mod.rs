@@ -69,11 +69,12 @@ impl OutputSink<Uninitialized> {
         duration_ns: u64,
         timecode_scale: u64,
     ) -> Result<OutputSink<Initialized>> {
+        println!("duration_ns: {}, timecode_scale: {}", duration_ns, timecode_scale);
         let info = Info {
             timestamp_scale: TimestampScale(timecode_scale),
             muxing_app: MuxingApp(APP_NAME.to_string()),
             writing_app: WritingApp(APP_NAME.to_string()),
-            duration: Some(Duration(duration_ns as f64)),
+            duration: Some(Duration((duration_ns / timecode_scale) as f64)),
             date_utc: Some(DateUtc(chrono::Utc::now().timestamp())),
             title: None,
             segment_uuid: Some(SegmentUuid(uuid::Uuid::new_v4().as_bytes().to_vec())),

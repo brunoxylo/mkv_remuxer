@@ -25,6 +25,7 @@
                 "--to", "20s",
                 "-m", "0:1",
                 "-m", "0:3",
+                "--seek-mode", "snap",
                 "/tmp/output_debug.mkv"
             ],
             "cwd": "${workspaceFolder}"

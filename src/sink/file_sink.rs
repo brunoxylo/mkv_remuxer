@@ -7,6 +7,9 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
+const CUE_INTERVAL_NS: u64 = 15_000_000_000; // 15 seconds
+
+
 /// File-based sink implementation for writing MKV files (legacy trait implementation)
 pub struct FileSink {
     writer: BufWriter<File>,
@@ -84,9 +87,10 @@ impl Sink for FileSink {
             .duration
             .map(|d| (d.0 * info.timestamp_scale.0 as f64) as u64)
             .unwrap_or(0);
-        let num_clusters = (duration_ns / crate::cluster_warpper::CLUSTER_MAX_DURATION_NS).max(1);
-        // Reserve ~64 bytes per cue point, plus some safety margin
-        let estimated_cues_size = num_clusters * 64 + 1024;
+        let num_clusters = (duration_ns / CUE_INTERVAL_NS).max(1);
+        // Reserve ~64 bytes per cue point, plus some safety 
+        let estimated_cues_size = num_clusters * 25 + 1024;
+        println!("Reserving {} bytes for cues (estimated {} cue points, total duration {} ns)", estimated_cues_size, num_clusters, duration_ns);
 
         self.cues_offset = self.writer.stream_position()?;
         self.reserved_cues_size = estimated_cues_size;
@@ -119,7 +123,6 @@ impl Sink for FileSink {
         let cluster_timestamp_ns = cluster_timestamp_ticks * self.timescale;
         
         // Add cue point if 15 seconds have passed since last cue
-        const CUE_INTERVAL_NS: u64 = 15_000_000_000; // 15 seconds
         if cluster_timestamp_ns >= self.last_cue_timestamp_ns + CUE_INTERVAL_NS || self.cue_points.is_empty() {
             self.cue_points.push((cluster_timestamp_ticks, cluster_position));
             self.last_cue_timestamp_ns = cluster_timestamp_ns;
@@ -187,6 +190,7 @@ impl Sink for FileSink {
                     cues_buf.clear();
                     cues_to_write.write_to(&mut cues_buf)?;
                 }
+
                 
                 let kept_count = cues_to_write.cue_point.len();
                 let removed_count = original_count - kept_count;
@@ -210,6 +214,8 @@ impl Sink for FileSink {
                     )));
                 }
             }
+            println!("cue buf size after truncation: {}", cues_buf.len());
+
             
             self.writer.write_all(&cues_buf)?;
             
