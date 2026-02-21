@@ -1,5 +1,6 @@
 mod block_ext;
 mod cluster_warpper;
+mod codec_parsers;
 mod error;
 mod metling_pot;
 mod remuxer;
@@ -9,6 +10,7 @@ mod source_mappings;
 pub mod test_utils;
 
 // Re-exports
+pub use codec_parsers::{Av1FrameHeader, FrameType, Vp9FrameHeader, Vp9FrameType, Vp9RefFrame, Vp8FrameHeader, Vp8FrameType, Vp8RefFrame};
 pub use block_ext::ClusterBlockExt;
 pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper, CLUSTER_MAX_DURATION_NS, CLUSTER_MAX_SIZE_BYTES};
 pub use error::{Error, Result};

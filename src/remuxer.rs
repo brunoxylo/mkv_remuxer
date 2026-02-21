@@ -33,7 +33,7 @@ pub struct RemuxStats {
 /// * `RemuxStats` - Statistics about the remuxing operation
 ///
 /// # Errors
-/// * Returns error if SnapNearestKeyframe is used with more than 1 output video stream
+/// * Currently only supports Squeeze seek type
 /// * Returns error if sources have incompatible timescales
 /// * Returns error if track mappings are invalid
 ///
@@ -58,7 +58,7 @@ pub struct RemuxStats {
 /// // Remux with cutting
 /// let source3 = InputSource::from(FileSource::new("input3.mkv")?);
 /// let output2 = OutputSink::from(FileSink::new("output2.mkv")?);
-/// let cut = CutConfig::new(SeekType::Freeze)
+/// let cut = CutConfig::new(SeekType::Squeeze)
 ///     .with_range(5_000_000_000, 15_000_000_000); // 5s to 15s
 /// let stats = remux(vec![source3], output2, Some(cut), None, None)?;
 ///
@@ -129,23 +129,6 @@ pub fn remux(
         sources_mappings.add_all_subtitle_tracks()?;
     }
 
-    // Step 4: Validate keyframe snap usage
-    if let Some(ref cut_config) = cut_config {
-        if matches!(cut_config.seek_type, SeekType::SnapNearestKeyframe) {
-            let video_count = count_video_tracks_in_mappings(&sources_mappings)?;
-            if video_count > 1 {
-                warn!(
-                    "SnapNearestKeyframe cannot be used with {} video streams",
-                    video_count
-                );
-                return Err(Error::InvalidConfig(format!(
-                    "SnapNearestKeyframe seek type cannot be used with {} video streams (>1). \
-                    Use Squeeze, Freeze, or DirtyCut instead, or reduce to single video track.",
-                    video_count
-                )));
-            }
-        }
-    }
 
     // Step 5: Get output tracks metadata
     let output_tracks = sources_mappings.get_output_tracks_metadata()?;

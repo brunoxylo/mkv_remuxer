@@ -1,11 +1,9 @@
-use super::{ClusterOfInterestCache, SeekType, Source};
+use super::{PreRollCalculator, SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::{Error, Result};
-use core::time;
-use log::{debug, info};
+use log::debug;
 use mkv_element::io::blocking_impl::*;
-use mkv_element::{ClusterBlock, prelude::*};
-use std::collections::HashMap;
+use mkv_element::prelude::*;
 use std::fmt;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
@@ -21,10 +19,14 @@ pub struct FileSource {
     info: Info,
     chapters: Option<Chapters>,
     cut_parameters: CutConfig,
-    /// position in the file where our first cluster of interest starts (usually around the specified cut start position)
-    initial_cluster_pos: ClusterOfInterestCache,
-    end_cluster_pos: ClusterOfInterestCache,
+    /// Pre-roll calculator for codec-aware frame dependencies
+    pre_roll_calculator: Option<PreRollCalculator>,
+    /// Index of all clusters: (file_position, timestamp_ns)
+    cluster_index: Vec<(u64, u64)>,
+    /// Current cluster position for iteration
+    current_cluster_idx: usize,
     first_video_track_num: Option<u64>,
+    video_codec_id: Option<String>,
     finished: bool,
 }
 
@@ -50,7 +52,7 @@ impl FileSource {
         let mut tracks = None;
         let mut info = None;
         let mut chapters = None;
-        let mut initial_cluster_pos: Option<ClusterOfInterestCache> = None;
+        let mut first_cluster_pos: Option<u64> = None;
 
         loop {
             let pos = file.stream_position()?;
@@ -70,11 +72,7 @@ impl FileSource {
             } else if header.id == Chapters::ID {
                 chapters = Some(Chapters::read_element(&header, &mut file)?);
             } else if header.id == Cluster::ID {
-                initial_cluster_pos = Some(ClusterOfInterestCache::new(
-                    pos,
-                    file.try_clone()?,
-                    timecode_scale,
-                ));
+                first_cluster_pos = Some(pos);
                 break;
             } else {
                 let size = header.size.value;
@@ -84,22 +82,26 @@ impl FileSource {
             }
         }
 
-        let initial_cluster_pos = initial_cluster_pos
+        let _first_cluster_pos = first_cluster_pos
             .ok_or_else(|| Error::InvalidConfig("No clusters found".to_string()))?;
 
-        let first_video_track_num = tracks
+        let tracks_ref = tracks
             .as_ref()
-            .ok_or_else(|| Error::InvalidConfig("Missing Tracks element".to_string()))?
+            .ok_or_else(|| Error::InvalidConfig("Missing Tracks element".to_string()))?;
+
+        let first_video_track_num = tracks_ref
             .get_all_video_tracks()
             .first()
             .cloned();
 
-        // Initialize end_cluster_pos at the same position as initial, will be updated during initialize_with_cut
-        let end_cluster_pos = ClusterOfInterestCache::new(
-            initial_cluster_pos.position,
-            file.try_clone()?,
-            timecode_scale,
-        );
+        // Get video codec ID for pre-roll calculator
+        let video_codec_id: Option<String> = if let Some(video_track) = first_video_track_num {
+            tracks_ref.track_entry.iter()
+                .find(|t| t.track_number.0 == video_track)
+                .map(|t| t.codec_id.0.clone())
+        } else {
+            None
+        };
 
         Ok(Self {
             file,
@@ -110,14 +112,16 @@ impl FileSource {
             info: info.ok_or_else(|| Error::InvalidConfig("Missing Info element".to_string()))?,
             chapters,
             cut_parameters: CutConfig {
-                seek_type: SeekType::SnapNearestKeyframe,
+                seek_type: SeekType::Squeeze, // Only Squeeze mode supported now
                 start_ns: None,
                 end_ns: None,
             },
-            initial_cluster_pos,
-            end_cluster_pos,
+            pre_roll_calculator: None, // Will be initialized when needed
+            cluster_index: Vec::new(), // Will be built on demand
+            current_cluster_idx: 0,
             finished: false,
             first_video_track_num,
+            video_codec_id,
         })
     }
 
@@ -126,7 +130,17 @@ impl FileSource {
         // Returns Vec of (file_position, timestamp_ns)
         let mut cluster_index = Vec::new();
         
-        self.file.seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
+        // Seek to beginning of clusters (after metadata)
+        self.file.rewind()?;
+        
+        // Skip EBML and Segment headers, find first cluster
+        let _ebml_header = Header::read_from(&mut self.file)?;
+        let ebml_size = _ebml_header.size.value;
+        if ebml_size > 0 && !_ebml_header.size.is_unknown {
+            self.file.seek(SeekFrom::Current(ebml_size as i64))?;
+        }
+        
+        let _segment_header = Header::read_from(&mut self.file)?;
         
         loop {
             let current_pos = self.file.stream_position()?;
@@ -145,7 +159,9 @@ impl FileSource {
             } else {
                 let size = header.size.value;
                 if size > 0 && !header.size.is_unknown {
-                    self.file.seek(SeekFrom::Current(size as i64))?;
+                    if self.file.seek(SeekFrom::Current(size as i64)).is_err() {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -221,13 +237,16 @@ impl FileSource {
 
     fn find_start_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
         let pos = self.find_cluster_by_binary_search(target_timestamp_ns, true)?;
-        self.initial_cluster_pos.set_pos(pos);
+        // Find index for this position
+        self.current_cluster_idx = self.cluster_index.iter()
+            .position(|(p, _)| *p == pos)
+            .unwrap_or(0);
         Ok(())
     }
     
-    fn find_end_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
-        let pos = self.find_cluster_by_binary_search(target_timestamp_ns, false)?;
-        self.end_cluster_pos.set_pos(pos);
+    fn find_end_cluster(&mut self, _target_timestamp_ns: u64) -> Result<()> {
+        // For now, we'll process until natural end or cut point
+        // TODO: Could optimize by finding exact end cluster
         Ok(())
     }
 
@@ -237,91 +256,17 @@ impl FileSource {
         }
 
         let orig_block_count = cluster.blocks.len();
-
         let orig_cluster_ticks = cluster.timestamp.0 as i64;
         let orig_cluster_ns = cluster.get_timestamp_ms(self.timecode_scale) as i64;
 
-        // Shift cluster timestamp
-        let shift_reference =  if self.cut_parameters.seek_type == SeekType::SnapNearestKeyframe {
-            if let Some(video_track_num) = self.first_video_track_num {
-                self.initial_cluster_pos
-                    .get_closest_keyframe_timestamp_ns(video_track_num, self.cut_parameters.start_ns.unwrap_or(0) as i64)?
-            } else {
-                // no video tracks, use cut start as reference for shifting 
-                self.cut_parameters.start_ns.unwrap_or(0) as i64
-            }
-        } else {
-            self.cut_parameters.start_ns.unwrap_or(0) as i64
-        };
-        let shifted_ns = orig_cluster_ns - shift_reference as i64;
+        // Squeeze mode: shift cluster timestamp based on start position
+        let shift_reference = self.cut_parameters.start_ns.unwrap_or(0) as i64;
+        let shifted_ns = orig_cluster_ns - shift_reference;
         cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
         let shifted_cluster_ticks = cluster.timestamp.0 as i64;
 
-        let mut filtered = Vec::with_capacity(orig_block_count);
-
-        let result = match self.cut_parameters.seek_type {
-            SeekType::SnapNearestKeyframe => {
-                // Simple: just shift timestamps, but we still need to respect end_ns
-                let mut filtered = Vec::with_capacity(cluster.blocks.len());
-                for mut block in cluster.blocks {
-                    let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
-                    if let Some(end) = self.cut_parameters.end_ns {
-                        if abs_ns as u64 > end {
-                            //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
-                            continue;
-                        }
-                    } 
-                    
-                    // only output after desired keyframe
-                    if abs_ns < shift_reference {
-                        continue;
-                    }
-                    block.set_timestamp_ns(
-                        abs_ns - shift_reference,
-                        cluster.timestamp.0 as i64,
-                        self.output_timecode_scale,
-                    )?;
-                    print!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?, abs_ns, self.cut_parameters.end_ns, shift_reference);
-                    filtered.push(block);
-                }
-                cluster.blocks = filtered;
-                Ok(cluster)
-            }
-            SeekType::DirtyCut => {
-                // Drop frames outside range
-                for mut block in cluster.blocks {
-                    let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
-                    let abs_ns = abs_ns as u64;
-                    if let Some(start) = self.cut_parameters.start_ns {
-                        if abs_ns < start {
-                            continue;
-                        }
-                    }
-                    if let Some(end) = self.cut_parameters.end_ns {
-                        if abs_ns > end {
-                            continue;
-                        }
-                    }
-                    if let Some(start) = self.cut_parameters.start_ns {
-                        let offset = abs_ns as i64 - start as i64;
-                        block.set_timestamp_ns(
-                            offset,
-                            cluster.timestamp.0 as i64,
-                            self.output_timecode_scale,
-                        )?;
-                    }
-                    filtered.push(block);
-                }
-                cluster.blocks = filtered;
-                Ok(cluster)
-            }
-            SeekType::Freeze => {
-                self.process_freeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks)
-            }
-            SeekType::Squeeze => {
-                self.process_squeeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks)
-            }
-        };
+        // Process with Squeeze logic
+        let result = self.process_squeeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks);
 
         if let Ok(ref processed) = result {
             if processed.blocks.is_empty() && orig_block_count > 0 {
@@ -336,112 +281,6 @@ impl FileSource {
         }
 
         result
-    }
-
-    fn process_freeze_cluster(
-        &mut self,
-        mut cluster: Cluster,
-        orig_cluster_ticks: i64,
-        shifted_cluster_ticks: i64,
-    ) -> Result<Cluster> {
-        let mut is_freeze_frame_set = false;
-        let mut filtered = Vec::with_capacity(cluster.blocks.len());
-        for i in 0..cluster.blocks.len() {
-            let track_num = cluster.blocks[i].track_number()?;
-            let kind = self
-                .tracks
-                .get_track_kind(track_num)
-                .ok_or_else(|| Error::TrackNotFound(track_num))?;
-
-            let abs_ns = cluster.blocks[i]
-                .timestamp_ns(orig_cluster_ticks, self.timecode_scale)
-                .unwrap_or(0);
-
-            match kind {
-                TrackKind::Video => {
-                    // Drop video after end
-                    if let Some(end) = self.cut_parameters.end_ns {
-                        if abs_ns > end as i64 {
-                            continue;
-                        }
-                    }
-
-                    if let Some(start) = self.cut_parameters.start_ns {
-                        let start = start as i64;
-                        if abs_ns < start {
-                            continue;
-                        } // Drop non-keyframes before start
-
-                        let keyframe_timestamp_ns = self
-                            .initial_cluster_pos
-                            .get_keyframe_timestamp_ns(track_num, start, true)?;
-
-                        if abs_ns >= start && abs_ns <= keyframe_timestamp_ns {
-                            debug!("inside freeze zone");
-
-                            if !is_freeze_frame_set {
-                                let cluster_pos = self
-                                    .initial_cluster_pos
-                                    .get_keyframe_block_idx(track_num, true, start)?;
-                                if let Some(keyframe_block) = cluster.blocks.get(cluster_pos) {
-                                    let mut new_block = keyframe_block.clone(); // use keyframe block as freeze frame
-                                    new_block.set_timestamp_ns(
-                                        0,
-                                        cluster.timestamp.0 as i64,
-                                        self.output_timecode_scale,
-                                    )?;
-                                    filtered.push(new_block);
-                                    is_freeze_frame_set = true;
-                                } else {
-                                    debug!("No keyframe block found for freeze frame");
-                                }
-                            } else {
-                                continue; // Drop non-keyframes before first keyframe
-                            }
-                        } else {
-                            // Shift video
-                            let offset = abs_ns as i64 - start as i64;
-                            let mut block = cluster.blocks[i].clone();
-                            block.set_timestamp_ns(
-                                offset,
-                                cluster.timestamp.0 as i64,
-                                self.output_timecode_scale,
-                            )?;
-                            filtered.push(block);
-                        }
-                    }
-                }
-                _ => {
-                    // all other tracks just shift timestamps if within range
-                    // Drop after end
-                    if let Some(end) = self.cut_parameters.end_ns {
-                        if abs_ns > end as i64 {
-                            continue;
-                        }
-                    }
-                    // Drop before start
-                    if let Some(start) = self.cut_parameters.start_ns {
-                        if abs_ns < start as i64 {
-                            continue;
-                        }
-                        // Shift audio
-                        let offset = abs_ns as i64 - start as i64;
-                        let mut block = cluster.blocks[i].clone();
-                        block.set_timestamp_ns(
-                            offset,
-                            cluster.timestamp.0 as i64,
-                            self.output_timecode_scale,
-                        )?;
-                        filtered.push(block);
-                    } else { // just add to output if no start specified
-                        filtered.push(cluster.blocks[i].clone());
-                    }
-                }
-            }
-        }
-
-        cluster.blocks = filtered;
-        Ok(cluster)
     }
 
     fn process_squeeze_cluster(
@@ -560,62 +399,22 @@ impl Source for FileSource {
         )
     }
 
-    fn get_duration(& mut self) -> Result<u64> {
-        let orig_duration =     match self.info.duration {
-                Some(duration) => Some((duration.0 * self.timecode_scale as f64) as u64),
-                None => None,
+    fn get_duration(&mut self) -> Result<u64> {
+        // Get original duration from Info element
+        let orig_duration = match self.info.duration {
+            Some(duration) => (duration.0 * self.timecode_scale as f64) as u64,
+            None => return Err(Error::InvalidConfig("No duration in Info element".to_string())),
         };
-        let video_track_num = self.first_video_track_num;
 
-        if let Some(v_track) = video_track_num && self.cut_parameters.seek_type == SeekType::SnapNearestKeyframe {
-            let start_keyframe = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                v_track,
-                self.cut_parameters.start_ns.unwrap_or(0) as i64,
-            )?;
-            if let Some (end_pos) = self.cut_parameters.end_ns {
-                let end_keyframe = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                    v_track,
-                    end_pos as i64,
-                )?;
-                if end_keyframe > start_keyframe {
-                    return Ok((end_keyframe - start_keyframe) as u64);
-                } else {
-                    return Err(Error::InvalidConfig("End keyframe is before start keyframe".to_string()));
-                }
-            } else {
-                if let Some(orig_dur) = orig_duration {
-                    if orig_dur > start_keyframe as u64 {
-                        return Ok(orig_dur - start_keyframe as u64);
-                    } else {
-                        return Err(Error::InvalidConfig("start keyframe exceeds original duration".to_string()));
-                    }
-                } else {
-                    return Err(Error::InvalidConfig("Original duration unknown, cannot calculate cut duration without end timestamp".to_string()));
-                }
-            }
+        // If cutting, calculate duration based on cut parameters
+        let start = self.cut_parameters.start_ns.unwrap_or(0);
+        let end = self.cut_parameters.end_ns.unwrap_or(orig_duration);
+        
+        if end > start {
+            Ok(end - start)
         } else {
-            // no video tracks or no SnapKeyframe, just use cut start and end timestamps to calculate duration
-            let start = self.cut_parameters.start_ns.unwrap_or(0);
-           if let Some(dur) = orig_duration {
-                let end = self.cut_parameters.end_ns.unwrap_or(dur);
-                if end > start {
-                    return Ok(end - start);
-                } else {
-                    return Err(Error::InvalidConfig("End timestamp is before start timestamp".to_string()));
-                }
-            } else {
-                if let Some(end) = self.cut_parameters.end_ns {
-                    if end > start {
-                        return Ok(end - start);
-                    } else {
-                        return Err(Error::InvalidConfig("End timestamp is before start timestamp".to_string()));
-                    }
-                } else {
-                    return Err(Error::InvalidConfig("Original duration unknown, cannot calculate cut duration without end timestamp".to_string()));
-                }
-            }
+            Err(Error::InvalidConfig("End timestamp is before start timestamp".to_string()))
         }
-
     }
 
     fn get_next_cluster(&mut self) -> Result<Option<Cluster>> {
@@ -683,8 +482,15 @@ impl Source for FileSource {
             self.output_timecode_scale = ts;
         }
 
-        self.file
-            .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
+        // Build cluster index if not already built
+        if self.cluster_index.is_empty() {
+            self.cluster_index = self.build_cluster_index()?;
+        }
+
+        // Seek to first cluster
+        if let Some((pos, _)) = self.cluster_index.first() {
+            self.file.seek(SeekFrom::Start(*pos))?;
+        }
         Ok(())
     }
 
@@ -699,13 +505,31 @@ impl Source for FileSource {
             self.output_timecode_scale = ts;
         }
 
+        // Build cluster index if not already built
+        if self.cluster_index.is_empty() {
+            self.cluster_index = self.build_cluster_index()?;
+        }
+
+        // Initialize pre-roll calculator if video track exists
+        if self.pre_roll_calculator.is_none() {
+            if let Some(codec_id) = &self.video_codec_id {
+                self.pre_roll_calculator = Some(PreRollCalculator::new(
+                    self.file.try_clone()?,
+                    self.timecode_scale,
+                    codec_id,
+                ));
+            }
+        }
+
+        // Find starting cluster if start time specified
         if let Some(start) = start_ns {
             self.find_start_cluster(start)?;
-            self.file
-                .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
+            if let Some((pos, _)) = self.cluster_index.get(self.current_cluster_idx) {
+                self.file.seek(SeekFrom::Start(*pos))?;
+            }
         }
         
-        // Also find end cluster if end timestamp is provided
+        // Note end cluster (used for optimization, not strictly necessary)
         if let Some(end) = end_ns {
             self.find_end_cluster(end)?;
         }
@@ -716,50 +540,10 @@ impl Source for FileSource {
             end_ns,
         };
 
-        let video_tracks = self.tracks.get_all_video_tracks();
-        let duration_ns = self.get_duration();
-        print!("Orig duration: {} ns", duration_ns.as_ref().ok().copied().unwrap_or(0));
-        let _orig_end_ns: Option<u64> = match end_ns {
-            Some(end) => Some(end),
-            None => match duration_ns {
-                Ok(dur) => Some(dur),
-                Err(_) => None,
-            },
-        };
-
-        let keyframe_pos_ns: i64 = match video_tracks.first() {
-            Some(video_track_num) => {
-                // we have a video track, so look for keyframes to determine start position
-                match seek_type {
-                    SeekType::SnapNearestKeyframe => {
-                        self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                            *video_track_num,
-                            start_ns.unwrap_or(0) as i64,
-                        )?
-                    }
-                    SeekType::DirtyCut => {
-                        self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                            *video_track_num,
-                            start_ns.unwrap_or(0) as i64,
-                        )?
-                    }
-                    SeekType::Freeze => self.initial_cluster_pos.get_keyframe_timestamp_ns(
-                        *video_track_num,
-                        start_ns.unwrap_or(0) as i64,
-                        true,
-                    )?, // use keyframe after start for freeze since we will use that keyframe as freeze frame
-                    SeekType::Squeeze => self.initial_cluster_pos.get_keyframe_timestamp_ns(
-                        *video_track_num,
-                        start_ns.unwrap_or(0) as i64,
-                        false,
-                    )?, // use keyframe before start and squeeze all frames to zero
-                }
-            }
-            None => start_ns.unwrap_or(0) as i64, // we only consider video keyframes for cutting, so if there are no video tracks just use the specified start timestamp as is
-        };
-        self.file
-            .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
-
-        Ok(keyframe_pos_ns - start_ns.unwrap_or(0) as i64)
+        // For Squeeze mode, we always cut at keyframe before start
+        // Pre-roll frames will be handled by PreRollCalculator
+        let keyframe_offset = 0i64; // We handle this via pre-roll now
+        
+        Ok(keyframe_offset)
     }
 }

@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 mod cluster_cache;
 mod file_source;
 
-pub use cluster_cache::ClusterOfInterestCache;
+pub use cluster_cache::PreRollCalculator;
 pub use file_source::FileSource;
 
 // Typestate marker types
@@ -18,14 +18,9 @@ pub struct Initialized;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeekType {
-    /// (fast, not exact, nice) Seek to the nearest keyframe before or after the target timestamp
-    SnapNearestKeyframe,
-    /// (slow on client, exact, nice) Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 0
+    /// Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 0
+    /// This provides frame-accurate cuts with pre-roll for codec state initialization.
     Squeeze,
-    /// (fast, exact, ugly) Move the next keyframe to timestamp 0 (while omitting frames in between), freezing the video from start until the original next keyframes position
-    Freeze,
-    // (fast, exact, ugly) Just cut at the exact timestamp, without respecting keyframe boundaries (may cause playback issues)
-    DirtyCut,
 }
 /// Represents a source of MKV data (input file or stream)
 pub trait Source: Display {
@@ -218,11 +213,8 @@ mod tests {
     const CUT_END_NS: u64 = 15_000_000_000;
     const CUT_MAX_NS: u64 = CUT_END_NS - CUT_START_NS;
 
-    const SEEK_TYPES: [SeekType; 4] = [
-        SeekType::Freeze,
+    const SEEK_TYPES: [SeekType; 1] = [
         SeekType::Squeeze,
-        SeekType::SnapNearestKeyframe,
-        SeekType::DirtyCut,
     ];
 
     fn test_file_path() -> PathBuf {
@@ -317,18 +309,13 @@ mod tests {
             println!("Testing seek type: {:?}", seek_type);
             for mut source in sources_implementations() {
                 print!("  Source Implementation: {}... ", source);
-                let (source, offset) = source.initialize_with_cut(
+                let (source, _offset) = source.initialize_with_cut(
                     None,
                     seek_type.clone(),
                     Some(CUT_START_NS),
                     Some(CUT_END_NS),
                 )?;
-                let mut max_ts = CUT_MAX_NS;
-                println!("our offset is {}", offset);
-                if matches!(seek_type, SeekType::SnapNearestKeyframe) {
-                    max_ts = (max_ts as i64 - offset as i64) as u64;
-                }
-                validate_stream(source, Some(max_ts))?;
+                validate_stream(source, Some(CUT_MAX_NS))?;
             }
         }
 

@@ -29,12 +29,9 @@ struct Args {
     #[arg(long = "to")]
     end: Option<String>,
 
-    /// Seek/cut mode: freeze, squeeze, snap, dirty
-    /// - freeze: Freeze frame before cut point (fast, visible artifact)
-    /// - squeeze: Compress pre-roll frames (slow decode, seamless)
-    /// - snap: Snap to nearest keyframe (fast, inexact timing)
-    /// - dirty: Cut at exact position (may cause decoding issues)
-    #[arg(long = "seek-mode", default_value = "freeze")]
+    /// Seek/cut mode: currently only 'squeeze' is supported
+    /// - squeeze: Include frames from last keyframe (frame-accurate with pre-roll)
+    #[arg(long = "seek-mode", default_value = "squeeze")]
     seek_mode: String,
 
     /// Track mappings in format "source:track" (e.g., "0:1" for track 1 from first input)
@@ -102,12 +99,9 @@ fn main() -> Result<()> {
 
     // Parse seek mode
     let seek_type = match args.seek_mode.as_str() {
-        "freeze" => SeekType::Freeze,
         "squeeze" => SeekType::Squeeze,
-        "snap" => SeekType::SnapNearestKeyframe,
-        "dirty" => SeekType::DirtyCut,
         _ => anyhow::bail!(
-            "Invalid seek mode: {}. Valid options: freeze, squeeze, snap, dirty",
+            "Invalid seek mode: {}. Only 'squeeze' is currently supported",
             args.seek_mode
         ),
     };
