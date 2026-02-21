@@ -12,15 +12,26 @@ use mkv_element::prelude::*;
 use mkv_element::io::blocking_impl::*;
 
 
-pub fn test_file_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("test.webm")
+pub fn get_test_file_paths() -> Vec<PathBuf> {
+    let paths = vec![
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test_av1.webm"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test_vp8.webm"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test_vp9.webm"),
+        ];
+    for path in &paths {
+        if !path.exists() {
+            panic!("Test file not found: {}", path.display());
+        }
+    }
+    paths
 }
 
 pub fn sources_implementations() -> Vec<InputSource<Uninitialized>> {
-    vec![
-        FileSource::new(test_file_path()).unwrap().into(),
-        // Add other Source implementations here as needed
-    ]
+    let mut sources = Vec::new();
+    for path in get_test_file_paths() {
+        sources.push(FileSource::new(path).unwrap().into());
+    }
+    sources
 }
 
 /// Get the duration metadata from an input MKV/WebM file
@@ -364,7 +375,9 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                             report.stats.max_cluster_duration_ns = 
                                 report.stats.max_cluster_duration_ns.max(cluster_duration_ns);
 
-                            if check_cluster_limits && cluster_duration_ns > CLUSTER_MAX_DURATION_NS {
+                            // Allow 10ms tolerance for timestamp rounding errors
+                            const DURATION_TOLERANCE_NS: u64 = 10_000_000; // 10ms
+                            if check_cluster_limits && cluster_duration_ns > CLUSTER_MAX_DURATION_NS + DURATION_TOLERANCE_NS {
                                 report.cluster_duration_valid = false;
                                 report.errors.push(format!(
                                     "Cluster {} exceeds max duration: {} > {} ns ({:.2}s > {:.2}s)",

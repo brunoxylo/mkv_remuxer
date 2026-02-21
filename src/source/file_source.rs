@@ -2,17 +2,20 @@ use super::{PreRollCalculator, SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::{Error, Result};
 use log::debug;
+use log4rs::append::file;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::fmt;
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use super::CutConfig;
 
+const SEEK_AFTER_END_TIME_NS :u64 = 50_000_000_000;
 
 pub struct FileSource {
     file: File,
+    path: PathBuf,
     timecode_scale: u64,
     output_timecode_scale: u64,
     tracks: Tracks,
@@ -32,6 +35,7 @@ pub struct FileSource {
 
 impl FileSource {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let mut file = File::open(path)?;
 
         // Read EBML header
@@ -105,6 +109,7 @@ impl FileSource {
 
         Ok(Self {
             file,
+            path: path_buf,
             timecode_scale,
             output_timecode_scale: timecode_scale,
             tracks: tracks
@@ -290,6 +295,8 @@ impl FileSource {
         shifted_cluster_ticks: i64,
     ) -> Result<Cluster> {
         let mut filtered = Vec::with_capacity(cluster.blocks.len());
+        let orig_cluster_ns = (orig_cluster_ticks * self.timecode_scale as i64) / 1_000_000;
+        
         for mut block in cluster.blocks {
             let track_num = block.track_number()?;
             let kind = self
@@ -375,7 +382,10 @@ impl FileSource {
 
 impl fmt::Display for FileSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FileSource",)
+        let own_file_name = self.path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        write!(f, "FileSource({})", own_file_name)
     }
 }
 
@@ -440,10 +450,12 @@ impl Source for FileSource {
                     }
                 };
 
+                let cluster_ts_ms = cluster.get_timestamp_ms(self.timecode_scale);
+
                 // Check if we should stop based on end time
                 if let Some(end_ns) = self.cut_parameters.end_ns {
-                    if cluster.get_timestamp_ms(self.timecode_scale) > end_ns {
-                        println!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ms(self.timecode_scale), end_ns);
+                    if cluster_ts_ms > end_ns + SEEK_AFTER_END_TIME_NS {
+                        println!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster_ts_ms, end_ns);
                         self.finished = true;
                         return Ok(None);
                     }

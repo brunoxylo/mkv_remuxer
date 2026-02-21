@@ -51,8 +51,10 @@ impl ClusterReadWrapper {
 /// Wrapper for building a cluster with automatic size and duration tracking
 pub struct ClusterWriteWrapper {
     cluster: Cluster,
-    /// Duration of the cluster in nanoseconds
-    duration_ns: u64,
+    /// Timestamp of first block in nanoseconds (None if no blocks yet)
+    first_block_ns: Option<i64>,
+    /// Timestamp of last block in nanoseconds (None if no blocks yet)
+    last_block_ns: Option<i64>,
     /// Size of the cluster in bytes (approximate)
     size_bytes: u64,
     /// Timecode scale for timestamp calculations
@@ -76,7 +78,8 @@ impl ClusterWriteWrapper {
                 position: None,
                 prev_size: None,
             },
-            duration_ns: 0,
+            first_block_ns: None,
+            last_block_ns: None,
             size_bytes: 0,
             timecode_scale,
             cluster_max_duration_ns: CLUSTER_MAX_DURATION_NS,
@@ -98,21 +101,33 @@ impl ClusterWriteWrapper {
             ClusterBlock::Simple(sb) => sb.0.len(),
             ClusterBlock::Group(bg) => bg.block.0.len(),
         };
-        // Update duration (last block timestamp - first block timestamp)
-        let block_end_ns = absolute_timestamp_ns;
-        let cluster_start_ns = self.cluster.timestamp.0 * self.timecode_scale;
-        let cluster_duration = (block_end_ns as i64 - cluster_start_ns as i64).max(0);
+        
+        // Calculate what the cluster duration would be if we add this block
+        let new_duration_ns = if let Some(first) = self.first_block_ns {
+            // Cluster already has blocks, calculate span including this new block
+            let earliest = first.min(absolute_timestamp_ns);
+            let latest = self.last_block_ns.unwrap().max(absolute_timestamp_ns);
+            (latest - earliest).max(0) as u64
+        } else {
+            // This would be the first block, duration is 0
+            0
+        };
 
-        // Check if the cluster has reached size or duration limits
-        if self.duration_ns as i64 + cluster_duration > self.cluster_max_duration_ns as i64
-            || self.size_bytes as i64 + block_size as i64 > self.cluster_max_size_bytes as i64
+        // Check if adding this block would exceed limits
+        if new_duration_ns > self.cluster_max_duration_ns
+            || self.size_bytes + block_size as u64 > self.cluster_max_size_bytes
         {
             return Err(Error::ClusterIsFull(format!(
-                "limit bytes: {}, duration: {}, block bytes: {}",
-                self.cluster_max_size_bytes, self.cluster_max_duration_ns, block_size
+                "limit bytes: {}, duration: {} ns, new duration: {} ns, block bytes: {}",
+                self.cluster_max_size_bytes, self.cluster_max_duration_ns, new_duration_ns, block_size
             )));
         }
-        self.duration_ns += cluster_duration as u64;
+        
+        // Limits OK, now update tracking
+        if self.first_block_ns.is_none() {
+            self.first_block_ns = Some(absolute_timestamp_ns);
+        }
+        self.last_block_ns = Some(absolute_timestamp_ns);
         self.size_bytes += block_size as u64;
 
         // Add block to cluster
@@ -134,7 +149,11 @@ impl ClusterWriteWrapper {
 
     /// Get the current duration in nanoseconds
     pub fn duration_ns(&self) -> u64 {
-        self.duration_ns
+        if let (Some(first), Some(last)) = (self.first_block_ns, self.last_block_ns) {
+            (last - first).max(0) as u64
+        } else {
+            0
+        }
     }
 
     /// Get the current size in bytes

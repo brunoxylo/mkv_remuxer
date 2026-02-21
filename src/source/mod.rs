@@ -217,10 +217,6 @@ mod tests {
         SeekType::Squeeze,
     ];
 
-    fn test_file_path() -> PathBuf {
-        test_utils::test_file_path()
-    }
-
     fn sources_implementations() -> Vec<InputSource<Uninitialized>> {
         test_utils::sources_implementations()
     }
@@ -289,7 +285,6 @@ mod tests {
 
     #[test]
     fn test_source_monotonic_and_start_times() -> Result<()> {
-        assert!(test_file_path().exists(), "missing test.webm in repo root");
 
         for source in sources_implementations() {
             let source = source.initialize(None)?;
@@ -303,7 +298,6 @@ mod tests {
 
     #[test]
     fn test_source_cut_5s_to_15s() -> Result<()> {
-        assert!(test_file_path().exists(), "missing test.webm in repo root");
 
         for seek_type in SEEK_TYPES {
             println!("Testing seek type: {:?}", seek_type);

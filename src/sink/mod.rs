@@ -120,35 +120,43 @@ mod tests {
     use super::*;
     use crate::remux;
     use crate::source::{FileSource, InputSource, SeekType};
-    use crate::test_utils::{test_file_path, validate_mkv_output};
+    use crate::test_utils::{get_test_file_paths, validate_mkv_output};
     use crate::source::CutConfig;
 
     fn run_remux_test_with_seek_type(seek_type: SeekType) -> Result<()> {
-        // Setup: Create output path in temp directory
         let temp_dir = std::env::temp_dir();
         let seek_type_name = format!("{:?}", seek_type);
-        let output_path = temp_dir.join(format!("test_german_audio_{}.mkv", seek_type_name));
         
-        // Create input source from test.webm (uninitialized)
-        let input_path = test_file_path();
-        let source = FileSource::new(&input_path)?;
-        let input_source = InputSource::from(source);
-        
-        // Create output sink (uninitialized)
-        let output_sink = FileSink::new(&output_path)?;
-        let output = OutputSink::from(output_sink);
-        
-        // Configure cutting: from 20 seconds to the end
-        let start_ns = 20_000_000_000u64; // 20 seconds in nanoseconds
-        let cut_config = CutConfig::new(seek_type.clone())
-            .with_start(start_ns);
-        
-        // We need to pre-check for German audio tracks manually
-        // Initialize source temporarily to check tracks
-        let temp_source = FileSource::new(&input_path)?;
-        let temp_input = InputSource::from(temp_source);
-        let mut initialized_temp = temp_input.initialize(None)?;
-        let tracks = initialized_temp.get_tracks()?;
+        // Loop over all test files
+        let input_paths = get_test_file_paths();
+        for input_path in input_paths {
+            println!("Testing file: {}", input_path.display());
+            
+            // Setup: Create output path in temp directory
+            let file_name = input_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("test");
+            let output_path = temp_dir.join(format!("{}_german_audio_{}.mkv", file_name, seek_type_name));
+            
+            // Create input source from test file (uninitialized)
+            let source = FileSource::new(&input_path)?;
+            let input_source = InputSource::from(source);
+            
+            // Create output sink (uninitialized)
+            let output_sink = FileSink::new(&output_path)?;
+            let output = OutputSink::from(output_sink);
+            
+            // Configure cutting: from 20 seconds to the end
+            let start_ns = 20_000_000_000u64; // 20 seconds in nanoseconds
+            let cut_config = CutConfig::new(seek_type.clone())
+                .with_start(start_ns);
+            
+            // We need to pre-check for German audio tracks manually
+            // Initialize source temporarily to check tracks
+            let temp_source = FileSource::new(&input_path)?;
+            let temp_input = InputSource::from(temp_source);
+            let mut initialized_temp = temp_input.initialize(None)?;
+            let tracks = initialized_temp.get_tracks()?;
         
 
         let mut output_mappings = Vec::new();
@@ -229,6 +237,9 @@ mod tests {
         // Cleanup
         //let _ = std::fs::remove_file(&output_path);
         
+        println!("✓ Test passed for file: {}", input_path.display());
+        } // End of loop over test files
+        
         Ok(())
     }
 
@@ -239,21 +250,23 @@ mod tests {
 
     #[test]
     fn validate_input_file() -> Result<()> {
-        let input_path = test_file_path();
-        let report =  validate_mkv_output(&input_path, true, None, false, false)?;
-        print!("Input file validation report:\n{}", report.summary());
-                // Print report for debugging
-        if !report.is_valid() {
-            eprintln!("{}", report.summary());
-            for error in &report.errors {
-                eprintln!("ERROR: {}", error);
+        let input_paths = get_test_file_paths();
+        for input_path in input_paths {
+            println!("Validating input file: {}", input_path.display());
+            let report = validate_mkv_output(&input_path, true, None, false, false)?;
+            print!("Input file validation report:\n{}", report.summary());
+            // Print report for debugging
+            if !report.is_valid() {
+                eprintln!("{}", report.summary());
+                for error in &report.errors {
+                    eprintln!("ERROR: {}", error);
+                }
+                for warning in &report.warnings {
+                    eprintln!("WARNING: {}", warning);
+                }
             }
-            for warning in &report.warnings {
-                eprintln!("WARNING: {}", warning);
-            }
+            assert!(report.is_valid(), "Input file {} should be valid", input_path.display());
         }
-        assert!(report.is_valid(), "Input file should be valid");
         Ok(())
-
     }
 }

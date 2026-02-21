@@ -4,10 +4,13 @@ use crate::{
 };
 use log::{debug, warn};
 use mkv_element::prelude::*;
+use mkv_element::ClusterBlock;
 
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
     clusters: Vec<Option<ClusterReadWrapper>>,
+    /// Pending block that couldn't fit in previous cluster and needs to be retried
+    pending_block: Option<(ClusterBlock, i64, usize)>, // (block, timestamp_ns, source_index)
 }
 
 impl MeltingPot {
@@ -18,6 +21,7 @@ impl MeltingPot {
         Self {
             sources_mappings,
             clusters: initial_clusters,
+            pending_block: None,
         }
     }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
@@ -99,6 +103,21 @@ impl MeltingPot {
             }
 
             if let Some(mut o_cluster) = output_cluster.take() {
+                // First, try to add any pending block from previous cluster
+                if let Some((pending_block, pending_ts, pending_source_idx)) = self.pending_block.take() {
+                    match o_cluster.add_block(&pending_block, pending_ts) {
+                        Ok(_) => {
+                            // Pending block added successfully, continue with normal flow
+                        }
+                        Err(Error::ClusterIsFull(_)) => {
+                            // Still can't fit, keep as pending and return current cluster
+                            self.pending_block = Some((pending_block, pending_ts, pending_source_idx));
+                            return Ok(Some(o_cluster.finish()));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                
                 // add the block with the lowest timestamp to the output cluster
                 if let Some(lowest_index) = lowest_cluster_index {
                     if let Some(input_cluster) = &mut self.clusters[lowest_index] {
@@ -114,7 +133,8 @@ impl MeltingPot {
                                 match o_cluster.add_block(&block, lowest_timestamp_ns) {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
-                                        // Cluster is full, break the inner loop and start a new cluster
+                                        // Cluster is full, save this block as pending and return current cluster
+                                        self.pending_block = Some((block.clone(), lowest_timestamp_ns, lowest_index));
                                         return Ok(Some(o_cluster.finish()));
                                     }
                                     Err(e) => return Err(e),
