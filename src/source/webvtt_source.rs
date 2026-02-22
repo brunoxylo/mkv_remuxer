@@ -1,7 +1,6 @@
 use super::{SeekType, Source};
 use crate::source::CutInterval;
 use crate::{Error, Result};
-use log::debug;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use mkv_element::ClusterBlock;
@@ -167,7 +166,6 @@ impl WebVttSource {
             }
         }
 
-        debug!("Parsed {} cues from VTT file", cues.len());
         Ok(cues)
     }
 
@@ -277,7 +275,24 @@ impl WebVttSource {
             // Flags byte (0x00 - no special flags for subtitles)
             block_data.push(0x00);
 
-            // Frame data (UTF-8 encoded text)
+            // Frame data format according to WebVTT-in-WebM spec:
+            // 1. Cue identifier + line terminator (or just line terminator if no ID)
+            // 2. Cue settings + line terminator (or just line terminator if no settings)
+            // 3. Cue payload text
+
+            // Write cue identifier or empty line
+            if let Some(ref id) = cue.id {
+                block_data.extend_from_slice(id.as_bytes());
+            }
+            block_data.push(b'\n');
+
+            // Write cue settings or empty line
+            if let Some(ref settings) = cue.settings {
+                block_data.extend_from_slice(settings.as_bytes());
+            }
+            block_data.push(b'\n');
+
+            // Write cue payload text
             block_data.extend_from_slice(cue.text.as_bytes());
 
             // Create BlockGroup with Block and BlockDuration
@@ -406,14 +421,14 @@ impl Source for WebVttSource {
 
             // Apply cut filters
             if let Some(start) = self.start_ns {
-                if cue.end_ns < start {
+                if cue.end_ns <= start {
                     self.current_cue_idx += 1;
                     continue;
                 }
             }
 
             if let Some(end) = self.end_ns {
-                if cue.start_ns > end {
+                if cue.start_ns >= end {
                     self.finished = true;
                     break;
                 }

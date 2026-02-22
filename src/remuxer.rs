@@ -4,6 +4,7 @@ use crate::source::{CutInterval, InputSource, SeekType, Uninitialized};
 use crate::source_mappings::SourcesMappings;
 use crate::{Error, Result};
 use log::{debug, info, warn};
+use mkv_element::prelude::Seek;
 
 /// Track mapping specification: (source_index, track_number)
 pub type TrackMapping = (u64, u64);
@@ -83,26 +84,39 @@ pub fn remux(
     let mut initialized_sources = Vec::new();
     let mut target_timescale = None;
     let seek_type = seek_type.unwrap_or(SeekType::SnapNearestKeyframe); // default to SnapNearestKeyframe if cutting is used without specifying seek type
-
-    for (idx, source) in sources.into_iter().enumerate() {
-        debug!("Initializing source {}", idx);
-        let initialized = if let Some(ref cut_interval) = cut_interval {
+    if let Some(ref cut_interval) = cut_interval {
+        let mut actual_cut_interval= cut_interval.clone(); // will be updated with actual cut interval after snapping to keyframes for the first source
+        let mut used_seek_type = seek_type.clone();
+        for (idx, source) in sources.into_iter().enumerate() {
+            debug!("Initializing source {}", idx);
             // Initialize with cut
             let (init_source, offsets) = source.initialize_with_cut(
                 target_timescale,
-                seek_type.clone(),
-                cut_interval.clone(),
+                used_seek_type.clone(),
+                actual_cut_interval.clone(),
             )?;
-            init_source
-        } else {
-            // Initialize without cut
-            source.initialize(target_timescale)?
-        };
-        if target_timescale.is_none() { // use first source's timescale as target timescale for all sources (required for cutting and syncing)
-            target_timescale = Some(initialized.get_own_timecode_scale()?);
+            if seek_type == SeekType::SnapNearestKeyframe && idx == 0 {
+                // For the first source, we need to calculate the actual cut interval after snapping to keyframes
+                actual_cut_interval = offsets;
+                used_seek_type = SeekType::DirtyCut; // For subsequent sources, we will use DirtyCut to cut at the same timestamps without snapping again
+                debug!("Actual cut interval for source {}: {:?}", idx, actual_cut_interval);
+            }
+            if target_timescale.is_none() { // use first source's timescale as target timescale for all sources (required for cutting and syncing)
+                target_timescale = Some(init_source.get_own_timecode_scale()?);
+            }
+            initialized_sources.push(init_source);
         }
-        initialized_sources.push(initialized);
-    }
+    } else {
+            for (idx, source) in sources.into_iter().enumerate() {
+                debug!("Initializing source {}", idx);
+                // Initialize without cut
+                let src = source.initialize(target_timescale)?;
+                if target_timescale.is_none() { // use first source's timescale as target timescale for all sources (required for cutting and syncing)
+                    target_timescale = Some(src.get_own_timecode_scale()?);
+                }
+                initialized_sources.push(src);
+            }
+    };
 
     let target_timescale = target_timescale.ok_or_else(|| Error::MissingElement("No sources provided".to_string()))?;
 

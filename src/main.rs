@@ -3,8 +3,9 @@ use clap::Parser;
 use log::{debug, error, info};
 use log4rs;
 use mkv_remuxer::sink::{FileSink, OutputSink};
-use mkv_remuxer::source::{FileSource, InputSource, SeekType};
+use mkv_remuxer::source::{FileSource, InputSource, SeekType, WebVttSource};
 use mkv_remuxer::*;
+use std::path::Path;
 
 #[derive(Parser, Debug)]
 #[command(name = env!("CARGO_PKG_NAME"))]
@@ -168,9 +169,30 @@ fn main() -> Result<()> {
     let mut sources = Vec::new();
     for (idx, input_path) in args.inputs.iter().enumerate() {
         info!("Loading input {}: {}", idx, input_path);
-        let file_source = FileSource::new(input_path)
-            .with_context(|| format!("Failed to open input file: {}", input_path))?;
-        sources.push(InputSource::from(file_source));
+        
+        // Detect file type by extension
+        let path = Path::new(input_path);
+        let extension = path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase());
+        
+        let input_source = match extension.as_deref() {
+            Some("vtt") | Some("webvtt") => {
+                // Create WebVTT source with default language "eng"
+                // TODO: Allow language override via CLI flag
+                let vtt_source = WebVttSource::new(input_path, "eng")
+                    .with_context(|| format!("Failed to parse WebVTT file: {}", input_path))?;
+                InputSource::from(vtt_source)
+            }
+            _ => {
+                // Default to FileSource for .mkv, .webm, etc.
+                let file_source = FileSource::new(input_path)
+                    .with_context(|| format!("Failed to open input file: {}", input_path))?;
+                InputSource::from(file_source)
+            }
+        };
+        
+        sources.push(input_source);
     }
 
     // Create output sink

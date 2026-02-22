@@ -336,7 +336,7 @@ mod tests {
 }
 
 /// Configuration for cutting/seeking behavior
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CutInterval {
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,

@@ -120,7 +120,7 @@ impl MeltingPot {
                                     }
                                     Err(e) => return Err(e),
                                 }
-                            };
+                            }
                         } else {
                             // No more blocks in this cluster, set to None to fetch next cluster from source in next iteration
                             self.clusters[lowest_index] = None;

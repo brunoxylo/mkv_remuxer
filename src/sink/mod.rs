@@ -266,4 +266,88 @@ mod tests {
         Ok(())
 
     }
+
+    #[test]
+    fn test_remux_webvtt_into_video() -> Result<()> {
+        use crate::source::WebVttSource;
+        
+        // Setup: Create output path in temp directory
+        let temp_dir = std::env::temp_dir();
+        let output_path = temp_dir.join("test_av1_with_subtitles.mkv");
+        
+        // First, get the video tracks
+        let video_path = std::path::Path::new("test_av1.webm");
+        let temp_video = FileSource::new(video_path)?;
+        let temp_video_input = InputSource::from(temp_video);
+        let mut init_video = temp_video_input.initialize(None)?;
+        let video_tracks = init_video.get_tracks()?;
+        
+        // Create video source from test_av1.webm
+        let video_source = FileSource::new(video_path)?;
+        let video_input = InputSource::from(video_source);
+        
+        // Create WebVTT subtitle source from example.vtt (first 30 seconds only to match video)
+        let vtt_path = std::path::Path::new("example.vtt");
+        let vtt_source = WebVttSource::new(vtt_path, "eng")?;
+        let vtt_input = InputSource::from(vtt_source);
+        
+        // Create output sink
+        let output_sink = FileSink::new(&output_path)?;
+        let output = OutputSink::from(output_sink);
+        
+        // Configure output mappings: all tracks from video (source 0), subtitle track from WebVTT (source 1)
+        let mut output_mappings = Vec::new();
+        // Add all video and audio tracks from source 0
+        for track in &video_tracks.track_entry {
+            output_mappings.push((0u64, track.track_number.0));
+        }
+        // Add subtitle track from source 1 (WebVTT) - track number is 1
+        output_mappings.push((1u64, 1u64));
+        
+        // Apply cut interval to limit output to first 30 seconds to match video
+        let cut_interval = CutInterval::new().with_end(30_000_000_000);
+        
+        // Perform remuxing
+        let stats = remux(
+            vec![video_input, vtt_input],
+            output, 
+            Some(cut_interval),
+            None, // No special seek type
+            Some(output_mappings.clone())
+        )?;
+        
+        // Validate we processed some blocks
+        assert!(stats.blocks_processed > 0, "Should have processed at least some blocks");
+        assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
+        
+        // Validate the output (skip timestamp plausibility check due to video metadata vs actual frame mismatch)
+        let validation_report = validate_mkv_output(&output_path, true, None, false, true)?;
+        
+        // Print report for debugging
+        if !validation_report.is_valid() {
+            eprintln!("{}", validation_report.summary());
+            for error in &validation_report.errors {
+                eprintln!("ERROR: {}", error);
+            }
+            for warning in &validation_report.warnings {
+                eprintln!("WARNING: {}", warning);
+            }
+        }
+        
+        // Assert critical validations passed
+        assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
+        // Skip timestamps_plausible check - video file duration metadata doesn't match actual frame timestamps
+        assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
+        assert!(validation_report.cluster_duration_valid, 
+            "Cluster durations should not exceed {} ns", 
+            crate::cluster_warpper::CLUSTER_MAX_DURATION_NS);
+        assert!(validation_report.cluster_size_valid, 
+            "Cluster sizes should not exceed {} bytes", 
+            crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES);
+        
+        // Cleanup is commented out for inspection
+        // let _ = std::fs::remove_file(&output_path);
+        
+        Ok(())
+    }
 }

@@ -1,5 +1,5 @@
 use super::Sink;
-use crate::Result;
+use crate::{ClusterBlockExt, Result};
 use log::{debug, warn};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
