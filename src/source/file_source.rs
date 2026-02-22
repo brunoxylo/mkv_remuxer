@@ -20,6 +20,7 @@ pub struct FileSource {
     tracks: Tracks,
     info: Info,
     chapters: Option<Chapters>,
+    cues: Option<Cues>,
     seek_type: SeekType,
     input_cut_interval: CutInterval,
     /// position in the file where our first cluster of interest starts (usually around the specified cut start position)
@@ -51,6 +52,7 @@ impl FileSource {
         let mut tracks = None;
         let mut info = None;
         let mut chapters = None;
+        let mut cues = None;
         let mut initial_cluster_pos: Option<ClusterOfInterestCache> = None;
 
         loop {
@@ -70,6 +72,8 @@ impl FileSource {
                 tracks = Some(Tracks::read_element(&header, &mut file)?);
             } else if header.id == Chapters::ID {
                 chapters = Some(Chapters::read_element(&header, &mut file)?);
+            } else if header.id == Cues::ID {
+                cues = Some(Cues::read_element(&header, &mut file)?);
             } else if header.id == Cluster::ID {
                 initial_cluster_pos = Some(ClusterOfInterestCache::new(
                     pos,
@@ -110,6 +114,7 @@ impl FileSource {
                 .ok_or_else(|| Error::InvalidConfig("Missing Tracks element".to_string()))?,
             info: info.ok_or_else(|| Error::InvalidConfig("Missing Info element".to_string()))?,
             chapters,
+            cues,
             seek_type: SeekType::SnapNearestKeyframe, // default, can be changed in initialize_with_cut
             input_cut_interval: CutInterval::new(), // default, can be changed in initialize_with
             initial_cluster_pos,
@@ -119,15 +124,65 @@ impl FileSource {
         })
     }
 
-    /// Build an index of all cluster positions and timestamps for binary search
-    fn build_cluster_index(&mut self) -> Result<Vec<(u64, u64)>> {
+    /// Find cluster position range from Cues for a given timestamp
+    /// Returns (start_pos, end_pos) or None if Cues don't help narrow the range
+    fn find_cluster_range_from_cues(&self, target_timestamp_ns: u64) -> Option<(u64, Option<u64>)> {
+        let cues = self.cues.as_ref()?;
+        
+        // Convert target to timecode ticks
+        let target_ticks = target_timestamp_ns / self.timecode_scale;
+        
+        // Find the cue point closest to but before the target
+        let mut best_before: Option<&CuePoint> = None;
+        let mut best_after: Option<&CuePoint> = None;
+        
+        for cue_point in &cues.cue_point {
+            let cue_ticks = cue_point.cue_time.0;
+            
+            if cue_ticks <= target_ticks {
+                if best_before.is_none() || cue_ticks > best_before.unwrap().cue_time.0 {
+                    best_before = Some(cue_point);
+                }
+            } else {
+                if best_after.is_none() || cue_ticks < best_after.unwrap().cue_time.0 {
+                    best_after = Some(cue_point);
+                }
+            }
+        }
+        
+        // Get file positions from cue track positions
+        let start_pos = best_before?
+            .cue_track_positions
+            .first()?
+            .cue_cluster_position
+            .0;
+        
+        let end_pos = best_after
+            .and_then(|cp| cp.cue_track_positions.first())
+            .map(|ctp| ctp.cue_cluster_position.0);
+        
+        Some((start_pos, end_pos))
+    }
+
+    /// Build an index of cluster positions and timestamps for binary search
+    /// If start_pos and end_pos are provided, only index clusters in that range
+    fn build_cluster_index(&mut self, start_pos: Option<u64>, end_pos: Option<u64>) -> Result<Vec<(u64, u64)>> {
         // Returns Vec of (file_position, timestamp_ns)
         let mut cluster_index = Vec::new();
         
-        self.file.seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
+        let start = start_pos.unwrap_or(self.initial_cluster_pos.position);
+        self.file.seek(SeekFrom::Start(start))?;
         
         loop {
             let current_pos = self.file.stream_position()?;
+            
+            // Stop if we've reached the end position
+            if let Some(end) = end_pos {
+                if current_pos >= end {
+                    break;
+                }
+            }
+            
             let header = match Header::read_from(&mut self.file) {
                 Ok(h) => h,
                 Err(_) => break,
@@ -159,7 +214,16 @@ impl FileSource {
         target_timestamp_ns: u64,
         is_start: bool,
     ) -> Result<u64> {
-        let cluster_index = self.build_cluster_index()?;
+        // Try to narrow the search range using Cues if available
+        let (start_pos, end_pos) = if let Some((start, end)) = self.find_cluster_range_from_cues(target_timestamp_ns) {
+            trace!("Using Cues to narrow cluster search: start_pos={}, end_pos={:?}", start, end);
+            (Some(start), end)
+        } else {
+            trace!("No Cues available, scanning all clusters");
+            (None, None)
+        };
+        
+        let cluster_index = self.build_cluster_index(start_pos, end_pos)?;
         
         if cluster_index.is_empty() {
             return Err(Error::InvalidConfig("No clusters found".to_string()));

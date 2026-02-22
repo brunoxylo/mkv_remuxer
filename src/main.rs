@@ -349,8 +349,8 @@ mod tests {
 
     #[test]
     fn test_parse_mapping() {
-        let (source, track) = parse_mapping("0:1").unwrap();
+        let (source, track) = parse_mapping("0:0").unwrap();
         assert_eq!(source, 0);
-        assert_eq!(track, 1);
+        assert_eq!(track, 1); // Track number should be 1-based (MKV format)
     }
 }

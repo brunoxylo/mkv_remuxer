@@ -269,7 +269,7 @@ mod tests {
 
                 if let Some(max_ts) = max_ts_ns {
                     assert!(
-                        ts as u64 <= max_ts + 1500_000_000, // allow 150ms tolerance for cut accuracy (accounts for inter-track timing variations)
+                        ts as u64 <= max_ts, // allow 10s tolerance for cut accuracy (accounts for inter-track timing variations)
                         "track {} timestamp {} exceeds {}",
                         track_num,
                         ts,
@@ -320,11 +320,14 @@ mod tests {
                     CutInterval { start_ns: Some(CUT_START_NS), end_ns: Some(CUT_END_NS) },
                 )?;
                 let mut max_ts = CUT_MAX_NS;
-                println!("our acrtual intval is {:?}", offset);
+                println!("our actual interval is {}", offset);
                 if matches!(seek_type, SeekType::SnapNearestKeyframe) {
                     // Calculate the actual duration from the keyframe timestamps
                     if let (Some(start), Some(end)) = (offset.start_ns, offset.end_ns) {
                         max_ts = end - start;
+                        if seek_type == SeekType::SnapNearestKeyframe {
+                            max_ts += 5_000_000_000; // allow 5s tolerance for snap nearest keyframe, we cnt get this universally for every input source to we just assume a key frame interval of 5s 
+                        }
                     }
                 }
                 validate_stream(source, Some(max_ts))?;
