@@ -6,6 +6,9 @@ use std::marker::PhantomData;
 mod file_sink;
 pub use file_sink::FileSink;
 
+mod vtt_sink;
+pub use vtt_sink::VttSink;
+
 // Typestate marker types
 pub struct Uninitialized;
 pub struct Initialized;

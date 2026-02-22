@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info};
 use log4rs;
-use mkv_remuxer::sink::{FileSink, OutputSink};
+use mkv_remuxer::sink::{FileSink, OutputSink, VttSink};
 use mkv_remuxer::source::{FileSource, InputSource, SeekType, WebVttSource};
 use mkv_remuxer::*;
+use std::fs::File;
 use std::path::Path;
 
 #[derive(Parser, Debug)]
@@ -197,9 +198,27 @@ fn main() -> Result<()> {
 
     // Create output sink
     info!("Creating output: {}", args.output);
-    let file_sink = FileSink::new(&args.output)
-        .with_context(|| format!("Failed to create output file: {}", args.output))?;
-    let output_sink = OutputSink::from(file_sink);
+    let output_path = Path::new(&args.output);
+    let output_extension = output_path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+    
+    let output_sink = match output_extension.as_deref() {
+        Some("vtt") | Some("webvtt") => {
+            // Create VttSink for WebVTT output
+            info!("Using WebVTT output format");
+            let file = File::create(&args.output)
+                .with_context(|| format!("Failed to create output file: {}", args.output))?;
+            let vtt_sink = VttSink::new(file);
+            OutputSink::from(vtt_sink)
+        }
+        _ => {
+            // Default to FileSink for .mkv, .webm, etc.
+            let file_sink = FileSink::new(&args.output)
+                .with_context(|| format!("Failed to create output file: {}", args.output))?;
+            OutputSink::from(file_sink)
+        }
+    };
 
     // Execute remux
     info!("Starting remux...");
