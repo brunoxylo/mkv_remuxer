@@ -81,8 +81,8 @@ pub trait ClusterBlockExt {
 }
 
 pub trait ClusterExt {
-    fn get_timestamp_ms(&self, timecode_scale: u64) -> u64;
-    fn set_timestamp_ms(&mut self, timestamp_ms: u64, timecode_scale: u64);
+    fn get_timestamp_ns(&self, timecode_scale: u64) -> u64;
+    fn set_timestamp_ns(&mut self, timestamp_ns: u64, timecode_scale: u64);
     /// return a list of indexes of keyframe blocks in the clusters blocks array
     fn get_keyframes(&self, track_num: u64) -> Vec<usize>;
     fn has_keyframes(&self, track_num: u64) -> bool {
@@ -106,11 +106,11 @@ pub trait ClusterExt {
 }
 
 impl ClusterExt for Cluster {
-    fn get_timestamp_ms(&self, timecode_scale: u64) -> u64 {
+    fn get_timestamp_ns(&self, timecode_scale: u64) -> u64 {
         self.timestamp.0 * timecode_scale
     }
-    fn set_timestamp_ms(&mut self, timestamp_ms: u64, timecode_scale: u64) {
-        self.timestamp.0 = timestamp_ms / timecode_scale;
+    fn set_timestamp_ns(&mut self, timestamp_ns: u64, timecode_scale: u64) {
+        self.timestamp.0 = timestamp_ns / timecode_scale;
     }
     fn get_keyframes(&self, track_num: u64) -> Vec<usize> {
         self.blocks

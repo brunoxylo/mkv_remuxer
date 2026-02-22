@@ -159,7 +159,7 @@ impl FileSource {
                     Ok(c) => c,
                     Err(_) => break,
                 };
-                let timestamp_ns = cluster.get_timestamp_ms(self.timecode_scale);
+                let timestamp_ns = cluster.get_timestamp_ns(self.timecode_scale);
                 cluster_index.push((current_pos, timestamp_ns));
             } else {
                 let size = header.size.value;
@@ -262,7 +262,7 @@ impl FileSource {
 
         let orig_block_count = cluster.blocks.len();
         let orig_cluster_ticks = cluster.timestamp.0 as i64;
-        let orig_cluster_ns = cluster.get_timestamp_ms(self.timecode_scale) as i64;
+        let orig_cluster_ns = cluster.get_timestamp_ns(self.timecode_scale) as i64;
 
         // Squeeze mode: shift cluster timestamp based on start position
         let shift_reference = self.cut_parameters.start_ns.unwrap_or(0) as i64;
@@ -450,12 +450,12 @@ impl Source for FileSource {
                     }
                 };
 
-                let cluster_ts_ms = cluster.get_timestamp_ms(self.timecode_scale);
+                let cluster_ts_ns = cluster.get_timestamp_ns(self.timecode_scale);
 
                 // Check if we should stop based on end time
                 if let Some(end_ns) = self.cut_parameters.end_ns {
-                    if cluster_ts_ms > end_ns + SEEK_AFTER_END_TIME_NS {
-                        println!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster_ts_ms, end_ns);
+                    if cluster_ts_ns > end_ns + SEEK_AFTER_END_TIME_NS {
+                        println!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster_ts_ns, end_ns);
                         self.finished = true;
                         return Ok(None);
                     }
