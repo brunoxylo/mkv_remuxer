@@ -476,6 +476,7 @@ impl FileSource {
                                 self.output_timecode_scale,
                             )?;
                             block.set_invisible(true)?;
+                            info!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
                         } else if let Some(end) = self.cut_parameters.end_ns {
                             if abs_ns > end as i64 {
                                 continue; // Drop post-roll for now (could squeeze at end)

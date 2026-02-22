@@ -151,10 +151,56 @@ def inspect_webm(filename, max_blocks=50):
                             if info['discardable']:
                                 markers.append("DISC")
                             
-                            print(f"[{track_type:8s}] {abs_time_ms:6d}ms | "
+                            print(f"[{track_type:8s}] {abs_time_ms:6d}ms | SimpleBlock | "
                                   f"Flags: {flags_str} | {' '.join(markers) if markers else 'none'}")
                             
                             if info['track'] == 1:  # Only count video blocks
+                                block_count += 1
+                                if block_count >= max_blocks:
+                                    return
+                    elif sub_id == 0xA0:  # BlockGroup
+                        bg_start = f.tell()
+                        bg_end = bg_start + sub_size
+                        block_duration = None
+                        block_info = None
+                        
+                        # Read BlockGroup contents
+                        while f.tell() < bg_end:
+                            bg_sub_id, bg_sub_size = read_element_id_size(f)
+                            if bg_sub_id is None:
+                                break
+                            
+                            if bg_sub_id == 0xA1:  # Block
+                                block_data = f.read(bg_sub_size)
+                                block_info = parse_simpleblock(block_data)
+                            elif bg_sub_id == 0x9B:  # BlockDuration
+                                block_duration = int.from_bytes(f.read(bg_sub_size), 'big')
+                            else:
+                                # Skip other BlockGroup elements
+                                if bg_sub_size > 0 and bg_sub_size < 1024*1024:
+                                    f.read(bg_sub_size)
+                                else:
+                                    break
+                        
+                        if block_info:
+                            abs_time_ms = (current_cluster_time + block_info['timestamp'])
+                            track_type = "video" if block_info['track'] == 1 else f"audio/{block_info['track']}"
+                            
+                            flags_str = f"0x{block_info['flags']:02x}"
+                            markers = []
+                            if block_info['keyframe']:
+                                markers.append("KEY")
+                            if block_info['invisible']:
+                                markers.append("INVISIBLE")
+                            if block_info['discardable']:
+                                markers.append("DISC")
+                            
+                            duration_str = f"dur={block_duration}ms" if block_duration is not None else "no-dur"
+                            
+                            print(f"[{track_type:8s}] {abs_time_ms:6d}ms | BlockGroup | {duration_str} | "
+                                  f"Flags: {flags_str} | {' '.join(markers) if markers else 'none'}")
+                            
+                            if block_info['track'] == 1:  # Only count video blocks
                                 block_count += 1
                                 if block_count >= max_blocks:
                                     return
@@ -162,9 +208,6 @@ def inspect_webm(filename, max_blocks=50):
                         # Skip other elements
                         if sub_size > 0 and sub_size < 1024*1024:
                             f.read(sub_size)
-                        elif sub_id == 0xA0:  # BlockGroup
-                            # Skip to next
-                            pass
                         else:
                             break
             else:
