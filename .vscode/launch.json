@@ -21,12 +21,12 @@
                 }
             },
             "args": [
-                "-i", "${workspaceFolder}/test.webm",
+                "-i", "${workspaceFolder}/test_av1.webm",
                 "--to", "15s",
                 "--ss", "5s",
                 "-m", "0:1",
                 "-m", "0:3",
-                "--seek-mode", "freeze",
+                "--seek-mode", "squeeze",
                 "/tmp/output_debug.mkv"
             ],
             "cwd": "${workspaceFolder}"

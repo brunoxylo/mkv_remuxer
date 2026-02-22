@@ -78,6 +78,22 @@ pub trait ClusterBlockExt {
     // get the data of a block
     fn get_data_mut(&mut self) -> Result<&mut Vec<u8>, Error>;
     fn get_data(&self) -> Result<&Vec<u8>, Error>;
+
+    /// Get the block duration in Track Ticks
+    /// Returns None if:
+    /// - This is a SimpleBlock (which doesn't support BlockDuration)
+    /// - This is a BlockGroup but BlockDuration is not set
+    fn get_block_duration(&self) -> Option<u64>;
+
+    /// Set the block duration in Track Ticks
+    /// 
+    /// # Arguments
+    /// * `duration` - Duration in Track Ticks, or None to remove the duration field
+    /// 
+    /// # Returns
+    /// * `Err` if this is a SimpleBlock (which doesn't support BlockDuration)
+    /// * `Ok(())` if this is a BlockGroup (even if duration is None)
+    fn set_block_duration(&mut self, duration: Option<u64>) -> Result<(), Error>;
 }
 
 pub trait ClusterExt {
@@ -376,6 +392,27 @@ impl ClusterBlockExt for ClusterBlock {
             return Err(Error::InvalidBlockData("Block data too short".to_string()));
         }
         Ok(data)
+    }
+
+    fn get_block_duration(&self) -> Option<u64> {
+        match self {
+            ClusterBlock::Simple(_) => None, // SimpleBlock doesn't support BlockDuration
+            ClusterBlock::Group(bg) => bg.block_duration.as_ref().map(|bd| bd.0),
+        }
+    }
+
+    fn set_block_duration(&mut self, duration: Option<u64>) -> Result<(), Error> {
+        match self {
+            ClusterBlock::Simple(_) => {
+                Err(Error::InvalidBlockData(
+                    "Cannot set BlockDuration on SimpleBlock".to_string(),
+                ))
+            }
+            ClusterBlock::Group(bg) => {
+                bg.block_duration = duration.map(BlockDuration);
+                Ok(())
+            }
+        }
     }
 }
 

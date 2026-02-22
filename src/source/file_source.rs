@@ -475,7 +475,6 @@ impl FileSource {
                                 shifted_cluster_ticks,
                                 self.output_timecode_scale,
                             )?;
-                            block.set_invisible(true)?;
                         } else if let Some(end) = self.cut_parameters.end_ns {
                             if abs_ns > end as i64 {
                                 continue; // Drop post-roll for now (could squeeze at end)
