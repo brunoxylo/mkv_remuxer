@@ -43,10 +43,6 @@ struct Args {
     #[arg(short = 'm', long = "map")]
     mappings: Vec<String>,
 
-    /// Target timescale in nanoseconds (default: use source timescale)
-    #[arg(long = "timescale")]
-    timescale: Option<u64>,
-
     /// Output file path
     #[arg(required = true)]
     output: String,
@@ -137,8 +133,8 @@ fn main() -> Result<()> {
     }
 
     // Create cut config if needed
-    let cut_config = if start_ns.is_some() || end_ns.is_some() {
-        let mut config = CutConfig::new(seek_type);
+    let cut_interval = if start_ns.is_some() || end_ns.is_some() {
+        let mut config = CutInterval::new();
         if let Some(start) = start_ns {
             config = config.with_start(start);
         }
@@ -188,7 +184,8 @@ fn main() -> Result<()> {
     let stats = remux(
         sources,
         output_sink,
-        cut_config,
+        cut_interval,
+        Some(seek_type.clone()),
         track_mappings
     )
     .context("Remux operation failed")?;

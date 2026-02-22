@@ -1,10 +1,9 @@
 use crate::metling_pot::MeltingPot;
 use crate::sink::OutputSink;
-use crate::source::{InputSource, SeekType, Uninitialized};
+use crate::source::{CutInterval, InputSource, SeekType, Uninitialized};
 use crate::source_mappings::SourcesMappings;
 use crate::{Error, Result};
 use log::{debug, info, warn};
-use crate ::source::CutConfig;
 
 /// Track mapping specification: (source_index, track_number)
 pub type TrackMapping = (u64, u64);
@@ -74,7 +73,8 @@ pub struct RemuxStats {
 pub fn remux(
     sources: Vec<InputSource<Uninitialized>>,
     output_sink: OutputSink<crate::sink::Uninitialized>,
-    cut_config: Option<CutConfig>,
+    cut_interval: Option<CutInterval>,
+    seek_type: Option<SeekType>,
     mappings: Option<Vec<TrackMapping>>,
 ) -> Result<RemuxStats> {
     debug!("Starting remux process with {} sources", sources.len());
@@ -82,16 +82,16 @@ pub fn remux(
     // Step 1: Initialize sources
     let mut initialized_sources = Vec::new();
     let mut target_timescale = None;
+    let seek_type = seek_type.unwrap_or(SeekType::SnapNearestKeyframe); // default to SnapNearestKeyframe if cutting is used without specifying seek type
 
     for (idx, source) in sources.into_iter().enumerate() {
         debug!("Initializing source {}", idx);
-        let initialized = if let Some(ref cut_config) = cut_config {
+        let initialized = if let Some(ref cut_interval) = cut_interval {
             // Initialize with cut
-            let (init_source, _offsets) = source.initialize_with_cut(
+            let (init_source, offsets) = source.initialize_with_cut(
                 target_timescale,
-                cut_config.seek_type.clone(),
-                cut_config.start_ns,
-                cut_config.end_ns,
+                seek_type.clone(),
+                cut_interval.clone(),
             )?;
             init_source
         } else {
@@ -130,8 +130,8 @@ pub fn remux(
     }
 
     // Step 4: Validate keyframe snap usage
-    if let Some(ref cut_config) = cut_config {
-        if matches!(cut_config.seek_type, SeekType::SnapNearestKeyframe) {
+    if let Some(_) = cut_interval {
+        if matches!(seek_type, SeekType::SnapNearestKeyframe) {
             let video_count = count_video_tracks_in_mappings(&sources_mappings)?;
             if video_count > 1 {
                 warn!(

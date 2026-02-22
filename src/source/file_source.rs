@@ -1,5 +1,6 @@
 use super::{ClusterOfInterestCache, SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
+use crate::source::CutInterval;
 use crate::{Error, Result};
 use core::time;
 use log::{debug, info};
@@ -10,7 +11,6 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
-use super::CutConfig;
 
 
 pub struct FileSource {
@@ -20,7 +20,8 @@ pub struct FileSource {
     tracks: Tracks,
     info: Info,
     chapters: Option<Chapters>,
-    cut_parameters: CutConfig,
+    seek_type: SeekType,
+    input_cut_interval: CutInterval,
     /// position in the file where our first cluster of interest starts (usually around the specified cut start position)
     initial_cluster_pos: ClusterOfInterestCache,
     end_cluster_pos: ClusterOfInterestCache,
@@ -109,11 +110,8 @@ impl FileSource {
                 .ok_or_else(|| Error::InvalidConfig("Missing Tracks element".to_string()))?,
             info: info.ok_or_else(|| Error::InvalidConfig("Missing Info element".to_string()))?,
             chapters,
-            cut_parameters: CutConfig {
-                seek_type: SeekType::SnapNearestKeyframe,
-                start_ns: None,
-                end_ns: None,
-            },
+            seek_type: SeekType::SnapNearestKeyframe, // default, can be changed in initialize_with_cut
+            input_cut_interval: CutInterval::new(), // default, can be changed in initialize_with
             initial_cluster_pos,
             end_cluster_pos,
             finished: false,
@@ -232,7 +230,7 @@ impl FileSource {
     }
 
     fn process_cluster_for_cut(&mut self, mut cluster: Cluster) -> Result<Cluster> {
-        if self.cut_parameters.start_ns.is_none() && self.cut_parameters.end_ns.is_none() {
+        if self.input_cut_interval.start_ns.is_none() && self.input_cut_interval.end_ns.is_none() {
             return Ok(cluster); // no cutting needed, just return original cluster
         }
 
@@ -242,16 +240,16 @@ impl FileSource {
         let orig_cluster_ns = cluster.get_timestamp_ms(self.timecode_scale) as i64;
 
         // Shift cluster timestamp
-        let shift_reference =  if self.cut_parameters.seek_type == SeekType::SnapNearestKeyframe {
+        let shift_reference =  if self.seek_type == SeekType::SnapNearestKeyframe {
             if let Some(video_track_num) = self.first_video_track_num {
                 self.initial_cluster_pos
-                    .get_closest_keyframe_timestamp_ns(video_track_num, self.cut_parameters.start_ns.unwrap_or(0) as i64)?
+                    .get_closest_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64)?
             } else {
                 // no video tracks, use cut start as reference for shifting 
-                self.cut_parameters.start_ns.unwrap_or(0) as i64
+                self.input_cut_interval.start_ns.unwrap_or(0) as i64
             }
         } else {
-            self.cut_parameters.start_ns.unwrap_or(0) as i64
+            self.input_cut_interval.start_ns.unwrap_or(0) as i64
         };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
         cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
@@ -259,13 +257,13 @@ impl FileSource {
 
         let mut filtered = Vec::with_capacity(orig_block_count);
 
-        let result = match self.cut_parameters.seek_type {
+        let result = match self.seek_type {
             SeekType::SnapNearestKeyframe => {
                 // Simple: just shift timestamps, but we still need to respect end_ns
                 let mut filtered = Vec::with_capacity(cluster.blocks.len());
                 for mut block in cluster.blocks {
                     let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
-                    if let Some(end) = self.cut_parameters.end_ns {
+                    if let Some(end) = self.input_cut_interval.end_ns {
                         if abs_ns as u64 > end {
                             //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
                             continue;
@@ -281,7 +279,7 @@ impl FileSource {
                         cluster.timestamp.0 as i64,
                         self.output_timecode_scale,
                     )?;
-                    print!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?, abs_ns, self.cut_parameters.end_ns, shift_reference);
+                    print!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?, abs_ns, self.input_cut_interval.end_ns, shift_reference);
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
@@ -292,17 +290,17 @@ impl FileSource {
                 for mut block in cluster.blocks {
                     let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
                     let abs_ns = abs_ns as u64;
-                    if let Some(start) = self.cut_parameters.start_ns {
+                    if let Some(start) = self.input_cut_interval.start_ns {
                         if abs_ns < start {
                             continue;
                         }
                     }
-                    if let Some(end) = self.cut_parameters.end_ns {
+                    if let Some(end) = self.input_cut_interval.end_ns {
                         if abs_ns > end {
                             continue;
                         }
                     }
-                    if let Some(start) = self.cut_parameters.start_ns {
+                    if let Some(start) = self.input_cut_interval.start_ns {
                         let offset = abs_ns as i64 - start as i64;
                         block.set_timestamp_ns(
                             offset,
@@ -326,8 +324,8 @@ impl FileSource {
                     "Cluster filtering removed all {} blocks (cluster_ns={}, start_ns={:?}, end_ns={:?})",
                     orig_block_count,
                     orig_cluster_ns,
-                    self.cut_parameters.start_ns,
-                    self.cut_parameters.end_ns
+                    self.input_cut_interval.start_ns,
+                    self.input_cut_interval.end_ns
                 );
             }
         }
@@ -357,13 +355,13 @@ impl FileSource {
             match kind {
                 TrackKind::Video => {
                     // Drop video after end
-                    if let Some(end) = self.cut_parameters.end_ns {
+                    if let Some(end) = self.input_cut_interval.end_ns {
                         if abs_ns > end as i64 {
                             continue;
                         }
                     }
 
-                    if let Some(start) = self.cut_parameters.start_ns {
+                    if let Some(start) = self.input_cut_interval.start_ns {
                         let start = start as i64;
                         if abs_ns < start {
                             continue;
@@ -411,13 +409,13 @@ impl FileSource {
                 _ => {
                     // all other tracks just shift timestamps if within range
                     // Drop after end
-                    if let Some(end) = self.cut_parameters.end_ns {
+                    if let Some(end) = self.input_cut_interval.end_ns {
                         if abs_ns > end as i64 {
                             continue;
                         }
                     }
                     // Drop before start
-                    if let Some(start) = self.cut_parameters.start_ns {
+                    if let Some(start) = self.input_cut_interval.start_ns {
                         if abs_ns < start as i64 {
                             continue;
                         }
@@ -462,12 +460,12 @@ impl FileSource {
             match kind {
                 TrackKind::Video => {
                     // Drop after end
-                    if let Some(end) = self.cut_parameters.end_ns {
+                    if let Some(end) = self.input_cut_interval.end_ns {
                         if abs_ns > end as i64 {
                             continue;
                         }
                     }
-                    if let Some(start) = self.cut_parameters.start_ns {
+                    if let Some(start) = self.input_cut_interval.start_ns {
                         if abs_ns < start as i64 {
                             // Pre-roll: squeeze to time 0 and mark invisible
                             block.set_timestamp_ns(
@@ -477,7 +475,7 @@ impl FileSource {
                             )?;
                             block.set_invisible(true)?;
                             info!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
-                        } else if let Some(end) = self.cut_parameters.end_ns {
+                        } else if let Some(end) = self.input_cut_interval.end_ns {
                             if abs_ns > end as i64 {
                                 continue; // Drop post-roll for now (could squeeze at end)
                             } else {
@@ -503,12 +501,12 @@ impl FileSource {
                 _ => {
                     // Other tracks: just shift timestamps
                     // Drop after end
-                    if let Some(end) = self.cut_parameters.end_ns {
+                    if let Some(end) = self.input_cut_interval.end_ns {
                         if abs_ns > end as i64 {
                             continue;
                         }
                     }
-                    if let Some(start) = self.cut_parameters.start_ns {
+                    if let Some(start) = self.input_cut_interval.start_ns {
                         // Drop  before start (pre-roll is video-only)
                         if abs_ns < start as i64 {
                             continue;
@@ -553,8 +551,8 @@ impl Source for FileSource {
 
     fn get_cut_positions(&self) -> (u64, Option<u64>) {
         (
-            self.cut_parameters.start_ns.unwrap_or(0),
-            self.cut_parameters.end_ns,
+            self.input_cut_interval.start_ns.unwrap_or(0),
+            self.input_cut_interval.end_ns,
         )
     }
 
@@ -565,12 +563,12 @@ impl Source for FileSource {
         };
         let video_track_num = self.first_video_track_num;
 
-        if let Some(v_track) = video_track_num && self.cut_parameters.seek_type == SeekType::SnapNearestKeyframe {
+        if let Some(v_track) = video_track_num && self.seek_type == SeekType::SnapNearestKeyframe {
             let start_keyframe = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
                 v_track,
-                self.cut_parameters.start_ns.unwrap_or(0) as i64,
+                self.input_cut_interval.start_ns.unwrap_or(0) as i64,
             )?;
-            if let Some (end_pos) = self.cut_parameters.end_ns {
+            if let Some (end_pos) = self.input_cut_interval.end_ns {
                 let end_keyframe = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
                     v_track,
                     end_pos as i64,
@@ -593,16 +591,16 @@ impl Source for FileSource {
             }
         } else {
             // no video tracks or no SnapKeyframe, just use cut start and end timestamps to calculate duration
-            let start = self.cut_parameters.start_ns.unwrap_or(0);
+            let start = self.input_cut_interval.start_ns.unwrap_or(0);
            if let Some(dur) = orig_duration {
-                let end = self.cut_parameters.end_ns.unwrap_or(dur);
+                let end = self.input_cut_interval.end_ns.unwrap_or(dur);
                 if end > start {
                     return Ok(end - start);
                 } else {
                     return Err(Error::InvalidConfig("End timestamp is before start timestamp".to_string()));
                 }
             } else {
-                if let Some(end) = self.cut_parameters.end_ns {
+                if let Some(end) = self.input_cut_interval.end_ns {
                     if end > start {
                         return Ok(end - start);
                     } else {
@@ -640,7 +638,7 @@ impl Source for FileSource {
                 };
 
                 // Check if we should stop based on end time
-                if let Some(end_ns) = self.cut_parameters.end_ns {
+                if let Some(end_ns) = self.input_cut_interval.end_ns {
                     if cluster.get_timestamp_ms(self.timecode_scale) > end_ns {
                         println!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ms(self.timecode_scale), end_ns);
                         self.finished = true;
@@ -690,34 +688,30 @@ impl Source for FileSource {
         &mut self,
         time_scale: Option<u64>,
         seek_type: SeekType,
-        start_ns: Option<u64>,
-        end_ns: Option<u64>,
-    ) -> Result<i64> {
+        cut_interval: CutInterval,
+    ) -> Result<CutInterval> {
         if let Some(ts) = time_scale {
             self.output_timecode_scale = ts;
         }
 
-        if let Some(start) = start_ns {
+        if let Some(start) = cut_interval.start_ns {
             self.find_start_cluster(start)?;
             self.file
                 .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
         }
         
         // Also find end cluster if end timestamp is provided
-        if let Some(end) = end_ns {
+        if let Some(end) = cut_interval.end_ns {
             self.find_end_cluster(end)?;
         }
 
-        self.cut_parameters = CutConfig {
-            seek_type: seek_type.clone(),
-            start_ns,
-            end_ns,
-        };
+        self.input_cut_interval = cut_interval;
+        self.seek_type = seek_type;
 
         let video_tracks = self.tracks.get_all_video_tracks();
         let duration_ns = self.get_duration();
         print!("Orig duration: {} ns", duration_ns.as_ref().ok().copied().unwrap_or(0));
-        let _orig_end_ns: Option<u64> = match end_ns {
+        let _orig_end_ns: Option<u64> = match self.input_cut_interval.end_ns {
             Some(end) => Some(end),
             None => match duration_ns {
                 Ok(dur) => Some(dur),
@@ -725,34 +719,54 @@ impl Source for FileSource {
             },
         };
 
-        let keyframe_pos_ns: i64 = match video_tracks.first() {
+        let output_interval: CutInterval = match video_tracks.first() {
             Some(video_track_num) => {
                 // we have a video track, so look for keyframes to determine start position
-                match seek_type {
+                match self.seek_type {
                     SeekType::SnapNearestKeyframe => {
-                        self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
+                        let actual_start_ns = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
                             *video_track_num,
-                            start_ns.unwrap_or(0) as i64,
-                        )?
+                            self.input_cut_interval.start_ns.unwrap_or(0) as i64,
+                        )?;
+                        let actual_end_ns = if let Some(end_ns) = self.input_cut_interval.end_ns {
+                            Some(
+                                self.end_cluster_pos.get_closest_keyframe_timestamp_ns(
+                                    *video_track_num,
+                                    end_ns as i64,
+                                )? as u64
+                            )
+                        } else {
+                            duration_ns.ok().map(|d| d )
+                        };
+                        CutInterval {
+                            start_ns: Some(actual_start_ns as u64),
+                            end_ns: actual_end_ns,
+                        }
                     }
                     SeekType::DirtyCut => {
-                        self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                            *video_track_num,
-                            start_ns.unwrap_or(0) as i64,
-                        )?
+                        CutInterval {
+                            start_ns: self.input_cut_interval.start_ns.or_else(|| Some(0)),
+                            end_ns: self.input_cut_interval.end_ns.or_else(|| duration_ns.ok()),
+                        }
                     }
-                    SeekType::Squeeze => self.initial_cluster_pos.get_keyframe_timestamp_ns(
-                        *video_track_num,
-                        start_ns.unwrap_or(0) as i64,
-                        false,
-                    )?, // use keyframe before start and squeeze all frames to zero
+                    SeekType::Squeeze => {
+                        CutInterval {
+                            start_ns: self.input_cut_interval.start_ns.or_else(|| Some(0)),
+                            end_ns: self.input_cut_interval.end_ns.or_else(|| duration_ns.ok()),
+                        }
+                    }
                 }
             }
-            None => start_ns.unwrap_or(0) as i64, // we only consider video keyframes for cutting, so if there are no video tracks just use the specified start timestamp as is
+            None => {
+                CutInterval {
+                    start_ns: self.input_cut_interval.start_ns.or_else(|| Some(0)),
+                    end_ns: self.input_cut_interval.end_ns.or_else(|| duration_ns.ok()),
+                }
+            }
         };
         self.file
             .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
 
-        Ok(keyframe_pos_ns - start_ns.unwrap_or(0) as i64)
+        Ok(output_interval)
     }
 }

@@ -5,9 +5,11 @@ use std::marker::PhantomData;
 
 mod cluster_cache;
 mod file_source;
+mod webvtt_source;
 
 pub use cluster_cache::ClusterOfInterestCache;
 pub use file_source::FileSource;
+pub use webvtt_source::WebVttSource;
 
 // Typestate marker types
 /// Marker type indicating the source has not been initialized
@@ -58,9 +60,8 @@ pub trait Source: Display {
         &mut self,
         output_time_scale: Option<u64>,
         seek_type: SeekType,
-        start_ns: Option<u64>,
-        end_ns: Option<u64>,
-    ) -> Result<i64>;
+        cut_interval : CutInterval,
+    ) -> Result<CutInterval>;
 }
 
 /// Wrapper struct that uses the typestate pattern to prevent misuse
@@ -127,13 +128,12 @@ impl InputSource<Uninitialized> {
         mut self,
         time_scale: Option<u64>,
         seek_type: SeekType,
-        start_ns: Option<u64>,
-        end_ns: Option<u64>,
-    ) -> Result<(InputSource<Initialized>, i64)> {
+        cut_interval: CutInterval,
+    ) -> Result<(InputSource<Initialized>, CutInterval)> {
         // Delegate to the inner Source implementation
         let offsets = self
             .inner
-            .initialize_with_cut(time_scale, seek_type, start_ns, end_ns)?;
+            .initialize_with_cut(time_scale, seek_type, cut_interval)?;
 
         // Transition to initialized state
         Ok((
@@ -317,13 +317,15 @@ mod tests {
                 let (source, offset) = source.initialize_with_cut(
                     None,
                     seek_type.clone(),
-                    Some(CUT_START_NS),
-                    Some(CUT_END_NS),
+                    CutInterval { start_ns: Some(CUT_START_NS), end_ns: Some(CUT_END_NS) },
                 )?;
                 let mut max_ts = CUT_MAX_NS;
-                println!("our offset is {}", offset);
+                println!("our acrtual intval is {:?}", offset);
                 if matches!(seek_type, SeekType::SnapNearestKeyframe) {
-                    max_ts = (max_ts as i64 - offset as i64) as u64;
+                    // Calculate the actual duration from the keyframe timestamps
+                    if let (Some(start), Some(end)) = (offset.start_ns, offset.end_ns) {
+                        max_ts = end - start;
+                    }
                 }
                 validate_stream(source, Some(max_ts))?;
             }
@@ -335,16 +337,15 @@ mod tests {
 
 /// Configuration for cutting/seeking behavior
 #[derive(Debug, Clone)]
-pub struct CutConfig {
-    pub seek_type: SeekType,
+pub struct CutInterval {
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,
 }
 
-impl CutConfig {
-    pub fn new(seek_type: SeekType) -> Self {
+
+impl CutInterval {
+    pub fn new() -> Self {
         Self {
-            seek_type,
             start_ns: None,
             end_ns: None,
         }

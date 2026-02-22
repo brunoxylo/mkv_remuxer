@@ -121,7 +121,7 @@ mod tests {
     use crate::remux;
     use crate::source::{FileSource, InputSource, SeekType};
     use crate::test_utils::{test_file_path, validate_mkv_output};
-    use crate::source::CutConfig;
+    use crate::source::CutInterval;
 
     fn run_remux_test_with_seek_type(seek_type: SeekType) -> Result<()> {
         // Setup: Create output path in temp directory
@@ -140,8 +140,7 @@ mod tests {
         
         // Configure cutting: from 20 seconds to the end
         let start_ns = 20_000_000_000u64; // 20 seconds in nanoseconds
-        let cut_config = CutConfig::new(seek_type.clone())
-            .with_start(start_ns);
+        let cut_interval = CutInterval::new().with_start(start_ns);
         
         // We need to pre-check for German audio tracks manually
         // Initialize source temporarily to check tracks
@@ -183,7 +182,8 @@ mod tests {
         let stats = remux(
             vec![input_source],
             output, 
-            Some(cut_config), 
+            Some(cut_interval), 
+            Some(seek_type.clone()),
             Some(output_mappings.clone())
         )?;
         
