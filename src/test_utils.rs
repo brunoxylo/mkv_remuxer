@@ -13,7 +13,7 @@ use mkv_element::io::blocking_impl::*;
 
 
 pub fn test_file_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("test.webm")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("test_av1.webm")
 }
 
 pub fn sources_implementations() -> Vec<InputSource<Uninitialized>> {

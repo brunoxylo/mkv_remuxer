@@ -114,7 +114,8 @@ impl MeltingPot {
                                 match o_cluster.add_block(&block, lowest_timestamp_ns) {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
-                                        // Cluster is full, break the inner loop and start a new cluster
+                                        // Cluster is full, step back to preserve the block for next iteration
+                                        input_cluster.step_back();
                                         return Ok(Some(o_cluster.finish()));
                                     }
                                     Err(e) => return Err(e),
@@ -154,7 +155,6 @@ impl MeltingPot {
 mod tests {
     use super::*;
     use crate::sink::Sink;
-    use crate::source::Initialized;
     use crate::source::InputSource;
     use crate::source::Uninitialized;
     use crate::test_utils;

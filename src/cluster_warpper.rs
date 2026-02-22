@@ -31,6 +31,13 @@ impl ClusterReadWrapper {
         self.cluster.blocks.get_mut(self.block_index - 1)
     }
 
+    /// Steps back to the previous block (useful when a block couldn't be processed)
+    pub fn step_back(&mut self) {
+        if self.block_index > 0 {
+            self.block_index -= 1;
+        }
+    }
+
     /// Returns the global timestamp of the current block in ns without consuming it, or None if there are no more blocks
     pub fn get_current_absolute_timestamp_ns(&self, timescale: u64) -> Result<i64> {
         let cluster_timestamp = self.cluster.timestamp.0 as i64;
