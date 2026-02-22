@@ -9,6 +9,9 @@ pub use file_sink::FileSink;
 mod vtt_sink;
 pub use vtt_sink::VttSink;
 
+mod stream_sink;
+pub use stream_sink::StreamSink;
+
 // Typestate marker types
 pub struct Uninitialized;
 pub struct Initialized;

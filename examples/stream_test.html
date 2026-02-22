@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MKV Stream Server Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 900px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: inline-block;
+            width: 120px;
+            font-weight: bold;
+        }
+        input, select {
+            padding: 8px;
+            width: 200px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        video {
+            width: 100%;
+            max-width: 800px;
+            background: black;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+        }
+        .info {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .info h3 {
+            margin-top: 0;
+        }
+        code {
+            background: #f4f4f4;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+        #currentUrl {
+            word-break: break-all;
+            color: #0066cc;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎬 MKV Stream Server Test</h1>
+    
+    <div class="controls">
+        <h2>Stream Controls</h2>
+        
+        <div class="control-group">
+            <label for="startTime">Start (seconds):</label>
+            <input type="number" id="startTime" value="0" min="0" step="0.1">
+        </div>
+        
+        <div class="control-group">
+            <label for="endTime">End (seconds):</label>
+            <input type="number" id="endTime" value="" min="0" step="0.1" placeholder="Leave empty for full">
+        </div>
+        
+        <div class="control-group">
+            <label for="audioTrack">Audio Track:</label>
+            <select id="audioTrack">
+                <option value="">All tracks (default)</option>
+                <option value="1">Track 1</option>
+                <option value="2">Track 2</option>
+                <option value="3">Track 3</option>
+                <option value="4">Track 4</option>
+            </select>
+        </div>
+        
+        <button onclick="loadVideo()">Load Video</button>
+    </div>
+    
+    <video id="videoPlayer" controls>
+        Your browser does not support the video tag.
+    </video>
+    
+    <div class="info">
+        <h3>Current URL:</h3>
+        <div id="currentUrl">Click "Load Video" to generate URL</div>
+        
+        <h3>Quick Examples:</h3>
+        <ul>
+            <li><a href="#" onclick="loadExample(0, null, null)">Full video</a></li>
+            <li><a href="#" onclick="loadExample(5, 15, null)">5s to 15s</a></li>
+            <li><a href="#" onclick="loadExample(10, null, 2)">From 10s with audio track 2</a></li>
+            <li><a href="#" onclick="loadExample(0, 30, 1)">First 30s with audio track 1</a></li>
+        </ul>
+        
+        <h3>Instructions:</h3>
+        <ol>
+            <li>Make sure the stream server is running: <code>cargo run --example stream_server</code></li>
+            <li>Make sure <code>test_vp9.webm</code> exists in the project root</li>
+            <li>Adjust the parameters above and click "Load Video"</li>
+            <li>The video will be remuxed on-the-fly based on your parameters</li>
+        </ol>
+    </div>
+    
+    <script>
+        function loadVideo() {
+            const start = document.getElementById('startTime').value;
+            const end = document.getElementById('endTime').value;
+            const audioTrack = document.getElementById('audioTrack').value;
+            
+            let url = 'http://localhost:3030/video?';
+            const params = [];
+            
+            if (start && parseFloat(start) > 0) {
+                params.push(`start=${start}`);
+            }
+            if (end) {
+                params.push(`end=${end}`);
+            }
+            if (audioTrack) {
+                params.push(`audio_track=${audioTrack}`);
+            }
+            
+            url += params.join('&');
+            
+            const video = document.getElementById('videoPlayer');
+            video.src = url;
+            video.load();
+            video.play();
+            
+            document.getElementById('currentUrl').textContent = url;
+        }
+        
+        function loadExample(start, end, audioTrack) {
+            document.getElementById('startTime').value = start || 0;
+            document.getElementById('endTime').value = end || '';
+            document.getElementById('audioTrack').value = audioTrack || '';
+            loadVideo();
+            return false;
+        }
+        
+        // Load default video on page load
+        window.onload = function() {
+            loadVideo();
+        };
+    </script>
+</body>
+</html>
