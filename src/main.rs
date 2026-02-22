@@ -102,12 +102,11 @@ fn main() -> Result<()> {
 
     // Parse seek mode
     let seek_type = match args.seek_mode.as_str() {
-        "freeze" => SeekType::Freeze,
         "squeeze" => SeekType::Squeeze,
         "snap" => SeekType::SnapNearestKeyframe,
         "dirty" => SeekType::DirtyCut,
         _ => anyhow::bail!(
-            "Invalid seek mode: {}. Valid options: freeze, squeeze, snap, dirty",
+            "Invalid seek mode: {}. Valid options: squeeze, snap, dirty",
             args.seek_mode
         ),
     };

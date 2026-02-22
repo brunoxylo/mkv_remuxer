@@ -31,6 +31,13 @@ impl ClusterReadWrapper {
         self.cluster.blocks.get_mut(self.block_index - 1)
     }
 
+    // Step back to the previous block (if possible)
+    pub fn step_back(&mut self) {
+        if self.block_index > 0 {
+            self.block_index -= 1;
+        }
+    }
+
     /// Returns the global timestamp of the current block in ns without consuming it, or None if there are no more blocks
     pub fn get_current_absolute_timestamp_ns(&self, timescale: u64) -> Result<i64> {
         let cluster_timestamp = self.cluster.timestamp.0 as i64;
@@ -92,7 +99,7 @@ impl ClusterWriteWrapper {
 
     /// Add a block to the cluster with its absolute timestamp in nanoseconds
     /// The relative timestamp will be calculated automatically
-    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: i64) -> Result<()> {
+    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: i64, track_number: Option<u64>) -> Result<()> {
         // Estimate block size (header + data)
         let block_size = match &block {
             ClusterBlock::Simple(sb) => sb.0.len(),
@@ -128,6 +135,9 @@ impl ClusterWriteWrapper {
             self.cluster.timestamp.0 as i64,
             self.timecode_scale,
         )?;
+        if let Some(track_number) = track_number {
+            target_block.set_track_number(track_number)?;
+        }
 
         Ok(())
     }

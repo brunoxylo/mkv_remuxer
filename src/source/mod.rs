@@ -22,8 +22,6 @@ pub enum SeekType {
     SnapNearestKeyframe,
     /// (slow on client, exact, nice) Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 0
     Squeeze,
-    /// (fast, exact, ugly) Move the next keyframe to timestamp 0 (while omitting frames in between), freezing the video from start until the original next keyframes position
-    Freeze,
     // (fast, exact, ugly) Just cut at the exact timestamp, without respecting keyframe boundaries (may cause playback issues)
     DirtyCut,
 }
@@ -218,8 +216,7 @@ mod tests {
     const CUT_END_NS: u64 = 15_000_000_000;
     const CUT_MAX_NS: u64 = CUT_END_NS - CUT_START_NS;
 
-    const SEEK_TYPES: [SeekType; 4] = [
-        SeekType::Freeze,
+    const SEEK_TYPES: [SeekType; 3] = [
         SeekType::Squeeze,
         SeekType::SnapNearestKeyframe,
         SeekType::DirtyCut,

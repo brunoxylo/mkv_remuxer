@@ -3,11 +3,11 @@ use crate::{
     Cluster, ClusterBlockExt, ClusterReadWrapper, ClusterWriteWrapper, Result, SourcesMappings,
 };
 use log::{debug, warn};
-use mkv_element::prelude::*;
+use mkv_element::{ClusterBlock, prelude::*};
 
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
-    clusters: Vec<Option<ClusterReadWrapper>>,
+    clusters: Vec<Option<ClusterReadWrapper>>
 }
 
 impl MeltingPot {
@@ -17,7 +17,7 @@ impl MeltingPot {
         let initial_clusters = (0..num_sources).map(|_| None).collect();
         Self {
             sources_mappings,
-            clusters: initial_clusters,
+            clusters: initial_clusters
         }
     }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
@@ -98,6 +98,8 @@ impl MeltingPot {
                 ));
             }
 
+            // add pending block to output cluster if it exists
+
             if let Some(mut o_cluster) = output_cluster.take() {
                 // add the block with the lowest timestamp to the output cluster
                 if let Some(lowest_index) = lowest_cluster_index {
@@ -109,12 +111,11 @@ impl MeltingPot {
                                 .sources_mappings
                                 .is_track_mapped(lowest_index as u64, input_track_index)
                             {
-                                // yes we are writing into the input clusters buffer, but this is fine since we will never read from it again and it saves us from having to clone the block
-                                block.set_track_number(output_trackindex)?;
-                                match o_cluster.add_block(&block, lowest_timestamp_ns) {
+                                match o_cluster.add_block(&block, lowest_timestamp_ns, Some(output_trackindex)) {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
                                         // Cluster is full, break the inner loop and start a new cluster
+                                        input_cluster.step_back(); // step back to reprocess this block in the next cluster
                                         return Ok(Some(o_cluster.finish()));
                                     }
                                     Err(e) => return Err(e),

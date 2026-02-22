@@ -315,9 +315,6 @@ impl FileSource {
                 cluster.blocks = filtered;
                 Ok(cluster)
             }
-            SeekType::Freeze => {
-                self.process_freeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks)
-            }
             SeekType::Squeeze => {
                 self.process_squeeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks)
             }
@@ -743,11 +740,6 @@ impl Source for FileSource {
                             start_ns.unwrap_or(0) as i64,
                         )?
                     }
-                    SeekType::Freeze => self.initial_cluster_pos.get_keyframe_timestamp_ns(
-                        *video_track_num,
-                        start_ns.unwrap_or(0) as i64,
-                        true,
-                    )?, // use keyframe after start for freeze since we will use that keyframe as freeze frame
                     SeekType::Squeeze => self.initial_cluster_pos.get_keyframe_timestamp_ns(
                         *video_track_num,
                         start_ns.unwrap_or(0) as i64,

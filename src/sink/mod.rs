@@ -243,11 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn test_remux_german_audio_freeze() -> Result<()> {
-        run_remux_test_with_seek_type(SeekType::Freeze)
-    }
-
-    #[test]
     fn test_remux_german_audio_dirty_cut() -> Result<()> {
         run_remux_test_with_seek_type(SeekType::DirtyCut)
     }
