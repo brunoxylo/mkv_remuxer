@@ -85,6 +85,7 @@ pub fn remux(
     let mut target_timescale = None;
     let seek_type = seek_type.unwrap_or(SeekType::SnapNearestKeyframe); // default to SnapNearestKeyframe if cutting is used without specifying seek type
     if let Some(ref cut_interval) = cut_interval {
+        info!("Only remux content specified interval: {}", cut_interval);
         let mut actual_cut_interval= cut_interval.clone(); // will be updated with actual cut interval after snapping to keyframes for the first source
         let mut used_seek_type = seek_type.clone();
         for (idx, source) in sources.into_iter().enumerate() {
@@ -99,7 +100,7 @@ pub fn remux(
                 // For the first source, we need to calculate the actual cut interval after snapping to keyframes
                 actual_cut_interval = offsets;
                 used_seek_type = SeekType::DirtyCut; // For subsequent sources, we will use DirtyCut to cut at the same timestamps without snapping again
-                debug!("Actual cut interval for source {}: {:?}", idx, actual_cut_interval);
+                info!("Actual cut interval for source {}: {:?}", idx, actual_cut_interval);
             }
             if target_timescale.is_none() { // use first source's timescale as target timescale for all sources (required for cutting and syncing)
                 target_timescale = Some(init_source.get_own_timecode_scale()?);

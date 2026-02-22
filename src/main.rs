@@ -311,9 +311,10 @@ fn parse_mapping(mapping_str: &str) -> Result<TrackMapping> {
     let source_index: u64 = parts[0]
         .parse()
         .context("Invalid source index in mapping")?;
-    let track_number: u64 = parts[1]
+    let mut track_number: u64 = parts[1]
         .parse()
         .context("Invalid track number in mapping")?;
+    track_number += 1; // Convert to 1-based track number for MKV
 
     Ok((source_index, track_number))
 }

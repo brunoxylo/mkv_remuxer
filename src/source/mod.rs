@@ -367,3 +367,15 @@ impl CutInterval {
         self
     }
 }
+
+impl Display for CutInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const NS_PER_SEC: u64 = 1_000_000_000;
+        match (self.start_ns, self.end_ns) {
+            (Some(start), Some(end)) => write!(f, "{}s -> {}s", start / NS_PER_SEC, end / NS_PER_SEC),
+            (Some(start), None) => write!(f, "{}s -> ∞", start / NS_PER_SEC),
+            (None, Some(end)) => write!(f, "0s -> {}s", end / NS_PER_SEC),
+            (None, None) => write!(f, "no cut"),
+        }
+    }
+}

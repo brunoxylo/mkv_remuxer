@@ -1,6 +1,6 @@
 use super::Sink;
 use crate::{ClusterBlockExt, Result};
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::fs::File;
@@ -90,7 +90,7 @@ impl Sink for FileSink {
         let num_clusters = (duration_ns / CUE_INTERVAL_NS).max(1);
         // Reserve ~64 bytes per cue point, plus some safety 
         let estimated_cues_size = num_clusters * 25 + 1024;
-        println!("Reserving {} bytes for cues (estimated {} cue points, total duration {} ns)", estimated_cues_size, num_clusters, duration_ns);
+        debug!("Reserving {} bytes for cues (estimated {} cue points, total duration {} ns)", estimated_cues_size, num_clusters, duration_ns);
 
         self.cues_offset = self.writer.stream_position()?;
         
@@ -133,7 +133,7 @@ impl Sink for FileSink {
         
         cluster.write_to(&mut self.writer)?;
         self.writer.flush()?;
-        print!("written cluster at position {}, timestamp {} ns", cluster_position, cluster_timestamp_ns);
+        trace!("written cluster at position {}, timestamp {} ns", cluster_position, cluster_timestamp_ns);
         Ok(())
     }
 
@@ -217,7 +217,7 @@ impl Sink for FileSink {
                     )));
                 }
             }
-            println!("cue buf size after truncation: {}", cues_buf.len());
+            trace!("cue buf size after truncation: {}", cues_buf.len());
 
             
             self.writer.write_all(&cues_buf)?;

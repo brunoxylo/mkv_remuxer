@@ -128,7 +128,7 @@ impl MeltingPot {
                     }
                 } else {
                     // No valid block found but sources aren't finished - this shouldn't happen
-                    warn!(
+                    debug!(
                         "No valid block found in iteration {}, all_sources_finished={}",
                         iteration, all_sources_finished
                     );

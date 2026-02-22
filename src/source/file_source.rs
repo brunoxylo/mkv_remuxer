@@ -3,7 +3,7 @@ use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::source::CutInterval;
 use crate::{Error, Result};
 use core::time;
-use log::{debug, info};
+use log::{debug, info, trace};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::{ClusterBlock, prelude::*};
 use std::collections::HashMap;
@@ -640,7 +640,7 @@ impl Source for FileSource {
                 // Check if we should stop based on end time
                 if let Some(end_ns) = self.input_cut_interval.end_ns {
                     if cluster.get_timestamp_ms(self.timecode_scale) > end_ns {
-                        println!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ms(self.timecode_scale), end_ns);
+                        trace!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ms(self.timecode_scale), end_ns);
                         self.finished = true;
                         return Ok(None);
                     }
@@ -710,7 +710,6 @@ impl Source for FileSource {
 
         let video_tracks = self.tracks.get_all_video_tracks();
         let duration_ns = self.get_duration();
-        print!("Orig duration: {} ns", duration_ns.as_ref().ok().copied().unwrap_or(0));
         let _orig_end_ns: Option<u64> = match self.input_cut_interval.end_ns {
             Some(end) => Some(end),
             None => match duration_ns {
