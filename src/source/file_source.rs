@@ -738,14 +738,18 @@ impl Source for FileSource {
         Ok(self.output_timecode_scale)
     }
 
-    fn initialize(&mut self, time_scale: Option<u64>) -> Result<()> {
+    fn initialize(&mut self, time_scale: Option<u64>) -> Result<CutInterval> {
         if let Some(ts) = time_scale {
             self.output_timecode_scale = ts;
         }
 
         self.file
             .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
-        Ok(())
+        let duration = self.info.duration.map(|d| (d.0 * self.timecode_scale as f64) as u64);
+        Ok(CutInterval {
+            start_ns: Some(0),
+            end_ns: duration,
+        })
     }
 
     fn initialize_with_cut(

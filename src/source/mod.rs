@@ -28,7 +28,7 @@ pub enum SeekType {
     DirtyCut,
 }
 /// Represents a source of MKV data (input file or stream)
-pub trait Source: Display {
+pub trait Source: Display + Send {
     /// Get the track information from the source
     /// Returns the Tracks element containing all audio/video/subtitle tracks
     fn get_tracks(&self) -> Result<Tracks>;
@@ -53,7 +53,7 @@ pub trait Source: Display {
 
     // function to get target timecode scale for output (nanoseconds per time unit)
     fn get_target_timecode_scale(&self) -> Result<u64>;
-    fn initialize(&mut self, output_time_scale: Option<u64>) -> Result<()>;
+    fn initialize(&mut self, output_time_scale: Option<u64>) -> Result<CutInterval>;
     /// set start and end position in ns for the source (for seeking)
     /// Returns the offset to the reference keyframe from the specified start position in ns
     fn initialize_with_cut(
@@ -111,15 +111,18 @@ impl InputSource<Uninitialized> {
     pub fn initialize(
         mut self,
         output_time_scale: Option<u64>,
-    ) -> Result<InputSource<Initialized>> {
+    ) -> Result<(InputSource<Initialized>, CutInterval)> {
         // Delegate to the inner Source implementation
-        self.inner.initialize(output_time_scale)?;
+        let cut_interval = self.inner.initialize(output_time_scale)?;
 
         // Transition to initialized state
-        Ok(InputSource {
-            inner: self.inner,
-            _state: PhantomData,
-        })
+        Ok((
+            InputSource {
+                inner: self.inner,
+                _state: PhantomData,
+            },
+            cut_interval
+        ))
     }
 
     /// Initialize the source with cutting parameters
@@ -297,7 +300,7 @@ mod tests {
         assert!(test_file_path().exists(), "missing test.webm in repo root");
 
         for source in sources_implementations() {
-            let source = source.initialize(None)?;
+            let source = source.initialize(None)?.0;
             let source_str = source.to_string();
             validate_stream(source, None)
                 .map_err(|err| Error::InvalidConfig(format!("{}:{}", source_str, err)))?;

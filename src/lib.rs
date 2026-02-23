@@ -14,7 +14,7 @@ pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper, CLUSTER_MAX_D
 pub use error::{Error, Result};
 pub use metling_pot::MeltingPot;
 pub use mkv_element;
-pub use remuxer::{RemuxStats, TrackMapping, remux};
+pub use remuxer::{RemuxStats, RemuxerState, Remuxer, TrackMapping, remux};
 pub use sink::{FileSink, Sink};
 pub use source::{SeekType, Source, CutInterval, InputSource};
 pub use source_mappings::SourcesMappings;

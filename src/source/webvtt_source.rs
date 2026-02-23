@@ -238,6 +238,8 @@ impl WebVttSource {
         Ok((total_seconds * 1_000_000_000.0) as u64)
     }
 
+
+
     /// Create a cluster containing a batch of cues
     fn create_cluster_from_cues(&self, cues: &[VttCue]) -> Result<Cluster> {
         if cues.is_empty() {
@@ -474,13 +476,15 @@ impl Source for WebVttSource {
         }
     }
 
-    fn initialize(&mut self, time_scale: Option<u64>) -> Result<()> {
+    fn initialize(&mut self, time_scale: Option<u64>) -> Result<CutInterval> {
         if let Some(ts) = time_scale {
             self.output_timecode_scale = ts;
         }
         self.current_cue_idx = 0;
         self.finished = false;
-        Ok(())
+        let start_pos = self.start_ns.unwrap_or(0);
+        let end_pos = self.get_duration()? + start_pos;
+        Ok(CutInterval::new().with_start(start_pos).with_end(end_pos))
     }
 
     fn initialize_with_cut(

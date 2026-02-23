@@ -17,7 +17,7 @@ pub struct Uninitialized;
 pub struct Initialized;
 
 /// Represents a sink/destination for MKV data (output file or stream)
-pub trait Sink {
+pub trait Sink: Send {
     /// Initialize the output with EBML header and segment info
     fn initialize(
         &mut self,
@@ -151,7 +151,7 @@ mod tests {
         // Initialize source temporarily to check tracks
         let temp_source = FileSource::new(&input_path)?;
         let temp_input = InputSource::from(temp_source);
-        let mut initialized_temp = temp_input.initialize(None)?;
+        let mut initialized_temp = temp_input.initialize(None)?.0;
         let tracks = initialized_temp.get_tracks()?;
         
 
@@ -285,7 +285,7 @@ mod tests {
         let temp_video = FileSource::new(video_path)?;
         let temp_video_input = InputSource::from(temp_video);
         let mut init_video = temp_video_input.initialize(None)?;
-        let video_tracks = init_video.get_tracks()?;
+        let video_tracks = init_video.get_tracks()?.0;
         
         // Create video source from test_av1.webm
         let video_source = FileSource::new(video_path)?;

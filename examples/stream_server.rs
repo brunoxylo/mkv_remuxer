@@ -20,9 +20,7 @@
 use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::{
-    remux,
-    sink::{OutputSink, StreamSink},
-    source::{CutInterval, FileSource, InputSource, SeekType},
+    Remuxer, RemuxerState, sink::{OutputSink, StreamSink}, source::{CutInterval, FileSource, InputSource, SeekType}
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -174,22 +172,53 @@ async fn handle_video_request(
         })
         .unwrap_or_default();
 
+    let seek_type = match params.get("seek").map(|s| s.as_str()) {
+        Some("squeeze") => SeekType::Squeeze,
+        Some("dirty") => SeekType::DirtyCut,
+        _ => SeekType::SnapNearestKeyframe,
+    };
+
     info!(
-        "Request: file={} start={}s, end={:?}s, tracks={:?}",
-        safe_name, start_sec, end_sec, tracks
+        "Request: file={} start={}s, end={:?}s, tracks={:?}, seek={:?}",
+        safe_name, start_sec, end_sec, tracks, seek_type
     );
 
     // Create a channel for streaming chunks
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
 
-    // Spawn blocking task for remux (CPU-bound + synchronous I/O)
+    // Spawn blocking task for remuxer intialization since it may involve file I/O and processing
+    let (remuxer, output_interval) =  match tokio::task::spawn_blocking(move || {
+        process_video_request(input_path, start_sec, end_sec, tracks, seek_type, tx.clone())
+    }).await.unwrap() {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Error initializing remuxer: {}", e);
+            let response = warp::http::Response::builder()
+                .status(500)
+                .body(hyper::Body::from(format!("Internal server error: {}", e)))
+                .unwrap();
+            return Ok(response);
+        }
+    };
+
+
+    // spawn another blocking task to run the remuxer loop so it doesn't block the async response handling
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = process_video_request(input_path, start_sec, end_sec, tracks, tx.clone()) {
-            error!("Error processing video request: {}", e);
-            let _ = tx.send(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Remux error: {}", e),
-            )));
+        let mut remuxer = remuxer;
+        loop {
+            remuxer = match remuxer.process() {
+                Ok(state) => match state {
+                    RemuxerState::Processing(remuxer) => remuxer,
+                    RemuxerState::Done(stats) => {
+                        info!("Remuxing completed: {:?}", stats);
+                        return ();
+                    }
+                },
+                Err(e) => {
+                    error!("Error during remuxing: {}", e);
+                    return ();
+                }
+            };
         }
     });
 
@@ -197,10 +226,16 @@ async fn handle_video_request(
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
     let body = warp::hyper::Body::wrap_stream(stream);
 
+    // safe the start and end times of the segment we are streaming in custom headers so client can use them if needed
+    let start_sec = output_interval.start_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
+    let end_sec = output_interval.end_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
+
     let response = warp::http::Response::builder()
         .status(200)
         .header("Content-Type", "video/webm")
         .header("Cache-Control", "no-cache")
+        .header("X-Media-Start-Sec", format!("{:.3}", start_sec))
+        .header("X-Media-End-Sec", format!("{:.3}", end_sec))
         .body(body)
         .unwrap();
 
@@ -212,8 +247,9 @@ fn process_video_request(
     start_sec: f64,
     end_sec: Option<f64>,
     tracks: Vec<u64>,
+    seek_type: SeekType,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> mkv_remuxer::Result<()> {
+) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
     let source = FileSource::new(&input_path)?;
     let input = InputSource::from(source);
 
@@ -247,18 +283,11 @@ fn process_video_request(
     let output = OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>);
 
     let seek_type = if cut_interval.is_some() {
-        Some(SeekType::Squeeze)
+        Some(seek_type)
     } else {
         None
     };
 
     info!("Starting remux...");
-    let stats = remux(vec![input], output, cut_interval, seek_type, mappings)?;
-    info!(
-        "Remux completed: {} blocks, duration: {}s",
-        stats.blocks_processed,
-        stats.duration_ns as f64 / 1_000_000_000.0
-    );
-
-    Ok(())
+    Remuxer::new(vec![input], output, cut_interval, seek_type, mappings)
 }

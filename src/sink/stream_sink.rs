@@ -9,14 +9,14 @@ use std::io::{Seek, Write};
 /// 
 /// This sink writes to any `Write + Seek` stream without managing cues,
 /// since seekable streams allow the consumer to navigate the file.
-pub struct StreamSink<W: Write + Seek> {
+pub struct StreamSink<W: Write + Seek + Send> {
     writer: W,
     segment_started: bool,
     segment_start_offset: u64,
     timescale: u64,
 }
 
-impl<W: Write + Seek> StreamSink<W> {
+impl<W: Write + Seek + Send> StreamSink<W> {
     /// Create a new stream sink that writes to the specified stream
     pub fn new(writer: W) -> Result<Self> {
         Ok(Self {
@@ -28,7 +28,7 @@ impl<W: Write + Seek> StreamSink<W> {
     }
 }
 
-impl<W: Write + Seek> Sink for StreamSink<W> {
+impl<W: Write + Seek + Send> Sink for StreamSink<W> {
     fn initialize(
         &mut self,
         tracks: &Tracks,

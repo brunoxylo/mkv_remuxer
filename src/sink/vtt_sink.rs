@@ -7,7 +7,7 @@ use std::io::Write;
 /// 
 /// This sink extracts subtitle data from MKV clusters and writes it
 /// as WebVTT format to any writer (file, memory buffer, HTTP response, etc.)
-pub struct VttSink<W: Write> {
+pub struct VttSink<W: Write + Send> {
     writer: W,
     initialized: bool,
     subtitle_track_number: Option<u64>,
@@ -25,7 +25,7 @@ struct VttCue {
     text: String,
 }
 
-impl<W: Write> VttSink<W> {
+impl<W: Write + Send> VttSink<W> {
     /// Create a new VTT sink that writes to the specified writer
     pub fn new(writer: W) -> Self {
         Self {
@@ -81,7 +81,7 @@ impl<W: Write> VttSink<W> {
     }
 }
 
-impl<W: Write> Sink for VttSink<W> {
+impl<W: Write + Send> Sink for VttSink<W> {
     fn initialize(
         &mut self,
         tracks: &Tracks,

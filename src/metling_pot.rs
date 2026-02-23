@@ -162,7 +162,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn setup_melting_pot(source: InputSource<Uninitialized>) -> Result<(MeltingPot, u64)> {
-        let source = source.initialize(None)?;
+        let (source, _cut_interval) = source.initialize(None)?;
         let timescale = source.get_target_timecode_scale()?;
 
         let mut mappings = SourcesMappings::new(vec![source])?;

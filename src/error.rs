@@ -52,6 +52,9 @@ pub enum Error {
     /// End of stream reached unexpectedly
     UnexpectedEof,
 
+    /// Remuxing has completed — returned by `Remuxer::process()` when there are no more clusters
+    Done,
+
     /// Unknown or unsupported element size
     UnknownElementSize(String),
 
@@ -91,6 +94,7 @@ impl fmt::Display for Error {
             Error::UnsupportedOperation(msg) => write!(f, "Unsupported operation: {}", msg),
             Error::RemuxError(msg) => write!(f, "Remux error: {}", msg),
             Error::ClusterIsFull(msg) => write!(f, "Cluster is full: {}", msg),
+            Error::Done => write!(f, "Remuxing completed"),
         }
     }
 }
