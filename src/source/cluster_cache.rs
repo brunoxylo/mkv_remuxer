@@ -139,37 +139,31 @@ impl ClusterOfInterestCache {
             }
         }
 
-        // No suitable keyframe in current cluster, search neighboring clusters
-        const MAX_NEIGHBOR_SEARCH: usize = 5;
+        // No suitable keyframe in current cluster, search neighboring clusters.
+        // Use a generous limit — keyframe intervals can easily exceed 5–10 s on
+        // streaming content, so we scan up to 60 clusters forward.
+        const MAX_NEIGHBOR_SEARCH: usize = 60;
         
         // Scan to build a list of nearby cluster positions
         let nearby_clusters = self.scan_nearby_clusters(MAX_NEIGHBOR_SEARCH)?;
         
         // Search in the appropriate direction
         let search_clusters: Vec<(u64, u64)> = if after {
-            // For "after", prioritize clusters with timestamps >= current position
+            // For "after", only consider clusters whose timestamp is at or after
+            // the anchor cluster (so we actually scan *past* the reference).
             nearby_clusters.into_iter()
                 .filter(|(_, ts)| *ts >= cluster.get_timestamp_ms(self.timecode_scale))
                 .collect()
         } else {
-            // For "before", prioritize clusters with timestamps <= current position
+            // For "before", use any cluster at or before the anchor.
             let mut before_clusters: Vec<_> = nearby_clusters.into_iter()
                 .filter(|(_, ts)| *ts <= cluster.get_timestamp_ms(self.timecode_scale))
                 .collect();
-            before_clusters.reverse(); // Search backwards
+            before_clusters.reverse(); // nearest-first
             before_clusters
         };
 
-        // Try each nearby cluster (only within reasonable time range)
-        const MAX_TIME_DISTANCE_NS: i64 = 2_000_000_000; // 2 seconds max distance
-        let current_cluster_ts = cluster.get_timestamp_ms(self.timecode_scale) as i64;
-        
-        for (cluster_pos, cluster_ts) in search_clusters {
-            let cluster_ts = cluster_ts as i64;
-            // Only consider clusters within reasonable time distance
-            if (cluster_ts - current_cluster_ts).abs() > MAX_TIME_DISTANCE_NS {
-                continue;
-            }
+        for (cluster_pos, _cluster_ts) in search_clusters {
             
             if let Ok(neighbor_cluster) = Cluster::from_file_pos(&mut self.file, cluster_pos) {
                 let keyframe_idx_opt = if after {
