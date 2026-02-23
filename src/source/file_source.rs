@@ -304,16 +304,26 @@ impl FileSource {
         let orig_cluster_ns = cluster.get_timestamp_ms(self.timecode_scale) as i64;
 
         // Shift cluster timestamp
-        let shift_reference =  if self.seek_type == SeekType::SnapNearestKeyframe {
-            if let Some(video_track_num) = self.first_video_track_num {
-                self.initial_cluster_pos
-                    .get_closest_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64)?
-            } else {
-                // no video tracks, use cut start as reference for shifting 
+        let shift_reference = match self.seek_type {
+            SeekType::SnapNearestKeyframe => {
+                if let Some(video_track_num) = self.first_video_track_num {
+                    self.initial_cluster_pos
+                        .get_closest_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64)?
+                } else {
+                    self.input_cut_interval.start_ns.unwrap_or(0) as i64
+                }
+            }
+            SeekType::SnapPreviousKeyframe => {
+                if let Some(video_track_num) = self.first_video_track_num {
+                    self.initial_cluster_pos
+                        .get_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64, false)?
+                } else {
+                    self.input_cut_interval.start_ns.unwrap_or(0) as i64
+                }
+            }
+            _ => {
                 self.input_cut_interval.start_ns.unwrap_or(0) as i64
             }
-        } else {
-            self.input_cut_interval.start_ns.unwrap_or(0) as i64
         };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
         cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
@@ -322,7 +332,7 @@ impl FileSource {
         let mut filtered = Vec::with_capacity(orig_block_count);
 
         let result = match self.seek_type {
-            SeekType::SnapNearestKeyframe => {
+            SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe => {
                 // Simple: just shift timestamps, but we still need to respect end_ns
                 let mut filtered = Vec::with_capacity(cluster.blocks.len());
                 for mut block in cluster.blocks {
@@ -627,16 +637,19 @@ impl Source for FileSource {
         };
         let video_track_num = self.first_video_track_num;
 
-        if let Some(v_track) = video_track_num && self.seek_type == SeekType::SnapNearestKeyframe {
-            let start_keyframe = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                v_track,
-                self.input_cut_interval.start_ns.unwrap_or(0) as i64,
-            )?;
+        if let Some(v_track) = video_track_num && matches!(self.seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) {
+            let prev_only = self.seek_type == SeekType::SnapPreviousKeyframe;
+            let start_keyframe = if prev_only {
+                self.initial_cluster_pos.get_keyframe_timestamp_ns(v_track, self.input_cut_interval.start_ns.unwrap_or(0) as i64, false)?
+            } else {
+                self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(v_track, self.input_cut_interval.start_ns.unwrap_or(0) as i64)?
+            };
             if let Some (end_pos) = self.input_cut_interval.end_ns {
-                let end_keyframe = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                    v_track,
-                    end_pos as i64,
-                )?;
+                let end_keyframe = if prev_only {
+                    self.initial_cluster_pos.get_keyframe_timestamp_ns(v_track, end_pos as i64, false)?
+                } else {
+                    self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(v_track, end_pos as i64)?
+                };
                 if end_keyframe > start_keyframe {
                     return Ok((end_keyframe - start_keyframe) as u64);
                 } else {
@@ -803,7 +816,29 @@ impl Source for FileSource {
                                 )? as u64
                             )
                         } else {
-                            duration_ns.ok().map(|d| d )
+                            duration_ns.ok().map(|d| d)
+                        };
+                        CutInterval {
+                            start_ns: Some(actual_start_ns as u64),
+                            end_ns: actual_end_ns,
+                        }
+                    }
+                    SeekType::SnapPreviousKeyframe => {
+                        let actual_start_ns = self.initial_cluster_pos.get_keyframe_timestamp_ns(
+                            *video_track_num,
+                            self.input_cut_interval.start_ns.unwrap_or(0) as i64,
+                            false,
+                        )?;
+                        let actual_end_ns = if let Some(end_ns) = self.input_cut_interval.end_ns {
+                            Some(
+                                self.end_cluster_pos.get_keyframe_timestamp_ns(
+                                    *video_track_num,
+                                    end_ns as i64,
+                                    false,
+                                )? as u64
+                            )
+                        } else {
+                            duration_ns.ok().map(|d| d)
                         };
                         CutInterval {
                             start_ns: Some(actual_start_ns as u64),

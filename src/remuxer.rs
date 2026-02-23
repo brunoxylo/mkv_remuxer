@@ -63,7 +63,7 @@ impl Remuxer {
                     new_cut_interval.clone(),
                 )?;
                 // if us efirst source as refernce for snapping and seek type is snap to nearest keyframe, update the cut interval to reflect the actual snap points (which may be different from requested cut interval)
-                if seek_type == SeekType::SnapNearestKeyframe && idx == 0 {
+                if matches!(seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) && idx == 0 {
                     new_cut_interval = offsets;
                     used_seek_type = SeekType::DirtyCut;
                     info!("Actual cut interval for source {}: {:?}", idx, new_cut_interval);

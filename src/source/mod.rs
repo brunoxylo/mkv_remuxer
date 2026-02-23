@@ -22,6 +22,8 @@ pub struct Initialized;
 pub enum SeekType {
     /// (fast, not exact, nice) Seek to the nearest keyframe before or after the target timestamp
     SnapNearestKeyframe,
+    /// (fast, not exact, nice) Seek to the nearest keyframe before the target timestamp
+    SnapPreviousKeyframe,
     /// (slow on client, exact, nice) Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 0
     Squeeze,
     // (fast, exact, ugly) Just cut at the exact timestamp, without respecting keyframe boundaries (may cause playback issues)
@@ -324,11 +326,11 @@ mod tests {
                 )?;
                 let mut max_ts = CUT_MAX_NS;
                 println!("our actual interval is {}", offset);
-                if matches!(seek_type, SeekType::SnapNearestKeyframe) {
+                if matches!(seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) {
                     // Calculate the actual duration from the keyframe timestamps
                     if let (Some(start), Some(end)) = (offset.start_ns, offset.end_ns) {
                         max_ts = end - start;
-                        if seek_type == SeekType::SnapNearestKeyframe {
+                        if matches!(seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) {
                             max_ts += 5_000_000_000; // allow 5s tolerance for snap nearest keyframe, we cnt get this universally for every input source to we just assume a key frame interval of 5s 
                         }
                     }

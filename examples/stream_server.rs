@@ -175,6 +175,7 @@ async fn handle_video_request(
     let seek_type = match params.get("seek").map(|s| s.as_str()) {
         Some("squeeze") => SeekType::Squeeze,
         Some("dirty") => SeekType::DirtyCut,
+        Some("snap_prev") => SeekType::SnapPreviousKeyframe,
         _ => SeekType::SnapNearestKeyframe,
     };
 
