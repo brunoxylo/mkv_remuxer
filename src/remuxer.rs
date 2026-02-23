@@ -118,8 +118,9 @@ impl Remuxer {
 
         let chapters = sources_mappings
             .sources
-            .first()
-            .and_then(|s| s.get_chapters().ok().flatten());
+            .iter()
+            .find_map(|source| source.get_chapters().ok().flatten());
+            
 
         let mut melting_pot = MeltingPot::new(sources_mappings);
         let duration_ns = melting_pot.get_final_duration().unwrap_or(0);
@@ -131,6 +132,7 @@ impl Remuxer {
             &output_tracks,
             duration_ns,
             target_timescale,
+            chapters.as_ref()
         )?;
 
         Ok((

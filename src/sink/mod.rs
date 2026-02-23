@@ -74,6 +74,7 @@ impl OutputSink<Uninitialized> {
         tracks: &Tracks,
         duration_ns: u64,
         timecode_scale: u64,
+        chapters: Option<&Chapters>
     ) -> Result<OutputSink<Initialized>> {
         let info = Info {
             timestamp_scale: TimestampScale(timecode_scale),
@@ -93,7 +94,7 @@ impl OutputSink<Uninitialized> {
             crc32: None,
             void: None,
         };
-        self.initialize(tracks, &info, None)
+        self.initialize(tracks, &info, chapters)
     }
 }
 
@@ -284,8 +285,8 @@ mod tests {
         let video_path = std::path::Path::new("test_av1.webm");
         let temp_video = FileSource::new(video_path)?;
         let temp_video_input = InputSource::from(temp_video);
-        let mut init_video = temp_video_input.initialize(None)?;
-        let video_tracks = init_video.get_tracks()?.0;
+        let (mut init_video,_output_cut) = temp_video_input.initialize(None)?;
+        let video_tracks = init_video.get_tracks()?;
         
         // Create video source from test_av1.webm
         let video_source = FileSource::new(video_path)?;
