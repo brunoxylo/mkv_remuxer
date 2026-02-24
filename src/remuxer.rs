@@ -108,23 +108,33 @@ impl Remuxer {
                             first_mapped
                     };
 
-                    let actual_cut = if let Some(mapped_video) = first_mapped_video_track { // there is a video track we can use as reference for snapping
-                        let mut my_source = sources_cutting.remove(mapped_video.0 as usize);
-                        let cut_interval = match cut_mode {
-                            Some(RemuxerCutMode::SnapNearestKeyframe) => my_source.cut(SeekType::SnapNearestKeyframe(mapped_video.1), cut_interval)?,
-                            Some(RemuxerCutMode::SnapPreviousKeyframe) => my_source.cut(SeekType::SnapPreviousKeyframe(mapped_video.1), cut_interval)?,
-                            Some(RemuxerCutMode::SnapNextKeyframe) => my_source.cut( SeekType::SnapNextKeyframe(mapped_video.1), cut_interval)?,
+                    // Cut the video source first to determine the snapped interval, then apply
+                    // that interval to all other sources with DirtyCut — all sources stay in
+                    // their original order so mapping indices remain valid.
+                    let actual_cut = if let Some((video_src_idx, video_track_num)) = first_mapped_video_track {
+                        let actual = match cut_mode {
+                            Some(RemuxerCutMode::SnapNearestKeyframe) => sources_cutting[video_src_idx as usize].cut(SeekType::SnapNearestKeyframe(video_track_num), cut_interval)?,
+                            Some(RemuxerCutMode::SnapPreviousKeyframe) => sources_cutting[video_src_idx as usize].cut(SeekType::SnapPreviousKeyframe(video_track_num), cut_interval)?,
+                            Some(RemuxerCutMode::SnapNextKeyframe) => sources_cutting[video_src_idx as usize].cut(SeekType::SnapNextKeyframe(video_track_num), cut_interval)?,
                             _ => unreachable!(),
                         };
-                        initialized_sources.push(my_source.into_remuxing()?);
-                        cut_interval
-
-                    } else { // no video track found, so we dont need to adapt the interval
+                        // Apply the snapped interval to all other sources with DirtyCut
+                        for (idx, source) in sources_cutting.iter_mut().enumerate() {
+                            if idx != video_src_idx as usize {
+                                let _ = source.cut(SeekType::DirtyCut, actual)?;
+                            }
+                        }
+                        actual
+                    } else {
+                        // No video track found; apply DirtyCut to all
+                        for source in sources_cutting.iter_mut() {
+                            let _ = source.cut(SeekType::DirtyCut, cut_interval)?;
+                        }
                         cut_interval
                     };
-                    // all other sources are cut with dirty cut, we dont have a reference track for them to snap to
-                    for mut source in sources_cutting.into_iter() {
-                        let _ = source.cut(  SeekType::DirtyCut, actual_cut)?;
+
+                    // Push all sources in original order so mapping indices stay correct
+                    for source in sources_cutting.into_iter() {
                         initialized_sources.push(source.into_remuxing()?);
                     }
                     actual_cut

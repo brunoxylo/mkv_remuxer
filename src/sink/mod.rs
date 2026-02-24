@@ -1,20 +1,15 @@
-use crate::APP_NAME;
 use crate::Result;
 use mkv_element::prelude::*;
-use std::marker::PhantomData;
 
+mod util;
 mod file_sink;
-pub use file_sink::FileSink;
-
 mod vtt_sink;
-pub use vtt_sink::VttSink;
-
 mod stream_sink;
-pub use stream_sink::StreamSink;
 
-// Typestate marker types
-pub struct Uninitialized;
-pub struct Initialized;
+pub use util::{OutputSink, Uninitialized, Initialized};
+pub use file_sink::FileSink;
+pub use vtt_sink::VttSink;
+pub use stream_sink::StreamSink;
 
 /// Represents a sink/destination for MKV data (output file or stream)
 pub trait Sink: Send {
@@ -31,94 +26,6 @@ pub trait Sink: Send {
 
     /// Finalize the output (write cues, seek head, close file)
     fn finalize(&mut self) -> Result<()>;
-}
-
-/// Wrapper struct that uses the typestate pattern to prevent misuse
-pub struct OutputSink<State = Uninitialized> {
-    inner: Box<dyn Sink>,
-    _state: PhantomData<State>,
-}
-
-// Implementation for uninitialized sink
-impl OutputSink<Uninitialized> {
-    /// Create a new uninitialized output sink wrapping any Sink implementation
-    pub fn new(sink: Box<dyn Sink>) -> Self {
-        Self {
-            inner: sink,
-            _state: PhantomData,
-        }
-    }
-
-    /// Initialize the sink with EBML header and segment info
-    ///
-    /// Consumes the uninitialized sink and returns an initialized one.
-    /// This state transition ensures initialization can only happen once.
-    pub fn initialize(
-        mut self,
-        tracks: &Tracks,
-        info: &Info,
-        chapters: Option<&Chapters>,
-    ) -> Result<OutputSink<Initialized>> {
-        // Delegate to the inner Sink implementation
-        self.inner.initialize(tracks, info, chapters)?;
-
-        // Transition to initialized state
-        Ok(OutputSink {
-            inner: self.inner,
-            _state: PhantomData,
-        })
-    }
-
-    pub fn initialize_simple(
-        self,
-        tracks: &Tracks,
-        duration_ns: u64,
-        timecode_scale: u64,
-        chapters: Option<&Chapters>
-    ) -> Result<OutputSink<Initialized>> {
-        let info = Info {
-            timestamp_scale: TimestampScale(timecode_scale),
-            muxing_app: MuxingApp(APP_NAME.to_string()),
-            writing_app: WritingApp(APP_NAME.to_string()),
-            duration: Some(Duration((duration_ns / timecode_scale) as f64)),
-            date_utc: Some(DateUtc(chrono::Utc::now().timestamp())),
-            title: None,
-            segment_uuid: Some(SegmentUuid(uuid::Uuid::new_v4().as_bytes().to_vec())),
-            segment_filename: None,
-            prev_uuid: None,
-            prev_filename: None,
-            next_uuid: None,
-            next_filename: None,
-            segment_family: Vec::new(),
-            chapter_translate: Vec::new(),
-            crc32: None,
-            void: None,
-        };
-        self.initialize(tracks, &info, chapters)
-    }
-}
-
-// From trait implementations for automatic conversion
-impl From<Box<dyn Sink>> for OutputSink<Uninitialized> {
-    fn from(sink: Box<dyn Sink>) -> Self {
-        Self::new(sink)
-    }
-}
-
-impl<T: Sink + 'static> From<T> for OutputSink<Uninitialized> {
-    fn from(sink: T) -> Self {
-        Self::new(Box::new(sink))
-    }
-}
-
-// Implementation for initialized sink
-impl OutputSink<Initialized> {
-    pub fn write_cluster(&mut self, cluster: &Cluster, track_number: u64) -> Result<()> {
-        self.inner.write_cluster(cluster, track_number)
-    }
-    pub fn finalize(mut self) -> Result<()> {
-        self.inner.finalize()
-    }
 }
 
 #[cfg(test)]
@@ -355,6 +262,73 @@ mod tests {
         // Cleanup is commented out for inspection
         // let _ = std::fs::remove_file(&output_path);
         
+        Ok(())
+    }
+
+    #[test]
+    fn test_remux_av1_vp9_cross_source_tracks() -> Result<()> {
+        use crate::source::WebVttSource;
+
+        // Remux tracks 3 and 4 from test_av1.webm (source 0),
+        // track 1 from test_vp9.webm (source 1), and
+        // subtitles from example.vtt (source 2),
+        // cutting from 5s to 25s with snap-nearest-keyframe.
+        let temp_dir = std::env::temp_dir();
+        let output_path = temp_dir.join("test_av1_vp9_cross_source.mkv");
+
+        let av1_path = std::path::Path::new("test_av1.webm");
+        let vp9_path = std::path::Path::new("test_vp9.webm");
+        let vtt_path = std::path::Path::new("example.vtt");
+
+        let source0 = InputSource::from(FileSource::new(av1_path)?);
+        let source1 = InputSource::from(FileSource::new(vp9_path)?);
+        let source2 = InputSource::from(WebVttSource::new(vtt_path, "eng")?);
+
+        let output = OutputSink::from(FileSink::new(&output_path)?);
+
+        // (source_index, track_number)
+        let output_mappings = vec![
+            (0u64, 3u64), // audio ger from test_av1.webm
+            (1u64, 1u64), // track 1 from test_vp9.webm
+            (2u64, 1u64), // subtitle from example.vtt (replaces source 0 subtitle)
+        ];
+
+        let cut_interval = CutInterval::new().with_range(5_000_000_000, 25_000_000_000);
+
+        let stats = remux(
+            vec![source0, source1, source2],
+            output,
+            Some(cut_interval),
+            Some(RemuxerCutMode::SnapNearestKeyframe),
+            Some(output_mappings.clone()),
+        )?;
+
+        assert!(stats.blocks_processed > 0, "Should have processed at least some blocks");
+        assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
+
+        let validation_report = validate_mkv_output(&output_path, true, None, false, true)?;
+
+        if !validation_report.is_valid() {
+            eprintln!("{}", validation_report.summary());
+            for error in &validation_report.errors {
+                eprintln!("ERROR: {}", error);
+            }
+            for warning in &validation_report.warnings {
+                eprintln!("WARNING: {}", warning);
+            }
+        }
+
+        assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
+        assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
+        assert!(validation_report.cluster_duration_valid,
+            "Cluster durations should not exceed {} ns",
+            crate::cluster_warpper::CLUSTER_MAX_DURATION_NS);
+        assert!(validation_report.cluster_size_valid,
+            "Cluster sizes should not exceed {} bytes",
+            crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES);
+
+        // let _ = std::fs::remove_file(&output_path);
+
         Ok(())
     }
 }
