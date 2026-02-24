@@ -176,6 +176,8 @@ async fn handle_video_request(
         Some("squeeze") => Some(RemuxerCutMode::Squeeze),
         Some("dirty") => Some(RemuxerCutMode::DirtyCut),
         Some("snap_prev") => Some(RemuxerCutMode::SnapPreviousKeyframe),
+        Some("snap_next") => Some(RemuxerCutMode::SnapNextKeyframe),
+        Some("snap") => Some(RemuxerCutMode::SnapNearestKeyframe),
         _ => None,
     };
 
