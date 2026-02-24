@@ -7,7 +7,7 @@ mod cluster_cache;
 mod file_source;
 mod webvtt_source;
 
-pub use cluster_cache::ClusterOfInterestCache;
+pub use cluster_cache::KeyframePositionCache;
 pub use file_source::FileSource;
 pub use webvtt_source::WebVttSource;
 
@@ -15,60 +15,141 @@ pub use webvtt_source::WebVttSource;
 /// Marker type indicating the source has not been initialized
 pub struct Uninitialized;
 
-/// Marker type indicating the source has been initialized
-pub struct Initialized;
+/// Marker type indicating the source has been initialized and is ready for optional cutting.
+/// Metadata (tracks, chapters, info) is accessible. `cut()` may be called any number of times
+/// (idempotent: each call re-seeks to the given interval and replaces the previous one).
+/// Call `into_remuxing()` or `cut_into_remuxing()` to move to the `Remuxing` state.
+pub struct Cutting;
+
+/// Marker type indicating the source has been fully prepared and is streaming clusters.
+/// Metadata is still accessible, but cutting is no longer possible.
+pub struct Remuxing;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeekType {
     /// (fast, not exact, nice) Seek to the nearest keyframe before or after the target timestamp
-    SnapNearestKeyframe,
+    /// The integer holds the mkv track number of the track that is used as reference for searching keyframes
+    SnapNearestKeyframe(u64),
     /// (fast, not exact, nice) Seek to the nearest keyframe before the target timestamp
-    SnapPreviousKeyframe,
-    /// (slow on client, exact, nice) Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 0
+    /// The integer holds the mkv track number of the track that is used as reference for searching keyframes
+    SnapPreviousKeyframe(u64),
+    /// (fast, not exact, nice) Seek to the nearest keyframe after the target timestamp
+    /// The integer holds the mkv track number of the track that is used as reference for searching keyframes
+    SnapNextKeyframe(u64),
+    /// (slow on client, exact, nice) Squeeze the frames from the previous keyframe up to the desired cut position to timestamp 
     Squeeze,
     // (fast, exact, ugly) Just cut at the exact timestamp, without respecting keyframe boundaries (may cause playback issues)
     DirtyCut,
 }
-/// Represents a source of MKV data (input file or stream)
+/// Represents a source of MKV data (input file or stream).
+///
+/// # Phase contract
+///
+/// Implementations must support the following call sequences — only these
+/// orderings are valid:
+///
+/// **With optional cutting:**
+/// ```text
+/// initialize()
+/// cut()*            ← idempotent; may be called any number of times
+/// start_remuxing()
+/// get_next_cluster()*
+/// ```
+///
+/// **Skipping the Cutting phase entirely:**
+/// ```text
+/// initialize_into_remuxing()   ← calls initialize() + start_remuxing() internally
+/// get_next_cluster()*
+/// ```
+///
+/// Calling `cut()` before `initialize()` or after `start_remuxing()` is
+/// undefined behaviour.  Calling `get_next_cluster()` before `start_remuxing()`
+/// (or `initialize_into_remuxing()`) is undefined behaviour.
 pub trait Source: Display + Send {
-    /// Get the track information from the source
-    /// Returns the Tracks element containing all audio/video/subtitle tracks
+    // ── Metadata ──────────────────────────────────────────────────────────────
+    // All metadata methods are valid after `initialize()`.
+
+    /// Track list for this source.
     fn get_tracks(&self) -> Result<Tracks>;
-
-    /// Get chapter information from the source
-    /// Returns None if the source has no chapters
+    /// Chapter list, or `None` if the source has no chapters.
     fn get_chapters(&self) -> Result<Option<Chapters>>;
-
-    /// Get segment metadata/info from the source
-    /// Returns the Info element with duration, title, timestamps, etc.
+    /// Segment info element (duration, title, timestamps, …).
     fn get_info(&self) -> Result<Info>;
-
-    /// Get the next block/frame of data from the source
-    /// Returns None when end of stream is reached
-    fn get_next_cluster(&mut self) -> Result<Option<Cluster>>;
-
-    /// fuction to get the sources timescale (nanoseconds per time unit)
+    /// The source's own timecode scale (nanoseconds per tick).
     fn get_own_timecode_scale(&self) -> Result<u64>;
-
-    fn get_cut_positions(&self) -> (u64, Option<u64>);
-    fn get_duration(& mut self) -> Result<u64>;
-
-    // function to get target timecode scale for output (nanoseconds per time unit)
+    /// The target output timecode scale (nanoseconds per tick).
     fn get_target_timecode_scale(&self) -> Result<u64>;
+    /// The (start_ns, end_ns) cut nanoseconds positions currently applied.
+    /// should return (0, OriginalDuration) when no cut applied, and update accordingly after each cut.
+    fn get_output_interval(&mut self) -> Result<CutInterval>;
+    /// Effective duration in nanoseconds, respecting any applied cut.
+    fn get_output_duration(&mut self) -> Result<Option<u64>> {
+        let start = self.get_output_interval()?.start_ns.unwrap_or(0);
+        if let Some(end) = self.get_output_interval()?.end_ns {
+            if end >= start {
+                return Ok(Some(end - start));
+            }
+        }
+        Ok(None)
+    }
+
+    // ── Phase transitions ─────────────────────────────────────────────────────
+
+    /// **Uninitialized → Cutting.**
+    ///
+    /// Reads headers and populates metadata.  Seeks to the first cluster.
+    /// `output_time_scale` sets the output timescale; uses the source's own
+    /// scale when `None`.  Returns the full-file interval (no cut applied yet).
     fn initialize(&mut self, output_time_scale: Option<u64>) -> Result<CutInterval>;
-    /// set start and end position in ns for the source (for seeking)
-    /// Returns the offset to the reference keyframe from the specified start position in ns
-    fn initialize_with_cut(
+
+    /// **Cutting (idempotent): apply or re-apply a cut interval.**
+    ///
+    /// Each call replaces the previous cut.  The returned interval reflects any
+    /// keyframe snapping that occurred (may differ from `interval` for
+    /// `SnapNearestKeyframe` / `SnapPreviousKeyframe`).
+    ///
+    /// MUST NOT be called before `initialize()` or after `start_remuxing()`.
+    fn cut(
+        &mut self,
+        seek_type: SeekType,
+        interval: CutInterval,
+    ) -> Result<CutInterval>;
+
+    /// **Cutting → Remuxing.**
+    ///
+    /// Seals the current cut (or the full-file interval from `initialize()`)
+    /// and seeks to the start cluster.  After this call `cut()` MUST NOT be
+    /// called; `get_next_cluster()` becomes valid.
+    ///
+    /// `output_time_scale` may override the scale set during `initialize()` /
+    /// `cut()`.
+    fn start_remuxing(&mut self) -> Result<()>;
+
+    /// **Uninitialized → Remuxing in one step** (skips the `Cutting` state).
+    ///
+    /// The default implementation calls `initialize(output_time_scale)` followed
+    /// by `start_remuxing()`.  Implementors may override for efficiency.
+    fn initialize_into_remuxing(
         &mut self,
         output_time_scale: Option<u64>,
-        seek_type: SeekType,
-        cut_interval : CutInterval,
-    ) -> Result<CutInterval>;
+    ) -> Result<CutInterval> {
+        let interval = self.initialize(output_time_scale)?;
+        self.start_remuxing()?;
+        Ok(interval)
+    }
+
+    // ── Remuxing ──────────────────────────────────────────────────────────────
+    // Only valid after `start_remuxing()` (or `initialize_into_remuxing()`).
+
+    /// Returns the next cluster, or `None` at end-of-stream.
+    fn get_next_cluster(&mut self) -> Result<Option<Cluster>>;
 }
 
-/// Wrapper struct that uses the typestate pattern to prevent misuse
+/// Wrapper struct that uses the typestate pattern to prevent misuse.
+/// All methods are thin pipes to the inner [`Source`] trait — no own logic.
 pub struct InputSource<State = Uninitialized> {
     inner: Box<dyn Source>,
+    /// Populated after `initialize()` and updated by every `cut()` call.
     _state: PhantomData<State>,
 }
 
@@ -78,76 +159,119 @@ impl<State> Display for InputSource<State> {
     }
 }
 
-// Implementation for uninitialized source
+// ── Uninitialized ─────────────────────────────────────────────────────────────
+
 impl InputSource<Uninitialized> {
-    /// Create a new uninitialized input source wrapping any Source implementation
+    /// Create a new uninitialized input source wrapping any [`Source`] implementation.
     pub fn new(source: Box<dyn Source>) -> Self {
-        Self {
-            inner: source,
-            _state: PhantomData,
-        }
+        Self { inner: source, _state: PhantomData }
     }
 
-    /// Create multiple uninitialized input sources from a vec of concrete Source implementations
+    /// Create multiple uninitialized sources from a `Vec` of concrete implementations.
     pub fn from_vec<T: Source + 'static>(sources: Vec<T>) -> Vec<Self> {
-        sources
-            .into_iter()
-            .map(|source| Self::new(Box::new(source)))
-            .collect()
+        sources.into_iter().map(|s| Self::new(Box::new(s))).collect()
     }
 
-    /// Create multiple uninitialized input sources from a vec of boxed trait objects
+    /// Create multiple uninitialized sources from a `Vec` of boxed trait objects.
     pub fn from_boxed_vec(sources: Vec<Box<dyn Source>>) -> Vec<Self> {
         sources.into_iter().map(Self::new).collect()
     }
 
-    /// Create multiple uninitialized input sources from an array of concrete Source implementations
+    /// Create multiple uninitialized sources from an array of concrete implementations.
     pub fn from_array<T: Source + 'static, const N: usize>(sources: [T; N]) -> Vec<Self> {
-        sources
-            .into_iter()
-            .map(|source| Self::new(Box::new(source)))
-            .collect()
+        sources.into_iter().map(|s| Self::new(Box::new(s))).collect()
     }
 
-    /// Initialize the source with optional custom time scale
-    pub fn initialize(
-        mut self,
-        output_time_scale: Option<u64>,
-    ) -> Result<(InputSource<Initialized>, CutInterval)> {
-        // Delegate to the inner Source implementation
+    /// **Uninitialized → Cutting.**
+    ///
+    /// Pipes to [`Source::initialize`].  Metadata methods become valid on the
+    /// returned source; no cut has been applied yet.
+    pub fn initialize(mut self, output_time_scale: Option<u64>) -> Result<InputSource<Cutting>> {
         let cut_interval = self.inner.initialize(output_time_scale)?;
-
-        // Transition to initialized state
-        Ok((
-            InputSource {
-                inner: self.inner,
-                _state: PhantomData,
-            },
-            cut_interval
-        ))
+        Ok(InputSource { inner: self.inner, _state: PhantomData })
     }
 
-    /// Initialize the source with cutting parameters
-    /// returns the offset to the reference keyframe from the specified start position in ns
-    pub fn initialize_with_cut(
-        mut self,
-        time_scale: Option<u64>,
-        seek_type: SeekType,
-        cut_interval: CutInterval,
-    ) -> Result<(InputSource<Initialized>, CutInterval)> {
-        // Delegate to the inner Source implementation
-        let offsets = self
-            .inner
-            .initialize_with_cut(time_scale, seek_type, cut_interval)?;
+    /// **Uninitialized → Remuxing** (skips the `Cutting` state entirely).
+    ///
+    /// Pipes to [`Source::initialize_into_remuxing`].  Use this when you do not
+    /// need to inspect metadata before deciding on a cut.
+    pub fn initialize_into_remuxing(mut self) -> Result<InputSource<Remuxing>> {
+        let cut_interval = self.inner.initialize_into_remuxing(None)?;
+        Ok(InputSource { inner: self.inner, _state: PhantomData })
+    }
+}
 
-        // Transition to initialized state
+// ── Shared metadata (Cutting + Remuxing) ─────────────────────────────────────
+
+/// Expands to metadata accessor methods for both `Cutting` and `Remuxing`.
+/// All methods are direct pipes to the inner [`Source`] implementation.
+macro_rules! impl_metadata_methods {
+    ($state:ty) => {
+        impl InputSource<$state> {
+            pub fn get_tracks(&self) -> Result<Tracks> { self.inner.get_tracks() }
+            pub fn get_chapters(&self) -> Result<Option<Chapters>> { self.inner.get_chapters() }
+            pub fn get_info(&self) -> Result<Info> { self.inner.get_info() }
+            pub fn get_own_timecode_scale(&self) -> Result<u64> { self.inner.get_own_timecode_scale() }
+            pub fn get_target_timecode_scale(&self) -> Result<u64> { self.inner.get_target_timecode_scale() }
+            pub fn get_output_interval(&mut self) -> Result<CutInterval> { self.inner.get_output_interval() }
+            pub fn get_output_duration(&mut self) -> Result<Option<u64>> { self.inner.get_output_duration() }
+        }
+    };
+}
+
+impl_metadata_methods!(Cutting);
+impl_metadata_methods!(Remuxing);
+
+// ── Cutting ───────────────────────────────────────────────────────────────────
+
+impl InputSource<Cutting> {
+    /// **Cutting (idempotent): apply or re-apply a cut interval.**
+    ///
+    /// Pipes to [`Source::cut`].  Returns the source with the updated interval
+    /// and the *actual* interval after any keyframe snapping.
+    pub fn cut(
+        &mut self,
+        seek_type: SeekType,
+        interval: CutInterval,
+    ) -> Result<CutInterval> {
+        self.inner.cut(seek_type, interval)
+    }
+
+    /// **Cutting → Remuxing.**
+    ///
+    /// Pipes to [`Source::start_remuxing`].  The cut applied by the last `cut()`
+    /// call (or the full-file default from `initialize()`) takes effect.
+    pub fn into_remuxing(mut self) -> Result<InputSource<Remuxing>> {
+        self.inner.start_remuxing()?;
+        Ok(InputSource { inner: self.inner, _state: PhantomData })
+    }
+
+    /// **Convenience: cut then immediately transition to Remuxing.**
+    ///
+    /// Equivalent to `cut(output_timescale, seek_type, interval)` followed by
+    /// `into_remuxing(None)` — pipes to [`Source::cut`] then [`Source::start_remuxing`].
+    pub fn cut_into_remuxing(
+        mut self,
+        output_timescale: Option<u64>,
+        seek_type: SeekType,
+        interval: CutInterval,
+    ) -> Result<(InputSource<Remuxing>, CutInterval)> {
+        let actual = self.inner.cut( seek_type, interval)?;
+        self.inner.start_remuxing()?;
         Ok((
-            InputSource {
-                inner: self.inner,
-                _state: PhantomData,
-            },
-            offsets,
+            InputSource { inner: self.inner, _state: PhantomData },
+            actual,
         ))
+    }
+}
+
+// ── Remuxing ──────────────────────────────────────────────────────────────────
+
+impl InputSource<Remuxing> {
+    /// Returns the next cluster, or `None` at end-of-stream.
+    /// Pipes to [`Source::get_next_cluster`].
+    pub fn get_next_cluster(&mut self) -> Result<Option<Cluster>> {
+        self.inner.get_next_cluster()
     }
 }
 
@@ -161,47 +285,6 @@ impl From<Box<dyn Source>> for InputSource<Uninitialized> {
 impl<T: Source + 'static> From<T> for InputSource<Uninitialized> {
     fn from(source: T) -> Self {
         Self::new(Box::new(source))
-    }
-}
-
-// Implementation for initialized source
-impl InputSource<Initialized> {
-    /// Get the track information from the source
-    pub fn get_tracks(&self) -> Result<Tracks> {
-        self.inner.get_tracks()
-    }
-
-    /// Get chapter information from the source
-    pub fn get_chapters(&self) -> Result<Option<Chapters>> {
-        self.inner.get_chapters()
-    }
-
-    /// Get segment metadata/info from the source
-    pub fn get_info(&self) -> Result<Info> {
-        self.inner.get_info()
-    }
-
-    /// Get the next block/frame of data from the source
-    pub fn get_next_cluster(&mut self) -> Result<Option<Cluster>> {
-        self.inner.get_next_cluster()
-    }
-
-    /// Get the source's timecode scale (nanoseconds per time unit)
-    pub fn get_own_timecode_scale(&self) -> Result<u64> {
-        self.inner.get_own_timecode_scale()
-    }
-
-    /// Get the target timecode scale for output (nanoseconds per time unit)
-    pub fn get_target_timecode_scale(&self) -> Result<u64> {
-        self.inner.get_target_timecode_scale()
-    }
-
-    pub fn get_cut_positions(&self) -> (u64, Option<u64>) {
-        self.inner.get_cut_positions()
-    }
-
-    pub fn get_duration(&mut self) -> Result<u64> {
-        self.inner.get_duration()
     }
 }
 
@@ -221,9 +304,11 @@ mod tests {
     const CUT_END_NS: u64 = 15_000_000_000;
     const CUT_MAX_NS: u64 = CUT_END_NS - CUT_START_NS;
 
-    const SEEK_TYPES: [SeekType; 3] = [
+    const SEEK_TYPES: [SeekType; 5] = [
         SeekType::Squeeze,
-        SeekType::SnapNearestKeyframe,
+        SeekType::SnapNearestKeyframe(1), // fot testing we assume that video track has number 1
+        SeekType::SnapPreviousKeyframe(1),
+        SeekType::SnapNextKeyframe(1),
         SeekType::DirtyCut,
     ];
 
@@ -235,7 +320,7 @@ mod tests {
         test_utils::sources_implementations()
     }
 
-    fn validate_stream(mut source: InputSource<Initialized>, max_ts_ns: Option<u64>) -> Result<()> {
+    fn validate_stream(mut source: InputSource<Remuxing>, max_ts_ns: Option<u64>) -> Result<()> {
         let tracks = source.get_tracks()?;
         let timecode_scale = source.get_target_timecode_scale()?;
         let mut last_by_track: HashMap<u64, i64> = HashMap::new();
@@ -302,7 +387,7 @@ mod tests {
         assert!(test_file_path().exists(), "missing test.webm in repo root");
 
         for source in sources_implementations() {
-            let source = source.initialize(None)?.0;
+            let source = source.initialize(None)?.into_remuxing()?;
             let source_str = source.to_string();
             validate_stream(source, None)
                 .map_err(|err| Error::InvalidConfig(format!("{}:{}", source_str, err)))?;
@@ -317,20 +402,20 @@ mod tests {
 
         for seek_type in SEEK_TYPES {
             println!("Testing seek type: {:?}", seek_type);
-            for mut source in sources_implementations() {
+            for source in sources_implementations() {
                 print!("  Source Implementation: {}... ", source);
-                let (source, offset) = source.initialize_with_cut(
+                let (source, offset) = source.initialize(None)?.cut_into_remuxing(
                     None,
                     seek_type.clone(),
                     CutInterval { start_ns: Some(CUT_START_NS), end_ns: Some(CUT_END_NS) },
                 )?;
                 let mut max_ts = CUT_MAX_NS;
                 println!("our actual interval is {}", offset);
-                if matches!(seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) {
+                if matches!(seek_type, SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_)) {
                     // Calculate the actual duration from the keyframe timestamps
                     if let (Some(start), Some(end)) = (offset.start_ns, offset.end_ns) {
                         max_ts = end - start;
-                        if matches!(seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) {
+                        if matches!(seek_type, SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_)) {
                             max_ts += 5_000_000_000; // allow 5s tolerance for snap nearest keyframe, we cnt get this universally for every input source to we just assume a key frame interval of 5s 
                         }
                     }
@@ -344,7 +429,7 @@ mod tests {
 }
 
 /// Configuration for cutting/seeking behavior
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 pub struct CutInterval {
     pub start_ns: Option<u64>,
     pub end_ns: Option<u64>,

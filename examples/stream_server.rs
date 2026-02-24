@@ -20,7 +20,7 @@
 use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::{
-    Remuxer, RemuxerState, sink::{OutputSink, StreamSink}, source::{CutInterval, FileSource, InputSource, SeekType}
+    Remuxer, RemuxerCutMode, RemuxerState, sink::{OutputSink, StreamSink}, source::{CutInterval, FileSource, InputSource, SeekType}
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -172,16 +172,16 @@ async fn handle_video_request(
         })
         .unwrap_or_default();
 
-    let seek_type = match params.get("seek").map(|s| s.as_str()) {
-        Some("squeeze") => SeekType::Squeeze,
-        Some("dirty") => SeekType::DirtyCut,
-        Some("snap_prev") => SeekType::SnapPreviousKeyframe,
-        _ => SeekType::SnapNearestKeyframe,
+    let cut_mode = match params.get("seek").map(|s| s.as_str()) {
+        Some("squeeze") => Some(RemuxerCutMode::Squeeze),
+        Some("dirty") => Some(RemuxerCutMode::DirtyCut),
+        Some("snap_prev") => Some(RemuxerCutMode::SnapPreviousKeyframe),
+        _ => None,
     };
 
     info!(
-        "Request: file={} start={}s, end={:?}s, tracks={:?}, seek={:?}",
-        safe_name, start_sec, end_sec, tracks, seek_type
+        "Request: file={} start={}s, end={:?}s, tracks={:?}, cut_mode={:?}",
+        safe_name, start_sec, end_sec, tracks, cut_mode
     );
 
     // Create a channel for streaming chunks
@@ -189,7 +189,7 @@ async fn handle_video_request(
 
     // Spawn blocking task for remuxer intialization since it may involve file I/O and processing
     let (remuxer, output_interval) =  match tokio::task::spawn_blocking(move || {
-        process_video_request(input_path, start_sec, end_sec, tracks, seek_type, tx.clone())
+        process_video_request(input_path, start_sec, end_sec, tracks, cut_mode, tx.clone())
     }).await.unwrap() {
         Ok(result) => result,
         Err(e) => {
@@ -248,7 +248,7 @@ fn process_video_request(
     start_sec: f64,
     end_sec: Option<f64>,
     tracks: Vec<u64>,
-    seek_type: SeekType,
+    cut_mode: Option<RemuxerCutMode>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
     let source = FileSource::new(&input_path)?;
@@ -269,11 +269,8 @@ fn process_video_request(
     };
 
     let mappings = if !tracks.is_empty() {
-        // Always include track 1 (video), plus each requested audio track
-        let mut m = vec![(0u64, 1u64)]; // Source 0, track 1 (video)
-        for track_num in &tracks {
-            m.push((0, *track_num));
-        }
+        // Use exactly the tracks requested by the caller
+        let m = tracks.iter().map(|&t| (0u64, t)).collect::<Vec<_>>();
         Some(m)
     } else {
         None // Include all tracks
@@ -283,12 +280,6 @@ fn process_video_request(
     let stream_sink = StreamSink::new(stream_writer)?;
     let output = OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>);
 
-    let seek_type = if cut_interval.is_some() {
-        Some(seek_type)
-    } else {
-        None
-    };
-
     info!("Starting remux...");
-    Remuxer::new(vec![input], output, cut_interval, seek_type, mappings)
+    Remuxer::new(vec![input], output, cut_interval, cut_mode, mappings)
 }

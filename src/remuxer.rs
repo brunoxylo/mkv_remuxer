@@ -1,6 +1,7 @@
+use crate::block_ext::{TrackKind, TracksExt};
 use crate::metling_pot::MeltingPot;
 use crate::sink::{Initialized, OutputSink};
-use crate::source::{CutInterval, InputSource, SeekType, Uninitialized};
+use crate::source::{self, CutInterval, Cutting, InputSource, Remuxing, SeekType, Uninitialized};
 use crate::source_mappings::SourcesMappings;
 use crate::{Error, Result};
 use log::{debug, info, warn};
@@ -17,6 +18,17 @@ pub struct RemuxStats {
     pub duration_ns: u64,
     /// Number of tracks
     pub track_count: usize,
+}
+
+// basically a mirrir is the SeekType you are no longer required to specify the video track number for the snap keyframe seek types
+// the remuxer automatically determines according to the mapping which track to use for keyframe snapping
+#[derive(Debug, Clone)]
+pub enum RemuxerCutMode {
+    Squeeze,
+    SnapNearestKeyframe,
+    SnapPreviousKeyframe,
+    SnapNextKeyframe,
+    DirtyCut,
 }
 
 /// A streaming remuxer that processes one cluster at a time.
@@ -42,55 +54,120 @@ impl Remuxer {
         sources: Vec<InputSource<Uninitialized>>,
         output_sink: OutputSink<crate::sink::Uninitialized>,
         cut_interval: Option<CutInterval>,
-        seek_type: Option<SeekType>,
+        cut_mode: Option<RemuxerCutMode>,
         mappings: Option<Vec<TrackMapping>>,
     ) -> Result<(Self, CutInterval)> {
         debug!("Initializing Remuxer with {} sources", sources.len());
 
-        let seek_type = seek_type.unwrap_or(SeekType::SnapNearestKeyframe);
-        let mut initialized_sources = Vec::new();
-        let mut target_timescale = None;
-
-        let mut output_interval = if let Some(ref cut_interval) = cut_interval {
-            let mut new_cut_interval = cut_interval.clone();
-            info!("Only remux content in interval: {}", cut_interval);
-            let mut used_seek_type = seek_type.clone();
-            for (idx, source) in sources.into_iter().enumerate() {
-                debug!("Initializing source {} with cut", idx);
-                let (init_source, offsets) = source.initialize_with_cut(
-                    target_timescale,
-                    used_seek_type.clone(),
-                    new_cut_interval.clone(),
-                )?;
-                // if us efirst source as refernce for snapping and seek type is snap to nearest keyframe, update the cut interval to reflect the actual snap points (which may be different from requested cut interval)
-                if matches!(seek_type, SeekType::SnapNearestKeyframe | SeekType::SnapPreviousKeyframe) && idx == 0 {
-                    new_cut_interval = offsets;
-                    used_seek_type = SeekType::DirtyCut;
-                    info!("Actual cut interval for source {}: {:?}", idx, new_cut_interval);
+        // initialize all sources fisrt
+        // Derive the output timescale from the first source's own timescale.
+        let mut target_timescale: Option<u64> = None;
+        let mut sources_cutting: Vec<InputSource<Cutting>> = Vec::with_capacity(sources.len());
+        for mut source in sources {
+            match target_timescale {
+                Some(ts) => { sources_cutting.push(source.initialize(Some(ts))?);
+                },
+                None => {
+                    let source = source.initialize(None)?;
+                    target_timescale = Some(source.get_target_timecode_scale()?);
+                    sources_cutting.push(source);
                 }
-                if target_timescale.is_none() {
-                    target_timescale = Some(init_source.get_own_timecode_scale()?);
-                }
-                initialized_sources.push(init_source);
             }
-            new_cut_interval
-        } else {
-            let mut first_cut_interval = CutInterval::new().with_start(0);
-            for (idx, source) in sources.into_iter().enumerate() {
-                debug!("Initializing source {}", idx);
-                let (src, cut_interval) = source.initialize(target_timescale)?;
-                if target_timescale.is_none() {
-                    target_timescale = Some(src.get_own_timecode_scale()?);
-                }
-                if idx == 0 {
-                    first_cut_interval.start_ns = cut_interval.start_ns;
-                    first_cut_interval.end_ns = cut_interval.end_ns;
-                }
-                initialized_sources.push(src);
-            }
-            first_cut_interval
+        }
 
+        let mut initialized_sources: Vec<InputSource<Remuxing>> = Vec::new();
+
+        // cut  if requested, we want to know the output interval that might be different due to keyframe snap cut
+        let mut output_cut_interval = if let Some(cut_interval) = cut_interval {
+            match cut_mode {
+                // search for the first video track to use as reference for snapping if needed, if no video track is found we just use dirty cut for all sources if any of the snap keyframe seek types is used
+                Some(RemuxerCutMode::SnapNearestKeyframe) | Some(RemuxerCutMode::SnapPreviousKeyframe) | Some(RemuxerCutMode::SnapNextKeyframe) => {
+                    let first_mapped_video_track = if let Some(ref mappings) = mappings { // there are custom mapping
+                        let mut first_mapped = None;
+                        for &(source_idx, track_num) in mappings {
+                            if let Some(source) = sources_cutting.get(source_idx as usize) {
+                                let tracks = source.get_tracks()?;
+                                if let Some(track) = tracks.get_track_kind(track_num) {
+                                    if track == TrackKind::Video {
+                                        first_mapped = Some((source_idx, track_num));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        first_mapped
+                    } else { // no custom mapping use first video track we can find
+                        let mut first_mapped = None;
+                        for (idx, source) in sources_cutting.iter().enumerate() {
+                                let tracks = source.get_tracks()?;
+                                if let Some(track) = tracks.track_entry.iter().find(|t| t.track_type.0 == TrackKind::Video) {
+                                    first_mapped = Some((idx as u64, track.track_number.0));
+                                    break;
+                                }
+                            }
+                            first_mapped
+                    };
+
+                    let actual_cut = if let Some(mapped_video) = first_mapped_video_track { // there is a video track we can use as reference for snapping
+                        let mut my_source = sources_cutting.remove(mapped_video.0 as usize);
+                        let cut_interval = match cut_mode {
+                            Some(RemuxerCutMode::SnapNearestKeyframe) => my_source.cut(SeekType::SnapNearestKeyframe(mapped_video.1), cut_interval)?,
+                            Some(RemuxerCutMode::SnapPreviousKeyframe) => my_source.cut(SeekType::SnapPreviousKeyframe(mapped_video.1), cut_interval)?,
+                            Some(RemuxerCutMode::SnapNextKeyframe) => my_source.cut( SeekType::SnapNextKeyframe(mapped_video.1), cut_interval)?,
+                            _ => unreachable!(),
+                        };
+                        initialized_sources.push(my_source.into_remuxing()?);
+                        cut_interval
+
+                    } else { // no video track found, so we dont need to adapt the interval
+                        cut_interval
+                    };
+                    // all other sources are cut with dirty cut, we dont have a reference track for them to snap to
+                    for mut source in sources_cutting.into_iter() {
+                        let _ = source.cut(  SeekType::DirtyCut, actual_cut)?;
+                        initialized_sources.push(source.into_remuxing()?);
+                    }
+                    actual_cut
+                },
+                Some(RemuxerCutMode::Squeeze) => {
+                    for mut source in sources_cutting.into_iter() {
+                        let _ = source.cut(SeekType::Squeeze, cut_interval)?;
+                        initialized_sources.push(source.into_remuxing()?);
+                    }
+                    cut_interval
+                },
+                Some(RemuxerCutMode::DirtyCut) => {
+                    for mut source in sources_cutting.into_iter() {
+                        let _ = source.cut(SeekType::DirtyCut, cut_interval)?;
+                        initialized_sources.push(source.into_remuxing()?);
+                    }
+                    cut_interval
+                },
+                None => { // cut interval requested but no cut mode specified, default to squeeze
+                    for mut source in sources_cutting.into_iter() {
+                        let _ = source.cut(SeekType::Squeeze, cut_interval)?;
+                        initialized_sources.push(source.into_remuxing()?);
+                    }
+                    cut_interval
+                }
+            }
+        } else { // no cut, just initialize remuxing directly
+            let mut max_duration :Option<u64> = None;
+            for mut source in sources_cutting.into_iter() {
+                
+                if let Some(dur) = source.get_output_duration()? {
+                    max_duration = Some(dur.max(max_duration.unwrap_or(0)));
+                }
+                initialized_sources.push(source.into_remuxing()?);
+            }
+            CutInterval { start_ns: Some(0), end_ns: max_duration }
         };
+
+        if initialized_sources.is_empty() {
+            return Err(Error::InvalidConfig(
+                "No valid sources after initialization".to_string(),
+            ));
+        }
 
         let target_timescale = target_timescale
             .ok_or_else(|| Error::MissingElement("No sources provided".to_string()))?;
@@ -100,6 +177,7 @@ impl Remuxer {
         let mut sources_mappings = SourcesMappings::new(initialized_sources)?;
 
         if let Some(ref mappings) = mappings {
+
             debug!("Applying {} custom track mappings", mappings.len());
             for &(source_idx, track_num) in mappings {
                 sources_mappings.add_mapping(source_idx, track_num)?;
@@ -123,8 +201,8 @@ impl Remuxer {
             
 
         let mut melting_pot = MeltingPot::new(sources_mappings);
-        let duration_ns = melting_pot.get_final_duration().unwrap_or(0);
-        output_interval.end_ns = Some(output_interval.start_ns.unwrap_or(0) + duration_ns);
+        let duration_ns = melting_pot.get_final_duration()?.unwrap_or(0);
+        output_cut_interval.end_ns = Some(output_cut_interval.start_ns.unwrap_or(0) + duration_ns);
         let track_count = output_tracks.track_entry.len();
 
         debug!("Initializing output sink");
@@ -144,7 +222,7 @@ impl Remuxer {
                 track_count,
                 duration_ns,
             },
-            output_interval,
+            output_cut_interval,
         ))
     }
 
@@ -201,11 +279,11 @@ pub fn remux(
     sources: Vec<InputSource<Uninitialized>>,
     output_sink: OutputSink<crate::sink::Uninitialized>,
     cut_interval: Option<CutInterval>,
-    seek_type: Option<SeekType>,
+    cut_mode: Option<RemuxerCutMode>,
     mappings: Option<Vec<TrackMapping>>,
 ) -> Result<RemuxStats> {
     let (mut remuxer, _actual_cut) =
-        Remuxer::new(sources, output_sink, cut_interval, seek_type, mappings)?;
+        Remuxer::new(sources, output_sink, cut_interval, cut_mode, mappings)?;
 
     loop {
         remuxer = match remuxer.process()? {

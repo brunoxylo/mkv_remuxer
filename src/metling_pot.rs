@@ -138,15 +138,15 @@ impl MeltingPot {
             }
         }
     }
-    pub fn get_final_duration(& mut self) -> Option<u64> {
+    pub fn get_final_duration(& mut self) -> Result<Option<u64>> {
         let mut max_duration_ns = 0;
         for source in &mut self.sources_mappings.sources {
-            max_duration_ns = max_duration_ns.max(source.get_duration().unwrap_or(0));
+            max_duration_ns = max_duration_ns.max(source.get_output_duration()?.unwrap_or(0));
         }
         if max_duration_ns > 0 {
-            Some(max_duration_ns)
+            Ok(Some(max_duration_ns))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -155,14 +155,13 @@ impl MeltingPot {
 mod tests {
     use super::*;
     use crate::sink::Sink;
-    use crate::source::Initialized;
     use crate::source::InputSource;
     use crate::source::Uninitialized;
     use crate::test_utils;
     use std::collections::HashMap;
 
-    fn setup_melting_pot(source: InputSource<Uninitialized>) -> Result<(MeltingPot, u64)> {
-        let (source, _cut_interval) = source.initialize(None)?;
+    fn setup_melting_pot(mut source: InputSource<Uninitialized>) -> Result<(MeltingPot, u64)> {
+        let source = source.initialize(None)?.into_remuxing()?;
         let timescale = source.get_target_timecode_scale()?;
 
         let mut mappings = SourcesMappings::new(vec![source])?;

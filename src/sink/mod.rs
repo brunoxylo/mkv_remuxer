@@ -125,15 +125,16 @@ impl OutputSink<Initialized> {
 mod tests {
     use super::*;
     use crate::remux;
-    use crate::source::{FileSource, InputSource, SeekType};
+    use crate::remuxer::RemuxerCutMode;
+    use crate::source::{FileSource, InputSource};
     use crate::test_utils::{test_file_path, validate_mkv_output};
     use crate::source::CutInterval;
 
-    fn run_remux_test_with_seek_type(seek_type: SeekType) -> Result<()> {
+    fn run_remux_test_with_seek_type(cut_mode: RemuxerCutMode) -> Result<()> {
         // Setup: Create output path in temp directory
         let temp_dir = std::env::temp_dir();
-        let seek_type_name = format!("{:?}", seek_type);
-        let output_path = temp_dir.join(format!("test_german_audio_{}.mkv", seek_type_name));
+        let cut_mode_name = format!("{:?}", cut_mode);
+        let output_path = temp_dir.join(format!("test_german_audio_{}.mkv", cut_mode_name));
         
         // Create input source from test.webm (uninitialized)
         let input_path = test_file_path();
@@ -152,7 +153,7 @@ mod tests {
         // Initialize source temporarily to check tracks
         let temp_source = FileSource::new(&input_path)?;
         let temp_input = InputSource::from(temp_source);
-        let mut initialized_temp = temp_input.initialize(None)?.0;
+        let mut initialized_temp = temp_input.initialize(None)?.into_remuxing()?;
         let tracks = initialized_temp.get_tracks()?;
         
 
@@ -189,7 +190,7 @@ mod tests {
             vec![input_source],
             output, 
             Some(cut_interval), 
-            Some(seek_type.clone()),
+            Some(cut_mode),
             Some(output_mappings.clone())
         )?;
         
@@ -198,7 +199,7 @@ mod tests {
         assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
 
 
-        let input_duration_ns = initialized_temp.get_duration().unwrap();
+        let input_duration_ns = initialized_temp.get_output_duration()?.unwrap_or(0);
         // Validate the output using our comprehensive validation method
         let validation_report = validate_mkv_output(&output_path, true, Some(input_duration_ns), false, true)?;
         
@@ -230,7 +231,7 @@ mod tests {
         }
         
         // Overall validation
-        assert!(validation_report.is_valid(), "Overall MKV validation should pass for SeekType::{:?}", seek_type);
+        assert!(validation_report.is_valid(), "Overall MKV validation should pass for {:?}", cut_mode_name);
         
         // Cleanup
         //let _ = std::fs::remove_file(&output_path);
@@ -240,17 +241,17 @@ mod tests {
 
     #[test]
     fn test_remux_german_audio_snap_nearest_keyframe() -> Result<()> {
-        run_remux_test_with_seek_type(SeekType::SnapNearestKeyframe)
+        run_remux_test_with_seek_type(RemuxerCutMode::SnapNearestKeyframe)
     }
 
     #[test]
     fn test_remux_german_audio_squeeze() -> Result<()> {
-        run_remux_test_with_seek_type(SeekType::Squeeze)
+        run_remux_test_with_seek_type(RemuxerCutMode::Squeeze)
     }
 
     #[test]
     fn test_remux_german_audio_dirty_cut() -> Result<()> {
-        run_remux_test_with_seek_type(SeekType::DirtyCut)
+        run_remux_test_with_seek_type(RemuxerCutMode::DirtyCut)
     }
 
     #[test]
@@ -285,7 +286,7 @@ mod tests {
         let video_path = std::path::Path::new("test_av1.webm");
         let temp_video = FileSource::new(video_path)?;
         let temp_video_input = InputSource::from(temp_video);
-        let (mut init_video,_output_cut) = temp_video_input.initialize(None)?;
+        let mut init_video = temp_video_input.initialize(None)?;
         let video_tracks = init_video.get_tracks()?;
         
         // Create video source from test_av1.webm

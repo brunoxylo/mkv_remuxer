@@ -3,7 +3,7 @@ use clap::Parser;
 use log::{debug, error, info};
 use log4rs;
 use mkv_remuxer::sink::{FileSink, OutputSink, VttSink};
-use mkv_remuxer::source::{FileSource, InputSource, SeekType, WebVttSource};
+use mkv_remuxer::source::{FileSource, InputSource, WebVttSource};
 use mkv_remuxer::*;
 use std::fs::File;
 use std::path::Path;
@@ -99,13 +99,14 @@ fn main() -> Result<()> {
     }
 
     // Parse seek mode
-    let seek_type = match args.seek_mode.as_str() {
-        "squeeze" => SeekType::Squeeze,
-        "snap" => SeekType::SnapNearestKeyframe,
-        "snap_prev" => SeekType::SnapPreviousKeyframe,
-        "dirty" => SeekType::DirtyCut,
+    let cut_mode = match args.seek_mode.as_str() {
+        "squeeze" => RemuxerCutMode::Squeeze,
+        "snap" => RemuxerCutMode::SnapNearestKeyframe,
+        "snap_prev" => RemuxerCutMode::SnapPreviousKeyframe,
+        "snap_next" => RemuxerCutMode::SnapNextKeyframe,
+        "dirty" => RemuxerCutMode::DirtyCut,
         _ => anyhow::bail!(
-            "Invalid seek mode: {}. Valid options: squeeze, snap, snap_prev, dirty",
+            "Invalid seek mode: {}. Valid options: squeeze, snap, snap_prev, snap_next, dirty",
             args.seek_mode
         ),
     };
@@ -227,7 +228,7 @@ fn main() -> Result<()> {
         sources,
         output_sink,
         cut_interval,
-        Some(seek_type.clone()),
+        Some(cut_mode),
         track_mappings
     )
     .context("Remux operation failed")?;

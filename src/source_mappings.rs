@@ -1,17 +1,17 @@
 use mkv_element::prelude::{TrackEntry, Tracks};
 
-use crate::{Error, Result, block_ext::TrackKind, source::{Initialized, InputSource}};
+use crate::{Error, Result, block_ext::TrackKind, source::{Remuxing, InputSource}};
 
 /// Wrapper struct to hold multiple sources and their track mappings for remuxing
 /// provides convenient methods for managing track mappings
 /// note the order of added mappings determines the order of tracks in the output file (e.g. if you want to prioritize video tracks from the first source, add those mappings first)
 pub struct SourcesMappings {
-    pub sources: Vec<InputSource<Initialized>>,
+    pub sources: Vec<InputSource<Remuxing>>,
     mappings: Vec<(u64, u64)>, // (input file index, track number)
 }
 
 impl SourcesMappings {
-    pub fn new(sources: Vec<InputSource<Initialized>>) -> Result<Self> {
+    pub fn new(sources: Vec<InputSource<Remuxing>>) -> Result<Self> {
         let first_output_timescale = if let Some(first_source) = sources.first() {
             first_source.get_target_timecode_scale()?
         } else {

@@ -8,29 +8,29 @@ use crate::block_ext::{ClusterBlockExt, ClusterExt};
 
 /// Lightweight cache for keyframe positions in the current cluster of interest
 /// to speed up freeze seek operations without fully parsing all blocks in the cluster
-pub struct ClusterOfInterestCache {
+pub struct KeyframePositionCache {
     pub position: u64,
     file: File,
     timecode_scale: u64,
-    cache_keyframe_timestamp_ns: HashMap<(u64, i64, bool), i64>, // (track_num, reference_timestamp_ns, after or before) -> timestamp_ns of keyframe in this cluster (for freeze seek)
-    cache_keyframe_block_idx: HashMap<(u64, i64, bool), usize>, // (track_num, reference_timestamp_ns, after or before) -> block index of keyframe in this cluster (for freeze seek)
+    keyframe_timestamp_ns: HashMap<(u64, i64, bool), i64>, // (track_num, reference_timestamp_ns, after or before) -> timestamp_ns of keyframe
+    keyframe_cluster_position: HashMap<(u64, i64, bool), u64>, // (track_num, reference_timestamp_ns, after or before) -> file position of the cluster that holds the keyframe
 }
 
-impl ClusterOfInterestCache {
+impl KeyframePositionCache {
     pub fn new(position: u64, file: File, timecode_scale: u64) -> Self {
         Self {
             position,
             file,
             timecode_scale,
-            cache_keyframe_timestamp_ns: HashMap::new(),
-            cache_keyframe_block_idx: HashMap::new(),
+            keyframe_timestamp_ns: HashMap::new(),
+            keyframe_cluster_position: HashMap::new(),
         }
     }
     
     pub fn set_pos(&mut self, position: u64) {
         self.position = position;
-        self.cache_keyframe_timestamp_ns.clear();
-        self.cache_keyframe_block_idx.clear();
+        self.keyframe_timestamp_ns.clear();
+        self.keyframe_cluster_position.clear();
     }
     
     pub fn get_keyframe_timestamp_ns(
@@ -40,14 +40,14 @@ impl ClusterOfInterestCache {
         after: bool,
     ) -> Result<i64> {
         if let Some(ts) =
-            self.cache_keyframe_timestamp_ns
+            self.keyframe_timestamp_ns
                 .get(&(track_num, reference_timestamp_ns, after))
         {
             Ok(*ts)
         } else {
             self.update_cache(track_num, after, reference_timestamp_ns)?;
             let ts = self
-                .cache_keyframe_timestamp_ns
+                .keyframe_timestamp_ns
                 .get(&(track_num, reference_timestamp_ns, after))
                 .ok_or(Error::InvalidConfig(
                     "Keyframe timestamp not found".to_string(),
@@ -74,26 +74,28 @@ impl ClusterOfInterestCache {
         }
     }
 
-    pub fn get_keyframe_block_idx(
+    /// Returns the file position of the cluster that contains the keyframe
+    /// nearest to `reference_timestamp_ns` for the given `track_num` and direction.
+    pub fn get_keyframe_cluster_position(
         &mut self,
         track_num: u64,
         after: bool,
         reference_timestamp_ns: i64,
-    ) -> Result<usize> {
-        if let Some(idx) =
-            self.cache_keyframe_block_idx
+    ) -> Result<u64> {
+        if let Some(pos) =
+            self.keyframe_cluster_position
                 .get(&(track_num, reference_timestamp_ns, after))
         {
-            Ok(*idx)
+            Ok(*pos)
         } else {
             self.update_cache(track_num, after, reference_timestamp_ns)?;
-            let idx = self
-                .cache_keyframe_block_idx
+            let pos = self
+                .keyframe_cluster_position
                 .get(&(track_num, reference_timestamp_ns, after))
                 .ok_or(Error::InvalidConfig(
-                    "Keyframe block index not found".to_string(),
+                    "Keyframe cluster position not found".to_string(),
                 ))?;
-            Ok(*idx)
+            Ok(*pos)
         }
     }
 
@@ -129,9 +131,9 @@ impl ClusterOfInterestCache {
             };
             
             if meets_criteria {
-                self.cache_keyframe_block_idx
-                    .insert((track_num, reference_timestamp_ns, after), keyframe_idx);
-                self.cache_keyframe_timestamp_ns.insert(
+                self.keyframe_cluster_position
+                    .insert((track_num, reference_timestamp_ns, after), self.position);
+                self.keyframe_timestamp_ns.insert(
                     (track_num, reference_timestamp_ns, after),
                     keyframe_timestamp_ns,
                 );
@@ -187,11 +189,11 @@ impl ClusterOfInterestCache {
                         };
                         
                         if meets_criteria {
-                            // Found it! Cache the keyframe information
-                            // NOTE: We cache timestamp but NOT block idx since that's only valid
-                            // if we relocate the cache position, which we intentionally don't do
-                            // to avoid breaking FileSource's positioning
-                            self.cache_keyframe_timestamp_ns.insert(
+                            self.keyframe_cluster_position.insert(
+                                (track_num, reference_timestamp_ns, after),
+                                cluster_pos,
+                            );
+                            self.keyframe_timestamp_ns.insert(
                                 (track_num, reference_timestamp_ns, after),
                                 keyframe_timestamp_ns,
                             );
@@ -216,8 +218,8 @@ impl ClusterOfInterestCache {
             }
         };
         
-        self.cache_keyframe_block_idx
-            .insert((track_num, reference_timestamp_ns, after), keyframe_idx);
+        self.keyframe_cluster_position
+            .insert((track_num, reference_timestamp_ns, after), self.position);
 
         let keyframe_timestamp_ns = cluster
             .blocks
@@ -226,7 +228,7 @@ impl ClusterOfInterestCache {
                 "Keyframe Index out of bounds".to_string(),
             ))?
             .timestamp_ns(cluster.timestamp.0 as i64, self.timecode_scale)?;
-        self.cache_keyframe_timestamp_ns.insert(
+        self.keyframe_timestamp_ns.insert(
             (track_num, reference_timestamp_ns, after),
             keyframe_timestamp_ns,
         );

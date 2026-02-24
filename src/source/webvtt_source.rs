@@ -46,6 +46,8 @@ pub struct WebVttSource {
     /// Cut parameters
     start_ns: Option<u64>,
     end_ns: Option<u64>,
+    /// The resolved output interval (updated by initialize() and cut())
+    output_interval: CutInterval,
     /// Batch size for clusters (number of cues per cluster)
     cluster_batch_size: usize,
     /// Is the source finished?
@@ -71,6 +73,7 @@ impl WebVttSource {
             track_name: None,
             start_ns: None,
             end_ns: None,
+            output_interval: CutInterval::new(),
             cluster_batch_size: 10,
             finished: false,
         })
@@ -459,21 +462,8 @@ impl Source for WebVttSource {
         Ok(self.output_timecode_scale)
     }
 
-    fn get_cut_positions(&self) -> (u64, Option<u64>) {
-        (self.start_ns.unwrap_or(0), self.end_ns)
-    }
-
-    fn get_duration(&mut self) -> Result<u64> {
-        let total_duration = self.cues.last().map(|c| c.end_ns).unwrap_or(0);
-        
-        let start = self.start_ns.unwrap_or(0);
-        let end = self.end_ns.unwrap_or(total_duration);
-        
-        if end > start {
-            Ok(end - start)
-        } else {
-            Ok(0)
-        }
+    fn get_output_interval(&mut self) -> Result<CutInterval> {
+        Ok(self.output_interval.clone())
     }
 
     fn initialize(&mut self, time_scale: Option<u64>) -> Result<CutInterval> {
@@ -482,28 +472,27 @@ impl Source for WebVttSource {
         }
         self.current_cue_idx = 0;
         self.finished = false;
-        let start_pos = self.start_ns.unwrap_or(0);
-        let end_pos = self.get_duration()? + start_pos;
-        Ok(CutInterval::new().with_start(start_pos).with_end(end_pos))
+        let start_ns = self.start_ns.unwrap_or(0);
+        let end_ns = self.cues.last().map(|c| c.end_ns).unwrap_or(start_ns);
+        self.output_interval = CutInterval::new().with_start(start_ns).with_end(end_ns);
+        Ok(self.output_interval.clone())
     }
 
-    fn initialize_with_cut(
+    fn cut(
         &mut self,
-        time_scale: Option<u64>,
         _seek_type: SeekType,
         cut_interval: CutInterval,
-
     ) -> Result<CutInterval> {
-        if let Some(ts) = time_scale {
-            self.output_timecode_scale = ts;
-        }
-
         self.start_ns = cut_interval.start_ns;
         self.end_ns = cut_interval.end_ns;
+        // WebVTT has no keyframes — return the interval unchanged.
+        self.output_interval = cut_interval.clone();
+        Ok(cut_interval)
+    }
+
+    fn start_remuxing(&mut self) -> Result<()> {
         self.current_cue_idx = 0;
         self.finished = false;
-
-        // For subtitles, we don't have keyframes, so offset is always 0
-        Ok(cut_interval)
+        Ok(())
     }
 }
