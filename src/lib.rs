@@ -17,6 +17,7 @@ pub use mkv_element;
 pub use remuxer::{RemuxStats, RemuxerState, RemuxerCutMode, Remuxer, TrackMapping, remux};
 pub use sink::{FileSink, Sink};
 pub use source::{SeekType, Source, CutInterval, InputSource, Cutting, Remuxing};
+pub use source::util::basic_info::MkvBasicInfo;
 pub use source_mappings::SourcesMappings;
 pub use test_utils::{validate_mkv_output, get_input_duration_ns, MkvValidationReport, ValidationStats};
 

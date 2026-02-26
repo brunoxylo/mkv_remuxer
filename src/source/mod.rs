@@ -2,7 +2,7 @@ use crate::{Result, source::util::basic_info::MkvBasicInfo};
 use mkv_element::prelude::*;
 use std::fmt::Display;
 
-mod util;
+pub mod util;
 mod file_source;
 mod webvtt_source;
 

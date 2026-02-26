@@ -20,7 +20,10 @@
 use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::{
-    Remuxer, RemuxerCutMode, RemuxerState, sink::{OutputSink, StreamSink}, source::{CutInterval, FileSource, InputSource, SeekType}
+    Remuxer, RemuxerCutMode, RemuxerState,
+    sink::{OutputSink, StreamSink, VttSink},
+    source::{CutInterval, FileSource, InputSource, SeekType, WebVttSource},
+    MkvBasicInfo,
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -104,57 +107,73 @@ impl Seek for StreamWriter {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    const DEFAULT_FILENAME: &str = "test_av1.webm";
-
     info!("Starting MKV streaming server on http://localhost:3030");
-    info!("Example URLs:");
-    info!("  - http://localhost:3030/video?file={}", DEFAULT_FILENAME);
-    info!("  - http://localhost:3030/video?file={}&start=5&end=15", DEFAULT_FILENAME);
-    info!("  - http://localhost:3030/video?file={}&start=10&tracks=2", DEFAULT_FILENAME);
-    info!("  - http://localhost:3030/video?file={}&tracks=2,3", DEFAULT_FILENAME);
-    info!("  - http://localhost:3030/video?file={}&tracks=2,4", DEFAULT_FILENAME);
+    info!("  GET /video          → JSON array of MkvBasicInfo for all .mkv/.webm files");
+    info!("  GET /video/0        → stream file at index 0");
+    info!("  GET /video/0?start=5&end=15");
+    info!("  GET /video/0?tracks=2,3");
+    info!("  GET /video/0?seek=snap&start=10");
 
+    // GET /video           → list all media files as JSON
+    let list_route = warp::get()
+        .and(warp::path("video"))
+        .and(warp::path::end())
+        .and_then(handle_files_request);
 
-    let video_route = warp::path("video")
+    // GET /video/{index}   → stream file by index
+    let stream_route = warp::get()
+        .and(warp::path("video"))
+        .and(warp::path::param::<usize>())
+        .and(warp::path::end())
         .and(warp::query::<HashMap<String, String>>())
         .and_then(handle_video_request);
 
-    warp::serve(video_route).run(([127, 0, 0, 1], 3030)).await;
+    let routes = list_route.or(stream_route);
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+}
+
+fn scan_media_files() -> Vec<PathBuf> {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&project_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && matches!(
+                    p.extension().and_then(|e| e.to_str()).unwrap_or(""),
+                    "mkv" | "webm" | "vtt"
+                )
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 async fn handle_video_request(
+    index: usize,
     params: HashMap<String, String>,
 ) -> Result<warp::reply::Response, Infallible> {
-    // Resolve file param: basename only, anchored to the project root
-    let file_name = params.get("file").map(|s| s.as_str()).unwrap_or("");
-    if file_name.is_empty() {
-        let response = warp::http::Response::builder()
-            .status(400)
-            .body(hyper::Body::from("Missing 'file' query parameter. Example: /video?file=myvideo.webm"))
-            .unwrap();
-        return Ok(response);
-    }
-    // Strip any path separators to prevent traversal
-    let safe_name = std::path::Path::new(file_name)
+    let files = scan_media_files();
+    let input_path = match files.get(index) {
+        Some(p) => p.clone(),
+        None => {
+            let response = warp::http::Response::builder()
+                .status(404)
+                .body(hyper::Body::from(format!(
+                    "No media file at index {index}. {} file(s) available. GET /video for the list.",
+                    files.len()
+                )))
+                .unwrap();
+            return Ok(response);
+        }
+    };
+    let safe_name = input_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if safe_name.is_empty() || safe_name != file_name {
-        let response = warp::http::Response::builder()
-            .status(400)
-            .body(hyper::Body::from("Invalid filename. Use a plain filename, e.g. myvideo.webm"))
-            .unwrap();
-        return Ok(response);
-    }
-    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let input_path = project_root.join(&safe_name);
-    if !input_path.exists() {
-        let response = warp::http::Response::builder()
-            .status(404)
-            .body(hyper::Body::from(format!("File not found: {safe_name}")))
-            .unwrap();
-        return Ok(response);
-    }
+        .unwrap_or_else(|| format!("file[{index}]"));
+    let is_vtt = input_path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
 
     let start_sec = params
         .get("start")
@@ -182,8 +201,8 @@ async fn handle_video_request(
     };
 
     info!(
-        "Request: file={} start={}s, end={:?}s, tracks={:?}, cut_mode={:?}",
-        safe_name, start_sec, end_sec, tracks, cut_mode
+        "Request: index={} file={} start={}s, end={:?}s, tracks={:?}, cut_mode={:?}",
+        index, safe_name, start_sec, end_sec, tracks, cut_mode
     );
 
     // Create a channel for streaming chunks
@@ -233,9 +252,11 @@ async fn handle_video_request(
     let start_sec = output_interval.start_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
     let end_sec = output_interval.end_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
 
+    let content_type = if is_vtt { "text/vtt; charset=utf-8" } else { "video/webm" };
+
     let response = warp::http::Response::builder()
         .status(200)
-        .header("Content-Type", "video/webm")
+        .header("Content-Type", content_type)
         .header("Cache-Control", "no-cache")
         .header("X-Media-Start-Sec", format!("{:.3}", start_sec))
         .header("X-Media-End-Sec", format!("{:.3}", end_sec))
@@ -253,8 +274,12 @@ fn process_video_request(
     cut_mode: Option<RemuxerCutMode>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
-    let source = FileSource::new(&input_path)?;
-    let input = InputSource::from(source);
+    let is_vtt = input_path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
+    let input: InputSource = if is_vtt {
+        InputSource::from(WebVttSource::new(&input_path, "und")?)
+    } else {
+        InputSource::from(FileSource::new(&input_path)?)
+    };
 
     let cut_interval = if start_sec > 0.0 || end_sec.is_some() {
         let start_ns = (start_sec * 1_000_000_000.0) as u64;
@@ -279,9 +304,45 @@ fn process_video_request(
     };
 
     let stream_writer = StreamWriter::new(tx);
-    let stream_sink = StreamSink::new(stream_writer)?;
-    let output = OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>);
+    let output = if is_vtt {
+        OutputSink::from(Box::new(VttSink::new(stream_writer)) as Box<dyn mkv_remuxer::Sink>)
+    } else {
+        let stream_sink = StreamSink::new(stream_writer)?;
+        OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>)
+    };
 
     info!("Starting remux...");
     Remuxer::new(vec![input], output, cut_interval, cut_mode, mappings)
+}
+
+async fn handle_files_request() -> Result<warp::reply::Response, Infallible> {
+    let infos: Vec<MkvBasicInfo> = tokio::task::block_in_place(|| {
+        use mkv_remuxer::source::Source;
+        scan_media_files()
+            .into_iter()
+            .filter_map(|path| {
+                let is_vtt = path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
+                let result: mkv_remuxer::Result<Box<dyn Source>> = if is_vtt {
+                    WebVttSource::new(&path, "und").map(|s| Box::new(s) as Box<dyn Source>)
+                } else {
+                    FileSource::new(&path).map(|s| Box::new(s) as Box<dyn Source>)
+                };
+                match result {
+                    Ok(src) => src.get_basic_info().ok(),
+                    Err(e) => {
+                        error!("Failed to open {:?}: {}", path, e);
+                        None
+                    }
+                }
+            })
+            .collect()
+    });
+
+    let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}" ));
+    let response = warp::http::Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(warp::hyper::Body::from(json))
+        .unwrap();
+    Ok(response)
 }

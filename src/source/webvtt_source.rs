@@ -250,8 +250,11 @@ impl WebVttSource {
             return Err(Error::InvalidConfig("No cues to create cluster".to_string()));
         }
 
-        // Cluster timestamp is the first cue's start time
-        let cluster_timestamp_ticks = cues[0].start_ns / self.output_timecode_scale;
+        let shift_ns = self.start_ns.unwrap_or(0);
+
+        // Cluster timestamp is the first cue's start time, shifted by the cut start
+        let cluster_timestamp_ticks =
+            cues[0].start_ns.saturating_sub(shift_ns) / self.output_timecode_scale;
 
         let mut blocks = Vec::new();
 
@@ -260,8 +263,8 @@ impl WebVttSource {
             let duration_ns = cue.end_ns.saturating_sub(cue.start_ns);
             let duration_ticks = duration_ns / self.output_timecode_scale;
 
-            // Block timestamp is relative to cluster
-            let block_timestamp_ns = cue.start_ns;
+            // Block timestamp is relative to cluster, shifted by cut start
+            let block_timestamp_ns = cue.start_ns.saturating_sub(shift_ns);
             let block_timestamp_ticks = block_timestamp_ns / self.output_timecode_scale;
             let relative_timestamp = (block_timestamp_ticks as i64 - cluster_timestamp_ticks as i64)
                 .clamp(i16::MIN as i64, i16::MAX as i64) as i16;

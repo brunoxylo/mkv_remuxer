@@ -893,6 +893,7 @@ dependencies = [
  "log4rs",
  "mkv-element",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "uuid",
