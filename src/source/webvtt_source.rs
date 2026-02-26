@@ -1,5 +1,6 @@
 use super::{SeekType, Source};
 use crate::source::CutInterval;
+use crate::source::util::basic_info::MkvBasicInfo;
 use crate::{Error, Result};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
@@ -379,6 +380,17 @@ impl Source for WebVttSource {
 
     fn get_chapters(&self) -> Result<Option<Chapters>> {
         Ok(None)
+    }
+
+    fn get_basic_info(&self) -> Result<MkvBasicInfo> {
+        let file_size = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let file_name = std::path::Path::new(&self.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.clone());
+        let tracks = self.get_tracks()?;
+        let info = self.get_info()?;
+        Ok(MkvBasicInfo::new(&tracks, &info, file_size, file_name))
     }
 
     fn get_info(&self) -> Result<Info> {

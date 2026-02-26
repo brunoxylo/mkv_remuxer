@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Result, source::util::basic_info::MkvBasicInfo};
 use mkv_element::prelude::*;
 use std::fmt::Display;
 
@@ -45,6 +45,7 @@ pub trait Source: Display + Send {
     fn get_chapters(&self) -> Result<Option<Chapters>>;
     /// Segment info element (duration, title, timestamps, …).
     fn get_info(&self) -> Result<Info>;
+    fn get_basic_info(&self)  -> Result<MkvBasicInfo>;
     /// The source's own timecode scale (nanoseconds per tick).
     fn get_own_timecode_scale(&self) -> Result<u64>;
     /// The target output timecode scale (nanoseconds per tick).

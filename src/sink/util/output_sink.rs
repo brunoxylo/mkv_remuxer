@@ -8,7 +8,7 @@ use super::super::Sink;
 pub struct Uninitialized;
 pub struct Initialized;
 
-/// Wrapper struct that uses the typestate pattern to prevent misuse
+/// Wrapper struct that uses the typestate pattern to prevent misuse of the trait implementations
 pub struct OutputSink<State = Uninitialized> {
     inner: Box<dyn Sink>,
     _state: PhantomData<State>,

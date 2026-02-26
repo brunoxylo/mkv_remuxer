@@ -1,6 +1,7 @@
 use super::{KeyframePositionCache, SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::source::CutInterval;
+use crate::source::util::basic_info::MkvBasicInfo;
 use crate::{Error, Result};
 use core::time;
 use log::{debug, info, trace};
@@ -15,6 +16,7 @@ use std::path::Path;
 
 pub struct FileSource {
     file: File,
+    path: String,
     timecode_scale: u64,
     output_timecode_scale: u64,
     tracks: Tracks,
@@ -33,6 +35,7 @@ pub struct FileSource {
 
 impl FileSource {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
         let mut file = File::open(path)?;
 
         // Read EBML header
@@ -106,6 +109,7 @@ impl FileSource {
 
         Ok(Self {
             file,
+            path: path_str,
             timecode_scale,
             output_timecode_scale: timecode_scale,
             tracks: tracks
@@ -513,6 +517,15 @@ impl Source for FileSource {
 
     fn get_info(&self) -> Result<Info> {
         Ok(self.info.clone())
+    }
+
+    fn get_basic_info(&self) -> Result<MkvBasicInfo> {
+        let file_size = self.file.metadata()?.len();
+        let file_name = std::path::Path::new(&self.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.clone());
+        Ok(MkvBasicInfo::new(&self.tracks, &self.info, file_size, file_name))
     }
 
     fn get_output_interval(&mut self) -> Result<CutInterval> {
