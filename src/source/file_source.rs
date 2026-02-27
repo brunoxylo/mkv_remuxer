@@ -10,7 +10,7 @@ use mkv_element::{ClusterBlock, prelude::*};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 
@@ -170,101 +170,264 @@ impl FileSource {
         Some((start_pos, end_pos))
     }
 
-    /// Build an index of cluster positions and timestamps for binary search
-    /// If start_pos and end_pos are provided, only index clusters in that range
-    fn build_cluster_index(&mut self, start_pos: Option<u64>, end_pos: Option<u64>) -> Result<Vec<(u64, u64)>> {
-        // Returns Vec of (file_position, timestamp_ns)
-        let mut cluster_index = Vec::new();
-        
-        let start = start_pos.unwrap_or(self.initial_cluster_pos.position);
-        self.file.seek(SeekFrom::Start(start))?;
-        
-        loop {
-            let current_pos = self.file.stream_position()?;
-            
-            // Stop if we've reached the end position
-            if let Some(end) = end_pos {
-                if current_pos >= end {
+    /// Read only the Cluster timestamp at a given file position without parsing
+    /// any block data. Reads ~10-20 bytes instead of potentially megabytes.
+    /// Returns (timestamp_ns, position_after_this_cluster).
+    fn read_cluster_timestamp_at(&mut self, pos: u64) -> Result<(u64, u64)> {
+        self.file.seek(SeekFrom::Start(pos))?;
+        let header = Header::read_from(&mut self.file)?;
+        if header.id != Cluster::ID {
+            return Err(Error::InvalidConfig(format!(
+                "Expected Cluster at position {}, found ID: {:x}",
+                pos, header.id.value
+            )));
+        }
+
+        let body_start = self.file.stream_position()?;
+        let next_element_pos = if header.size.is_unknown {
+            // Can't determine end for unknown-size clusters;
+            // return body_start as a fallback (caller should use scan_to_next_cluster)
+            None
+        } else {
+            Some(body_start + header.size.value)
+        };
+
+        // The Timestamp child (ID 0xE7) is specified to be the first or second
+        // child element of a Cluster. Scan at most 5 children to be safe.
+        for _ in 0..5 {
+            if let Some(end) = next_element_pos {
+                if self.file.stream_position()? >= end {
                     break;
                 }
             }
-            
+            let child_header = match Header::read_from(&mut self.file) {
+                Ok(h) => h,
+                Err(_) => break,
+            };
+            if child_header.id == Timestamp::ID {
+                let ts = Timestamp::read_element(&child_header, &mut self.file)?;
+                let timestamp_ns = ts.0 * self.timecode_scale;
+                let after = next_element_pos.unwrap_or_else(|| self.file.stream_position().unwrap_or(pos));
+                return Ok((timestamp_ns, after));
+            }
+            // Skip this child
+            if child_header.size.value > 0 && !child_header.size.is_unknown {
+                self.file.seek(SeekFrom::Current(child_header.size.value as i64))?;
+            } else {
+                break;
+            }
+        }
+
+        // Timestamp not found (shouldn't happen in valid MKV), default to 0
+        let after = next_element_pos.unwrap_or(self.file.stream_position().unwrap_or(pos));
+        Ok((0, after))
+    }
+
+    /// Scan forward from `from` looking for the 4-byte Cluster EBML ID pattern
+    /// (0x1F 0x43 0xB6 0x75). Returns the file position of the Cluster header,
+    /// or None if not found before `limit`.
+    fn scan_to_next_cluster(&mut self, from: u64, limit: u64) -> Result<Option<u64>> {
+        self.file.seek(SeekFrom::Start(from))?;
+
+        const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+        const BUF_SIZE: usize = 8192;
+        let mut buf = [0u8; BUF_SIZE];
+        let mut file_pos = from;
+        let mut matched = 0usize;
+
+        while file_pos < limit {
+            let to_read = ((limit - file_pos) as usize).min(BUF_SIZE);
+            let n = self.file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+
+            for i in 0..n {
+                if buf[i] == CLUSTER_ID[matched] {
+                    matched += 1;
+                    if matched == 4 {
+                        // Pattern matched; cluster header starts 3 bytes before current
+                        let cluster_pos = file_pos + i as u64 - 3;
+                        return Ok(Some(cluster_pos));
+                    }
+                } else if buf[i] == CLUSTER_ID[0] {
+                    matched = 1;
+                } else {
+                    matched = 0;
+                }
+            }
+
+            file_pos += n as u64;
+        }
+
+        Ok(None)
+    }
+
+    /// Sequentially scan from a known element boundary, reading only headers and
+    /// Cluster timestamps, skipping all block data. Returns a small Vec of
+    /// (file_position, timestamp_ns) for clusters in the range [from, limit).
+    fn collect_clusters_in_range(&mut self, from: u64, limit: u64) -> Result<Vec<(u64, u64)>> {
+        let mut clusters = Vec::new();
+        let mut pos = from;
+
+        loop {
+            if pos >= limit {
+                break;
+            }
+            self.file.seek(SeekFrom::Start(pos))?;
+
             let header = match Header::read_from(&mut self.file) {
                 Ok(h) => h,
                 Err(_) => break,
             };
-            
+
+            let body_start = self.file.stream_position()?;
+
             if header.id == Cluster::ID {
-                let cluster = match Cluster::read_element(&header, &mut self.file) {
-                    Ok(c) => c,
-                    Err(_) => break,
-                };
-                let timestamp_ns = cluster.get_timestamp_ms(self.timecode_scale);
-                cluster_index.push((current_pos, timestamp_ns));
-            } else {
-                let size = header.size.value;
-                if size > 0 && !header.size.is_unknown {
-                    self.file.seek(SeekFrom::Current(size as i64))?;
+                // Read only the Timestamp child, skip everything else
+                let mut timestamp_ticks = 0u64;
+                let body_end = if header.size.is_unknown {
+                    None
                 } else {
-                    break;
+                    Some(body_start + header.size.value)
+                };
+
+                for _ in 0..5 {
+                    if let Some(end) = body_end {
+                        if self.file.stream_position()? >= end {
+                            break;
+                        }
+                    }
+                    let child_h = match Header::read_from(&mut self.file) {
+                        Ok(h) => h,
+                        Err(_) => break,
+                    };
+                    if child_h.id == Timestamp::ID {
+                        if let Ok(ts) = Timestamp::read_element(&child_h, &mut self.file) {
+                            timestamp_ticks = ts.0;
+                        }
+                        break;
+                    }
+                    if child_h.size.value > 0 && !child_h.size.is_unknown {
+                        self.file.seek(SeekFrom::Current(child_h.size.value as i64))?;
+                    } else {
+                        break;
+                    }
                 }
+
+                clusters.push((pos, timestamp_ticks * self.timecode_scale));
+
+                // Skip past this cluster's body
+                if let Some(end) = body_end {
+                    pos = end;
+                } else {
+                    // Unknown-size cluster: fall back to byte-scanning for the next one
+                    match self.scan_to_next_cluster(body_start, limit)? {
+                        Some(next) => pos = next,
+                        None => break,
+                    }
+                }
+            } else if header.size.value > 0 && !header.size.is_unknown {
+                // Non-cluster element: skip its body
+                pos = body_start + header.size.value;
+            } else {
+                break;
             }
         }
-        
-        Ok(cluster_index)
+
+        Ok(clusters)
     }
 
-    /// Find cluster position using binary search on cluster index
+    /// Find cluster position using binary search directly on the file.
+    ///
+    /// Instead of linearly reading every cluster body to build an index, this
+    /// performs O(log n) seeks into the file, scanning forward from each midpoint
+    /// for the 4-byte Cluster ID and reading only the ~10-byte Timestamp element.
+    /// Once the range is small enough, a sequential header-level scan collects the
+    /// remaining candidates.
     fn find_cluster_by_binary_search(
         &mut self,
         target_timestamp_ns: u64,
         is_start: bool,
     ) -> Result<u64> {
-        // Try to narrow the search range using Cues if available
+        // Try to narrow the initial search range using Cues
         let (start_pos, end_pos) = if let Some((start, end)) = self.find_cluster_range_from_cues(target_timestamp_ns) {
             trace!("Using Cues to narrow cluster search: start_pos={}, end_pos={:?}", start, end);
             (Some(start), end)
         } else {
-            trace!("No Cues available, scanning all clusters");
+            trace!("No Cues available, searching all clusters");
             (None, None)
         };
-        
-        let cluster_index = self.build_cluster_index(start_pos, end_pos)?;
-        
+
+        let mut lo = start_pos.unwrap_or(self.initial_cluster_pos.position);
+        let file_len = self.file.metadata()?.len();
+        let mut hi = end_pos.unwrap_or(file_len);
+
+        // Phase 1: Binary search on file byte positions.
+        // Each iteration reads ~10 bytes (scan for 4-byte ID + read header + timestamp)
+        // instead of parsing megabytes of block data per cluster.
+        while hi.saturating_sub(lo) > 1_048_576 {
+            let mid = lo + (hi - lo) / 2;
+            match self.scan_to_next_cluster(mid, hi)? {
+                Some(cluster_pos) => {
+                    match self.read_cluster_timestamp_at(cluster_pos) {
+                        Ok((ts, _)) => {
+                            if ts <= target_timestamp_ns {
+                                lo = cluster_pos;
+                            } else {
+                                hi = cluster_pos;
+                            }
+                        }
+                        Err(_) => {
+                            // Invalid cluster (false positive from byte scan), narrow from above
+                            hi = cluster_pos;
+                        }
+                    }
+                }
+                None => {
+                    // No cluster between mid and hi
+                    hi = mid;
+                }
+            }
+        }
+
+        // Phase 2: Sequential scan of the remaining ≤1 MB range.
+        // Reads element headers and Cluster timestamps only — block data is skipped.
+        let cluster_index = self.collect_clusters_in_range(lo, hi)?;
+
         if cluster_index.is_empty() {
             return Err(Error::InvalidConfig("No clusters found".to_string()));
         }
-        
-        let video_track_numbers = self.tracks.get_all_video_tracks();
-        let video_num = video_track_numbers.first();
-        
-        // Binary search for the target timestamp
+
+        // Find the best cluster for the target timestamp
         let result = cluster_index.binary_search_by_key(&target_timestamp_ns, |(_, ts)| *ts);
-        
+
         let cluster_idx = match result {
-            Ok(idx) => idx, // Exact match
+            Ok(idx) => idx,
             Err(idx) => {
-                // idx is where target would be inserted
                 if idx == 0 {
-                    0 // Target is before first cluster
+                    0
                 } else if is_start {
-                    idx - 1 // For start, use cluster before target
+                    idx - 1
                 } else {
-                    idx.min(cluster_index.len() - 1) // For end, use cluster at or after target
+                    idx.min(cluster_index.len() - 1)
                 }
             }
         };
-        
-        // If we have video tracks, find the nearest cluster with a keyframe
-        if let Some(video_track_num) = video_num {
-            // Search backward from found position to find cluster with keyframe
+
+        // Phase 3: If there are video tracks, refine to the nearest cluster with a keyframe.
+        // This is the only phase that reads full cluster bodies, but only for a handful
+        // of clusters near the target — not the entire file.
+        let video_track_numbers = self.tracks.get_all_video_tracks();
+        if let Some(&video_track_num) = video_track_numbers.first() {
+            // Search backward from found position
             for i in (0..=cluster_idx).rev() {
                 let (pos, _) = cluster_index[i];
                 self.file.seek(SeekFrom::Start(pos))?;
                 let header = Header::read_from(&mut self.file)?;
                 if header.id == Cluster::ID {
                     let cluster = Cluster::read_element(&header, &mut self.file)?;
-                    if cluster.has_keyframes(*video_track_num) {
+                    if cluster.has_keyframes(video_track_num) {
                         return Ok(pos);
                     }
                 }
@@ -276,14 +439,13 @@ impl FileSource {
                 let header = Header::read_from(&mut self.file)?;
                 if header.id == Cluster::ID {
                     let cluster = Cluster::read_element(&header, &mut self.file)?;
-                    if cluster.has_keyframes(*video_track_num) {
+                    if cluster.has_keyframes(video_track_num) {
                         return Ok(pos);
                     }
                 }
             }
         }
-        
-        // No video track or no keyframe requirement, use found position
+
         Ok(cluster_index[cluster_idx].0)
     }
 
