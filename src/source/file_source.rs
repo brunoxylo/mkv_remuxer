@@ -240,6 +240,35 @@ impl FileSource {
     /// Scan forward from `from` looking for the 4-byte Cluster EBML ID pattern
     /// (0x1F 0x43 0xB6 0x75). Returns the file position of the Cluster header,
     /// or None if not found before `limit`.
+    /// Scan backward from `from` (exclusive) toward `limit` (a lower bound), looking
+    /// for the 4-byte Cluster ID `0x1F43B675`. Returns the file position of the last
+    /// byte of the ID (i.e. the start of the cluster element) if found.
+    fn scan_to_prev_cluster(&mut self, from: u64, limit: u64) -> Result<Option<u64>> {
+        const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+        const BUF_SIZE: usize = 8192;
+
+        let mut end = from; // we read [start, end)
+        loop {
+            if end <= limit {
+                break;
+            }
+            let start = end.saturating_sub(BUF_SIZE as u64).max(limit);
+            let len = (end - start) as usize;
+            let mut buf = vec![0u8; len];
+            self.file.seek(SeekFrom::Start(start))?;
+            self.file.read_exact(&mut buf)?;
+
+            // Search the buffer from right to left for the ID
+            for i in (0..len.saturating_sub(3)).rev() {
+                if buf[i..i + 4] == CLUSTER_ID {
+                    return Ok(Some(start + i as u64));
+                }
+            }
+            end = start;
+        }
+        Ok(None)
+    }
+
     fn scan_to_next_cluster(&mut self, from: u64, limit: u64) -> Result<Option<u64>> {
         self.file.seek(SeekFrom::Start(from))?;
 
@@ -429,34 +458,108 @@ impl FileSource {
             }
         };
 
-        // Phase 3: If there are video tracks, refine to the nearest cluster with a keyframe.
-        // This is the only phase that reads full cluster bodies, but only for a handful
-        // of clusters near the target — not the entire file.
+        // Phase 3: Ping-pong search — alternate one step backward, one step forward
+        // from the anchor cluster, so the first keyframe we find is the closest one.
+        // Stops once both directions have exceeded ±60 s from the anchor timestamp.
+        const KEYFRAME_WINDOW_NS: u64 = 60_000_000_000;
         let video_track_numbers = self.tracks.get_all_video_tracks();
         if let Some(&video_track_num) = video_track_numbers.first() {
-            // Search backward from found position
-            for i in (0..=cluster_idx).rev() {
-                let (pos, _) = cluster_index[i];
-                self.file.seek(SeekFrom::Start(pos))?;
-                let header = Header::read_from(&mut self.file)?;
-                if header.id == Cluster::ID {
-                    let cluster = Cluster::read_element(&header, &mut self.file)?;
-                    if cluster.has_keyframes(video_track_num) {
-                        return Ok(pos);
+            let anchor_pos = cluster_index[cluster_idx].0;
+            let anchor_ts  = cluster_index[cluster_idx].1;
+            let back_limit_ts = anchor_ts.saturating_sub(KEYFRAME_WINDOW_NS);
+            let fwd_limit_ts  = anchor_ts.saturating_add(KEYFRAME_WINDOW_NS);
+            let file_len = self.file.metadata()?.len();
+            let file_start = self.initial_cluster_pos.position;
+
+            // Current backward/forward cursor positions
+            let mut back_pos: Option<u64> = Some(anchor_pos);
+            let mut fwd_pos: Option<u64> = Some(anchor_pos);
+            let mut back_exhausted = false;
+            let mut fwd_exhausted = false;
+            let mut first_iteration = true;
+
+            loop {
+                if back_exhausted && fwd_exhausted {
+                    break;
+                }
+
+                // --- backward step ---
+                if let Some(cur) = back_pos {
+                    if !back_exhausted {
+                        // On first iteration, check the anchor itself; after that scan to prev
+                        let check_pos = if first_iteration {
+                            Some(cur)
+                        } else {
+                            match self.scan_to_prev_cluster(cur, file_start)? {
+                                Some(prev) if prev < cur => Some(prev),
+                                _ => None,
+                            }
+                        };
+
+                        match check_pos {
+                            Some(pos) => {
+                                self.file.seek(SeekFrom::Start(pos))?;
+                                match Header::read_from(&mut self.file) {
+                                    Ok(header) if header.id == Cluster::ID => {
+                                        let cluster = Cluster::read_element(&header, &mut self.file)?;
+                                        let ts = cluster.timestamp.0 * self.timecode_scale;
+                                        if cluster.has_keyframes(video_track_num) {
+                                            return Ok(pos);
+                                        }
+                                        if ts < back_limit_ts {
+                                            back_exhausted = true;
+                                        }
+                                        back_pos = Some(pos);
+                                    }
+                                    _ => back_exhausted = true,
+                                }
+                            }
+                            None => back_exhausted = true,
+                        }
                     }
                 }
-            }
-            // If no keyframe found backward, search forward
-            for i in cluster_idx..cluster_index.len() {
-                let (pos, _) = cluster_index[i];
-                self.file.seek(SeekFrom::Start(pos))?;
-                let header = Header::read_from(&mut self.file)?;
-                if header.id == Cluster::ID {
-                    let cluster = Cluster::read_element(&header, &mut self.file)?;
-                    if cluster.has_keyframes(video_track_num) {
-                        return Ok(pos);
+
+                // --- forward step ---
+                if let Some(cur) = fwd_pos {
+                    if !fwd_exhausted {
+                        // On first iteration the anchor was already checked above, skip it
+                        let check_pos = if first_iteration {
+                            // find the cluster right after the anchor
+                            match self.scan_to_next_cluster(cur + 1, file_len)? {
+                                Some(next) if next > cur => Some(next),
+                                _ => None,
+                            }
+                        } else {
+                            match self.scan_to_next_cluster(cur + 1, file_len)? {
+                                Some(next) if next > cur => Some(next),
+                                _ => None,
+                            }
+                        };
+
+                        match check_pos {
+                            Some(pos) => {
+                                self.file.seek(SeekFrom::Start(pos))?;
+                                match Header::read_from(&mut self.file) {
+                                    Ok(header) if header.id == Cluster::ID => {
+                                        let cluster = Cluster::read_element(&header, &mut self.file)?;
+                                        let ts = cluster.timestamp.0 * self.timecode_scale;
+                                        if cluster.has_keyframes(video_track_num) {
+                                            return Ok(pos);
+                                        }
+                                        if ts > fwd_limit_ts {
+                                            fwd_exhausted = true;
+                                        }
+                                        fwd_pos = Some(pos);
+                                    }
+                                    _ => fwd_exhausted = true,
+                                }
+                            }
+                            None => fwd_exhausted = true,
+                        }
                     }
                 }
+
+                first_iteration = false;
             }
         }
 
