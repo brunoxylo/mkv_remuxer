@@ -499,9 +499,12 @@ impl FileSource {
                         match check_pos {
                             Some(pos) => {
                                 self.file.seek(SeekFrom::Start(pos))?;
-                                match Header::read_from(&mut self.file) {
-                                    Ok(header) if header.id == Cluster::ID => {
-                                        let cluster = Cluster::read_element(&header, &mut self.file)?;
+                                match Header::read_from(&mut self.file)
+                                    .ok()
+                                    .filter(|h| h.id == Cluster::ID)
+                                    .map(|h| Cluster::read_element(&h, &mut self.file))
+                                {
+                                    Some(Ok(cluster)) => {
                                         let ts = cluster.timestamp.0 * self.timecode_scale;
                                         if cluster.has_keyframes(video_track_num) {
                                             return Ok(pos);
@@ -511,7 +514,9 @@ impl FileSource {
                                         }
                                         back_pos = Some(pos);
                                     }
-                                    _ => back_exhausted = true,
+                                    // False positive or corrupt cluster — skip it
+                                    Some(Err(_)) => { back_pos = Some(pos); }
+                                    None => back_exhausted = true,
                                 }
                             }
                             None => back_exhausted = true,
@@ -539,9 +544,12 @@ impl FileSource {
                         match check_pos {
                             Some(pos) => {
                                 self.file.seek(SeekFrom::Start(pos))?;
-                                match Header::read_from(&mut self.file) {
-                                    Ok(header) if header.id == Cluster::ID => {
-                                        let cluster = Cluster::read_element(&header, &mut self.file)?;
+                                match Header::read_from(&mut self.file)
+                                    .ok()
+                                    .filter(|h| h.id == Cluster::ID)
+                                    .map(|h| Cluster::read_element(&h, &mut self.file))
+                                {
+                                    Some(Ok(cluster)) => {
                                         let ts = cluster.timestamp.0 * self.timecode_scale;
                                         if cluster.has_keyframes(video_track_num) {
                                             return Ok(pos);
@@ -551,7 +559,9 @@ impl FileSource {
                                         }
                                         fwd_pos = Some(pos);
                                     }
-                                    _ => fwd_exhausted = true,
+                                    // False positive or corrupt cluster — skip it
+                                    Some(Err(_)) => { fwd_pos = Some(pos); }
+                                    None => fwd_exhausted = true,
                                 }
                             }
                             None => fwd_exhausted = true,
