@@ -1,5 +1,5 @@
 use super::Sink;
-use crate::{Error, Result};
+use crate::{ContainerFormat, Error, Result};
 use mkv_element::prelude::*;
 use std::io::Write;
 
@@ -86,6 +86,7 @@ impl<W: Write + Send> Sink for VttSink<W> {
         &mut self,
         tracks: &Tracks,
         info: &Info,
+        ebml_header: &Ebml, // not needed for vtt
         _chapters: Option<&Chapters>,
     ) -> Result<()> {
         if self.initialized {
@@ -249,6 +250,14 @@ impl<W: Write + Send> Sink for VttSink<W> {
 
         self.writer.flush()?;
         Ok(())
+    }
+    
+    fn does_support_container_format(&self, format: crate::ContainerFormat) -> bool {
+        match format {
+            ContainerFormat::Mkv => false,
+            ContainerFormat::WebM => false,
+            ContainerFormat::Vtt => true,
+        }
     }
 }
 

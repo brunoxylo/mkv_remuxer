@@ -1,5 +1,5 @@
-use crate::APP_NAME;
-use crate::Result;
+use crate::{APP_NAME, Error};
+use crate::{ContainerFormat, Result};
 use mkv_element::prelude::*;
 use std::marker::PhantomData;
 use super::super::Sink;
@@ -32,22 +32,32 @@ impl OutputSink<Uninitialized> {
         mut self,
         tracks: &Tracks,
         info: &Info,
+        ebml_header: &Ebml,
         chapters: Option<&Chapters>,
     ) -> Result<OutputSink<Initialized>> {
-        self.inner.initialize(tracks, info, chapters)?;
+        self.inner.initialize(tracks, info, ebml_header, chapters)?;
         Ok(OutputSink {
             inner: self.inner,
             _state: PhantomData,
         })
     }
+  
 
     pub fn initialize_simple(
-        self,
+        mut self,
         tracks: &Tracks,
         duration_ns: u64,
         timecode_scale: u64,
         chapters: Option<&Chapters>,
+        format: ContainerFormat,
     ) -> Result<OutputSink<Initialized>> {
+
+        if self.inner.does_support_container_format(format) == false {
+            return Err(Error::InvalidConfig(format!(
+                "The provided sink does not support the specified container format '{}'. Please use a compatible sink or choose a different container format.", 
+                format
+            )));
+        }
         let info = Info {
             timestamp_scale: TimestampScale(timecode_scale),
             muxing_app: MuxingApp(APP_NAME.to_string()),
@@ -66,7 +76,18 @@ impl OutputSink<Uninitialized> {
             crc32: None,
             void: None,
         };
-        self.initialize(tracks, &info, chapters)
+        let ebml_header = Ebml {
+            ebml_version: Some(EbmlVersion(1)),
+            ebml_read_version: Some(EbmlReadVersion(1)),
+            ebml_max_id_length: EbmlMaxIdLength(4),
+            ebml_max_size_length: EbmlMaxSizeLength(8),
+            doc_type: Some(DocType(format.to_string())),
+            doc_type_version: Some(DocTypeVersion(4)),
+            doc_type_read_version: Some(DocTypeReadVersion(2)),
+            crc32: None,
+            void: None,
+        };
+        self.initialize(tracks, &info, &ebml_header, chapters)
     }
 }
 
@@ -90,5 +111,12 @@ impl OutputSink<Initialized> {
     }
     pub fn finalize(mut self) -> Result<()> {
         self.inner.finalize()
+    }
+}
+
+/// returns whether we can send tracks with codecs that are supported by a specific container format to this sink
+impl<State> OutputSink<State> {
+    pub fn does_support_container_format(&self, format: ContainerFormat) -> bool {
+        self.inner.does_support_container_format(format)
     }
 }

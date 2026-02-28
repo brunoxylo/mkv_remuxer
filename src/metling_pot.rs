@@ -1,4 +1,5 @@
 use crate::Error;
+use crate::block_ext::TracksExt;
 use crate::{
     Cluster, ClusterBlockExt, ClusterReadWrapper, ClusterWriteWrapper, Result, SourcesMappings,
 };
@@ -149,6 +150,45 @@ impl MeltingPot {
             Ok(None)
         }
     }
+
+    /// Returns `true` if all mapped output tracks use codecs that are valid in
+    /// a WebM container (VP8, VP9, AV1, Vorbis, Opus, WebVTT).
+    ///
+    /// Use this to decide whether to write `DocType: webm` vs `DocType: matroska`.
+    pub fn can_be_webm(&self) -> Result<bool> {
+        let tracks = self.sources_mappings.get_output_tracks_metadata()?;
+        for entry in &tracks.track_entry {
+            let codec = entry.codec_id.0.as_str();
+            let ok = matches!(
+                codec,
+                "V_VP8" | "V_VP9" | "V_AV1"
+                | "A_VORBIS" | "A_OPUS"
+                | "D_WEBVTT/SUBTITLES"
+                | "D_WEBVTT/CAPTIONS"
+                | "D_WEBVTT/DESCRIPTIONS"
+                | "D_WEBVTT/METADATA"
+            ) || codec.starts_with("D_WEBVTT");
+            if !ok {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn is_single_vtt_track(&self) -> Result<bool> {
+        let mut only_one_vtt = false;
+        let sub_tracks = self.sources_mappings.get_output_tracks_metadata()?.track_entry;
+        for track in sub_tracks {
+            let codec = track.codec_id.0.as_str();
+            if codec.starts_with("D_WEBVTT") {
+                if only_one_vtt {
+                    return Ok(false);
+                }
+                only_one_vtt = true;
+            }
+        }
+        Ok(only_one_vtt)
+    }
 }
 
 #[cfg(test)]
@@ -189,9 +229,14 @@ mod tests {
             &mut self,
             _tracks: &Tracks,
             _info: &Info,
+            _ebml_header: &Ebml,
             _chapters: Option<&Chapters>,
         ) -> Result<()> {
             Ok(())
+        }
+
+        fn does_support_container_format(&self, format: crate::ContainerFormat) -> bool {
+            true
         }
 
         fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {

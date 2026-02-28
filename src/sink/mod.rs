@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::ContainerFormat;
 use mkv_element::prelude::*;
 
 mod util;
@@ -18,11 +19,15 @@ pub trait Sink: Send {
         &mut self,
         tracks: &Tracks,
         info: &Info,
+        ebml_header: &Ebml,
         chapters: Option<&Chapters>,
     ) -> Result<()>;
 
     /// Write a cluster to the output
     fn write_cluster(&mut self, cluster: &Cluster, track_number: u64) -> Result<()>;
+
+    /// returns whether we can send tracks with codecs that are supported by a specific container format to this sink
+    fn does_support_container_format(&self, format: ContainerFormat) -> bool;
 
     /// Finalize the output (write cues, seek head, close file)
     fn finalize(&mut self) -> Result<()>;

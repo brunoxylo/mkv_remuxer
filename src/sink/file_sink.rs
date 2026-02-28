@@ -1,5 +1,5 @@
 use super::Sink;
-use crate::{ClusterBlockExt, Result};
+use crate::{ClusterBlockExt, ContainerFormat, Error, Result};
 use log::{debug, trace, warn};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
@@ -13,6 +13,7 @@ const CUE_INTERVAL_NS: u64 = 15_000_000_000; // 15 seconds
 /// File-based sink implementation for writing MKV files (legacy trait implementation)
 pub struct FileSink {
     writer: BufWriter<File>,
+    container_format: ContainerFormat,
     segment_started: bool,
     segment_start_offset: u64,
     cues_offset: u64,
@@ -25,10 +26,29 @@ pub struct FileSink {
 impl FileSink {
     /// Create a new file sink that writes to the specified path
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::create(path)?;
+        let file = File::create(path.as_ref())?;
         let writer = BufWriter::new(file);
+
+        let format = path.as_ref()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .ok_or_else(|| Error::InvalidConfig("Output file extension must be .mkv or .webm".to_string()))
+            .and_then(|ext_str| {
+                if ext_str.eq_ignore_ascii_case("webm") {
+                    Ok(ContainerFormat::WebM)
+                } else if ext_str.eq_ignore_ascii_case("mkv") {
+                    Ok(ContainerFormat::Mkv)
+                } else {
+                    Err(Error::InvalidConfig(format!(
+                        "Output file extension must be .mkv or .webm, got .{}",
+                        ext_str
+                    )))
+                }
+            })?;
+
         Ok(Self {
             writer,
+            container_format: format,
             segment_started: false,
             segment_start_offset: 0,
             cues_offset: 0,
@@ -41,24 +61,32 @@ impl FileSink {
 }
 
 impl Sink for FileSink {
+
     fn initialize(
         &mut self,
         tracks: &Tracks,
         info: &Info,
+        ebml_header: &Ebml,
         chapters: Option<&Chapters>,
     ) -> Result<()> {
+        if ebml_header.doc_type == Some(DocType(ContainerFormat::Mkv.to_string())) && self.container_format == ContainerFormat::WebM {
+            return Err(Error::InvalidConfig(
+                "Output file has .webm extension but contains non-WebM compliant tracks. Please change the output file extension to .mkv or adjust the tracks to be WebM compliant.".to_string(),
+            ));
+        }
+        match ebml_header.doc_type {
+            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::Mkv.to_string() => {},
+            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {},
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "EBML header doc type must be mkv or webm for FileSink", 
+                )));
+            }
+        }
+        // we igore the required format if the file extension is .mkv, but we enforce it if it's .webm to prevent user mistakes
+        let mut ebml_header = ebml_header.clone();
+        ebml_header.doc_type = Some(DocType(self.container_format.to_string()));
         // Write EBML header
-        let ebml_header = Ebml {
-            ebml_version: Some(EbmlVersion(1)),
-            ebml_read_version: Some(EbmlReadVersion(1)),
-            ebml_max_id_length: EbmlMaxIdLength(4),
-            ebml_max_size_length: EbmlMaxSizeLength(8),
-            doc_type: Some(DocType("matroska".to_string())),
-            doc_type_version: Some(DocTypeVersion(4)),
-            doc_type_read_version: Some(DocTypeReadVersion(2)),
-            crc32: None,
-            void: None,
-        };
         ebml_header.write_to(&mut self.writer)?;
 
         // Write Segment start with unknown size for streaming
@@ -269,6 +297,15 @@ impl Sink for FileSink {
         self.writer.flush()?;
         Ok(())
     }
+
+    fn does_support_container_format(&self, format: ContainerFormat) -> bool {
+        let is_mkv_support =  self.container_format == ContainerFormat::Mkv;
+        match format {
+            ContainerFormat::Mkv => is_mkv_support,
+            ContainerFormat::WebM => true,
+            ContainerFormat::Vtt => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,8 +340,19 @@ mod tests {
                 duration: Some(Duration(10000.0)), // 10s
                 ..Default::default()
             };
+            let ebml_header = Ebml {
+                ebml_version: Some(EbmlVersion(1)),
+                ebml_read_version: Some(EbmlReadVersion(1)),
+                ebml_max_id_length: EbmlMaxIdLength(4),
+                ebml_max_size_length: EbmlMaxSizeLength(8),
+                doc_type: Some(DocType("matroska".to_string())),
+                doc_type_version: Some(DocTypeVersion(4)),
+                doc_type_read_version: Some(DocTypeReadVersion(2)),
+                crc32: None,
+                void: None,
+            };
 
-            sink.initialize(&tracks, &info, None)?;
+            sink.initialize(&tracks, &info, &ebml_header, None)?;
 
             assert!(sink.cues_offset > 0);
             assert!(sink.reserved_cues_size > 1024);

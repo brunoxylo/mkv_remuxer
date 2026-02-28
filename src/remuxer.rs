@@ -3,7 +3,7 @@ use crate::metling_pot::MeltingPot;
 use crate::sink::{Initialized, OutputSink};
 use crate::source::{self, CutInterval, Cutting, InputSource, Remuxing, SeekType, Uninitialized};
 use crate::source_mappings::SourcesMappings;
-use crate::{Error, Result};
+use crate::{ContainerFormat, Error, Result};
 use log::{debug, info, warn};
 
 /// Track mapping specification: (source_index, track_number)
@@ -42,6 +42,7 @@ pub struct Remuxer {
     clusters_written: u64,
     track_count: usize,
     duration_ns: u64,
+    output_container: ContainerFormat, // most generous format mkv, then comes webm and last comes vtt
 }
 
 impl Remuxer {
@@ -215,12 +216,44 @@ impl Remuxer {
         output_cut_interval.end_ns = Some(output_cut_interval.start_ns.unwrap_or(0) + duration_ns);
         let track_count = output_tracks.track_entry.len();
 
+        // determine which container fromat to use
+        let output_format =if output_sink.does_support_container_format(ContainerFormat::Mkv) == true {
+            if melting_pot.can_be_webm()? {
+               ContainerFormat::WebM
+            } else {
+                ContainerFormat::Mkv
+            }
+        } else if output_sink.does_support_container_format(ContainerFormat::WebM) == true {
+            if melting_pot.can_be_webm()? {
+                ContainerFormat::WebM
+            } else {
+                return Err(Error::InvalidConfig(
+                    "The provided sink does not support the required container format 'webm' for the given input sources. Please use a compatible sink or adjust the input sources to be compatible with webm.".to_string(),
+                ));
+            }
+        } else if output_sink.does_support_container_format(ContainerFormat::Vtt) == true {
+            if melting_pot.is_single_vtt_track()? {
+                ContainerFormat::Vtt
+            } else {
+                return Err(Error::InvalidConfig(
+                    "The provided sink does not support the required container format 'webvtt' for the given input sources. Please use a compatible sink or adjust the input sources to be compatible with webvtt.".to_string(),
+                ));
+            }
+        } else {
+            return Err(Error::InvalidConfig(
+                "The provided sink does not support any of the container formats compatible with the given input sources. Please use a compatible sink or adjust the input sources.".to_string(),
+            ));
+        };
+
+        info!("Container format: {:?}", output_format);
+
         debug!("Initializing output sink");
         let output_sink = output_sink.initialize_simple(
             &output_tracks,
             duration_ns,
             target_timescale,
-            chapters.as_ref()
+            chapters.as_ref(),
+            output_format,
         )?;
 
         Ok((
@@ -229,11 +262,17 @@ impl Remuxer {
                 output_sink,
                 blocks_processed: 0,
                 clusters_written: 0,
+                output_container: output_format,
                 track_count,
                 duration_ns,
             },
             output_cut_interval,
         ))
+    }
+
+    /// Returns the container format being used for the output.
+    pub fn get_output_container_format(&self) -> ContainerFormat {
+        self.output_container
     }
 
     /// Process one cluster.

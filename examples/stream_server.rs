@@ -20,10 +20,7 @@
 use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::{
-    Remuxer, RemuxerCutMode, RemuxerState,
-    sink::{OutputSink, StreamSink, VttSink},
-    source::{CutInterval, FileSource, InputSource, SeekType, WebVttSource},
-    MkvBasicInfo,
+    ContainerFormat, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState, sink::{OutputSink, StreamSink, VttSink}, source::{CutInterval, FileSource, InputSource, SeekType, WebVttSource}
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -173,7 +170,6 @@ async fn handle_video_request(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| format!("file[{index}]"));
-    let is_vtt = input_path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
 
     let start_sec = params
         .get("start")
@@ -223,6 +219,7 @@ async fn handle_video_request(
         }
     };
 
+    let output_format: ContainerFormat = remuxer.get_output_container_format(); 
 
     // spawn another blocking task to run the remuxer loop so it doesn't block the async response handling
     tokio::task::spawn_blocking(move || {
@@ -252,7 +249,12 @@ async fn handle_video_request(
     let start_sec = output_interval.start_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
     let end_sec = output_interval.end_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
 
-    let content_type = if is_vtt { "text/vtt; charset=utf-8" } else { "video/webm" };
+
+    let content_type = match output_format {
+        ContainerFormat::Vtt => "text/vtt; charset=utf-8",
+        ContainerFormat::WebM => "video/webm",
+        ContainerFormat::Mkv => "video/mkv",
+    };
 
     let response = warp::http::Response::builder()
         .status(200)

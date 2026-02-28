@@ -1,5 +1,5 @@
 use super::Sink;
-use crate::Result;
+use crate::{ContainerFormat, Error, Result};
 use log::trace;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
@@ -33,20 +33,20 @@ impl<W: Write + Seek + Send> Sink for StreamSink<W> {
         &mut self,
         tracks: &Tracks,
         info: &Info,
+        ebml_header: &Ebml,
         chapters: Option<&Chapters>,
     ) -> Result<()> {
+
+        match ebml_header.doc_type {
+            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::Mkv.to_string() => {},
+            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {},
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "EBML header doc type must be mkv or webm for StreamSink", 
+                )));
+            }
+        }
         // Write EBML header
-        let ebml_header = Ebml {
-            ebml_version: Some(EbmlVersion(1)),
-            ebml_read_version: Some(EbmlReadVersion(1)),
-            ebml_max_id_length: EbmlMaxIdLength(4),
-            ebml_max_size_length: EbmlMaxSizeLength(8),
-            doc_type: Some(DocType("matroska".to_string())),
-            doc_type_version: Some(DocTypeVersion(4)),
-            doc_type_read_version: Some(DocTypeReadVersion(2)),
-            crc32: None,
-            void: None,
-        };
         ebml_header.write_to(&mut self.writer)?;
 
         // Write Segment start with unknown size for streaming
@@ -103,6 +103,14 @@ impl<W: Write + Seek + Send> Sink for StreamSink<W> {
         self.writer.flush()?;
         Ok(())
     }
+
+    fn does_support_container_format(&self, format: ContainerFormat) -> bool {
+        match format {
+            ContainerFormat::Mkv => true,
+            ContainerFormat::WebM => true,
+            ContainerFormat::Vtt => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -133,8 +141,19 @@ mod tests {
             duration: Some(Duration(10000.0)), // 10s
             ..Default::default()
         };
+        let ebml_header = Ebml {
+            ebml_version: Some(EbmlVersion(1)),
+            ebml_read_version: Some(EbmlReadVersion(1)),
+            ebml_max_id_length: EbmlMaxIdLength(4),
+            ebml_max_size_length: EbmlMaxSizeLength(8),
+            doc_type: Some(DocType("matroska".to_string())),
+            doc_type_version: Some(DocTypeVersion(4)),
+            doc_type_read_version: Some(DocTypeReadVersion(2)),
+            crc32: None,
+            void: None,
+        };
 
-        sink.initialize(&tracks, &info, None)?;
+        sink.initialize(&tracks, &info, &ebml_header, None)?;
         assert!(sink.segment_started);
 
         // Write a simple cluster
@@ -182,7 +201,19 @@ mod tests {
             ..Default::default()
         };
 
-        sink.initialize(&tracks, &info, None)?;
+        let ebml_header = Ebml {
+            ebml_version: Some(EbmlVersion(1)),
+            ebml_read_version: Some(EbmlReadVersion(1)),
+            ebml_max_id_length: EbmlMaxIdLength(4),
+            ebml_max_size_length: EbmlMaxSizeLength(8),
+            doc_type: Some(DocType("matroska".to_string())),
+            doc_type_version: Some(DocTypeVersion(4)),
+            doc_type_read_version: Some(DocTypeReadVersion(2)),
+            crc32: None,
+            void: None,
+        };
+
+        sink.initialize(&tracks, &info, &ebml_header, None)?;
         
         // Write several clusters to simulate a longer file
         for i in 0..10 {

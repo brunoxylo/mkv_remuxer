@@ -35,12 +35,26 @@ pub struct FileSource {
 
 impl FileSource {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path_str = path.as_ref().to_string_lossy().to_string();
-        let mut file = File::open(path)?;
+        let path_ref = path.as_ref();
+        let path_str = path_ref.to_string_lossy().to_string();
+
+        // Determine expected DocType from file extension
+        let ext_expected_doctype = path_ref
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| match e.to_lowercase().as_str() {
+                "webm" => Some("webm"),
+                "mkv" | "mka" | "mks" => Some("matroska"),
+                _ => None,
+            })
+            .flatten();
+
+        let mut file = File::open(path_ref)?;
 
         // Read EBML header
         let ebml_header = Header::read_from(&mut file)?;
-        let _ebml = Ebml::read_element(&ebml_header, &mut file)?;
+        let ebml = Ebml::read_element(&ebml_header, &mut file)?;
+
 
         // Read Segment header
         let segment_header = Header::read_from(&mut file)?;
