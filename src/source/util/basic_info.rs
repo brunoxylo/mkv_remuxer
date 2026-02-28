@@ -8,7 +8,6 @@ pub struct VideoTrack {
     pub codec: String,
     pub width: u32,
     pub height: u32,
-    pub chroma_subsampling: Option<String>,
     pub color_space: Option<String>,
 }
 
@@ -25,7 +24,40 @@ pub struct AudioTrack {
 pub struct SubtitleTrack {
     pub track_id: u32,
     pub codec: String,
+    pub forced: bool,
     pub language: Option<String>,
+}
+
+impl SubtitleTrack {
+pub fn is_text_based(&self) -> bool {
+        let text_based_subtitle_codecs = [
+            "ass",
+            "eia_608",
+            "hdmv_text_subtitle",
+            "jacosub",
+            "microdvd",
+            "mpl2",
+            "pjs",
+            "realtext",
+            "sami",
+            "srt",
+            "ssa",
+            "stl",
+            "subrip",
+            "subviewer",
+            "subviewer1",
+            "text",
+            "ttml",
+            "vplayer",
+            "webvtt",
+            "mov_text",
+        ];
+        if text_based_subtitle_codecs.contains(&self.codec.as_str()) {
+            return true;
+        } else {
+            return false;
+        }
+    }
 }
 
 
@@ -61,13 +93,15 @@ impl MkvBasicInfo {
             match kind {
                 TrackKind::Video => {
                     if let Some(video) = &entry.video {
+                        let color_space = entry.clone()
+                            .video
+                            .and_then(|v| v.colour.as_ref().map(|c| c.matrix_coefficients.0.to_string()));
                         video_tracks.push(VideoTrack {
                             track_id,
                             codec,
                             width: video.pixel_width.0 as u32,
                             height: video.pixel_height.0 as u32,
-                            chroma_subsampling: None,
-                            color_space: None,
+                            color_space,
                         });
                     }
                 }
@@ -88,6 +122,7 @@ impl MkvBasicInfo {
                     subtitle_tracks.push(SubtitleTrack {
                         track_id,
                         codec,
+                        forced: entry.flag_forced.0 != 0,
                         language: (!language.is_empty()).then_some(language),
                     });
                 }
