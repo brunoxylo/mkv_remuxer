@@ -20,85 +20,16 @@
 use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::{
-    ContainerFormat, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState, sink::{OutputSink, StreamSink, VttSink}, source::{CutInterval, FileSource, InputSource, SeekType, WebVttSource}
+    ContainerFormat, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState,
+    sink::{ChannelWriterWrapper, ChannelWriterWrapperTokio, OutputSink, StreamSink, VttSink},
+    source::{CutInterval, FileSource, InputSource, WebVttSource},
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use warp::hyper;
 use warp::Filter;
-
-/// A streaming writer that sends chunks over a channel as they're written
-struct StreamWriter {
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-    buffer: Vec<u8>,
-    position: u64,
-}
-
-impl StreamWriter {
-    fn new(tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>) -> Self {
-        Self {
-            tx,
-            buffer: Vec::new(),
-            position: 0,
-        }
-    }
-}
-
-impl Write for StreamWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        self.position += buf.len() as u64;
-
-        // Send chunks when buffer reaches a reasonable size (64KB)
-        const CHUNK_SIZE: usize = 64 * 1024;
-        if self.buffer.len() >= CHUNK_SIZE {
-            let chunk = std::mem::take(&mut self.buffer);
-            if self.tx.send(Ok(Bytes::from(chunk))).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "Receiver dropped",
-                ));
-            }
-        }
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buffer.is_empty() {
-            let chunk = std::mem::take(&mut self.buffer);
-            if self.tx.send(Ok(Bytes::from(chunk))).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "Receiver dropped",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Seek for StreamWriter {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match pos {
-            SeekFrom::Current(offset) => {
-                self.position = (self.position as i64 + offset) as u64;
-                Ok(self.position)
-            }
-            SeekFrom::Start(pos) => {
-                self.position = pos;
-                Ok(self.position)
-            }
-            SeekFrom::End(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "SeekFrom::End not supported in streaming mode",
-            )),
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() {
@@ -202,11 +133,11 @@ async fn handle_video_request(
     );
 
     // Create a channel for streaming chunks
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(20);
 
     // Spawn blocking task for remuxer intialization since it may involve file I/O and processing
     let (remuxer, output_interval) =  match tokio::task::spawn_blocking(move || {
-        process_video_request(input_path, start_sec, end_sec, tracks, cut_mode, tx.clone())
+        process_video_request(input_path, start_sec, end_sec, tracks, cut_mode, tx)
     }).await.unwrap() {
         Ok(result) => result,
         Err(e) => {
@@ -242,8 +173,9 @@ async fn handle_video_request(
     });
 
     // Convert receiver to a Stream, then wrap with hyper::Body::wrap_stream
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-    let body = warp::hyper::Body::wrap_stream(stream);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mapped_stream = tokio_stream::StreamExt::map(stream, |chunk| Ok::<_, Infallible>(chunk));
+    let body = warp::hyper::Body::wrap_stream(mapped_stream);
 
     // safe the start and end times of the segment we are streaming in custom headers so client can use them if needed
     let start_sec = output_interval.start_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
@@ -260,6 +192,7 @@ async fn handle_video_request(
         .status(200)
         .header("Content-Type", content_type)
         .header("Cache-Control", "no-cache")
+        .header("Connection", "close")
         .header("X-Media-Start-Sec", format!("{:.3}", start_sec))
         .header("X-Media-End-Sec", format!("{:.3}", end_sec))
         .body(body)
@@ -274,7 +207,7 @@ fn process_video_request(
     end_sec: Option<f64>,
     tracks: Vec<u64>,
     cut_mode: Option<RemuxerCutMode>,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    tx: tokio::sync::mpsc::Sender<Bytes>,
 ) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
     let is_vtt = input_path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
     let input: InputSource = if is_vtt {
@@ -305,11 +238,13 @@ fn process_video_request(
         None // Include all tracks
     };
 
-    let stream_writer = StreamWriter::new(tx);
     let output = if is_vtt {
-        OutputSink::from(Box::new(VttSink::new(stream_writer)) as Box<dyn mkv_remuxer::Sink>)
+        let writer = ChannelWriterWrapperTokio { tx };
+        let vtt_sink = VttSink::new(writer);
+        OutputSink::from(Box::new(vtt_sink) as Box<dyn mkv_remuxer::Sink>)
     } else {
-        let stream_sink = StreamSink::new(stream_writer)?;
+        let writer = ChannelWriterWrapperTokio { tx };
+        let stream_sink = StreamSink::new(writer)?;
         OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>)
     };
 

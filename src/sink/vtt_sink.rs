@@ -1,5 +1,5 @@
 use super::Sink;
-use crate::{ContainerFormat, Error, Result};
+use crate::{ContainerFormat, Error, Result, sink::ChannelWriterWrapper, sink::ChannelWriterWrapperTokio};
 use mkv_element::prelude::*;
 use std::io::Write;
 
@@ -24,6 +24,8 @@ struct VttCue {
     settings: Option<String>,
     text: String,
 }
+
+
 
 impl<W: Write + Send> VttSink<W> {
     /// Create a new VTT sink that writes to the specified writer

@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use crate::Result;
 use crate::ContainerFormat;
 use mkv_element::prelude::*;
@@ -10,7 +12,7 @@ mod stream_sink;
 pub use util::{OutputSink, Uninitialized, Initialized};
 pub use file_sink::FileSink;
 pub use vtt_sink::VttSink;
-pub use stream_sink::StreamSink;
+pub use stream_sink::{StreamSink};
 
 /// Represents a sink/destination for MKV data (output file or stream)
 pub trait Sink: Send {
@@ -32,6 +34,45 @@ pub trait Sink: Send {
     /// Finalize the output (write cues, seek head, close file)
     fn finalize(&mut self) -> Result<()>;
 }
+
+pub struct ChannelWriterWrapper {
+    pub tx: std::sync::mpsc::SyncSender<bytes::Bytes>,
+}
+
+impl Write for ChannelWriterWrapper {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Send the data as bytes through the channel
+        self.tx.send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // No buffering, so nothing to flush
+        Ok(())
+    }
+}
+
+pub struct ChannelWriterWrapperTokio {
+    pub tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+}
+
+impl Write for ChannelWriterWrapperTokio {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Send the data as bytes through the channel
+        self.tx.blocking_send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // No buffering, so nothing to flush
+        Ok(())
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

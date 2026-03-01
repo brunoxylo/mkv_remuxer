@@ -1,34 +1,36 @@
+use std::io::Write;
+use std::sync::mpsc;
+
 use super::Sink;
+use crate::sink::{ChannelWriterWrapper, ChannelWriterWrapperTokio};
 use crate::{ContainerFormat, Error, Result};
 use log::trace;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
-use std::io::{Seek, Write};
 
 /// Stream-based sink implementation for writing MKV files to any stream
 /// 
 /// This sink writes to any `Write + Seek` stream without managing cues,
 /// since seekable streams allow the consumer to navigate the file.
-pub struct StreamSink<W: Write + Seek + Send> {
+pub struct StreamSink<W: Write + Send> {
     writer: W,
     segment_started: bool,
-    segment_start_offset: u64,
     timescale: u64,
 }
 
-impl<W: Write + Seek + Send> StreamSink<W> {
+impl<W: Write + Send> StreamSink<W> {
+
     /// Create a new stream sink that writes to the specified stream
     pub fn new(writer: W) -> Result<Self> {
         Ok(Self {
             writer,
             segment_started: false,
-            segment_start_offset: 0,
             timescale: 1_000_000,
         })
     }
 }
 
-impl<W: Write + Seek + Send> Sink for StreamSink<W> {
+impl<W: Write + Send> Sink for StreamSink<W> {
     fn initialize(
         &mut self,
         tracks: &Tracks,
@@ -52,7 +54,6 @@ impl<W: Write + Seek + Send> Sink for StreamSink<W> {
         // Write Segment start with unknown size for streaming
         // Segment ID is 0x18538067
         self.writer.write_all(&[0x18, 0x53, 0x80, 0x67])?;
-        self.segment_start_offset = self.writer.stream_position()?;
 
         // Unknown size marker (all 1s in VINT encoding)
         self.writer
@@ -81,16 +82,13 @@ impl<W: Write + Seek + Send> Sink for StreamSink<W> {
                 "Cannot write cluster before initialize() is called".to_string(),
             ));
         }
-
-        // Get cluster position before writing
-        let cluster_position = self.writer.stream_position()?;
         
         // Calculate cluster timestamp in nanoseconds
         let cluster_timestamp_ticks = cluster.timestamp.0;
         let cluster_timestamp_ns = cluster_timestamp_ticks * self.timescale;
         
         cluster.write_to(&mut self.writer)?;
-        trace!("written cluster at position {}, timestamp {} ns", cluster_position, cluster_timestamp_ns);
+        trace!("written cluster at timestamp {} ns", cluster_timestamp_ns);
         Ok(())
     }
 
@@ -116,14 +114,31 @@ impl<W: Write + Seek + Send> Sink for StreamSink<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
-    #[test]
-    fn test_stream_sink_basic() -> Result<()> {
-        let mut buffer = Cursor::new(Vec::new());
-        let mut sink = StreamSink::new(&mut buffer)?;
+    fn collect_output(rx: std::sync::mpsc::Receiver<bytes::Bytes>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            out.extend_from_slice(&chunk);
+        }
+        out
+    }
 
-        let tracks = Tracks {
+    fn make_ebml_header(doc_type: &str) -> Ebml {
+        Ebml {
+            ebml_version: Some(EbmlVersion(1)),
+            ebml_read_version: Some(EbmlReadVersion(1)),
+            ebml_max_id_length: EbmlMaxIdLength(4),
+            ebml_max_size_length: EbmlMaxSizeLength(8),
+            doc_type: Some(DocType(doc_type.to_string())),
+            doc_type_version: Some(DocTypeVersion(4)),
+            doc_type_read_version: Some(DocTypeReadVersion(2)),
+            crc32: None,
+            void: None,
+        }
+    }
+
+    fn make_tracks() -> Tracks {
+        Tracks {
             track_entry: vec![TrackEntry {
                 track_number: TrackNumber(1),
                 track_uid: TrackUid(123),
@@ -132,8 +147,15 @@ mod tests {
                 ..Default::default()
             }],
             ..Default::default()
-        };
+        }
+    }
 
+    #[test]
+    fn test_stream_sink_basic() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(100);
+        let mut sink = StreamSink::new(ChannelWriterWrapper { tx })?;
+
+        let tracks = make_tracks();
         let info = Info {
             timestamp_scale: TimestampScale(1_000_000),
             muxing_app: MuxingApp("test".to_string()),
@@ -141,22 +163,10 @@ mod tests {
             duration: Some(Duration(10000.0)), // 10s
             ..Default::default()
         };
-        let ebml_header = Ebml {
-            ebml_version: Some(EbmlVersion(1)),
-            ebml_read_version: Some(EbmlReadVersion(1)),
-            ebml_max_id_length: EbmlMaxIdLength(4),
-            ebml_max_size_length: EbmlMaxSizeLength(8),
-            doc_type: Some(DocType("matroska".to_string())),
-            doc_type_version: Some(DocTypeVersion(4)),
-            doc_type_read_version: Some(DocTypeReadVersion(2)),
-            crc32: None,
-            void: None,
-        };
 
-        sink.initialize(&tracks, &info, &ebml_header, None)?;
+        sink.initialize(&tracks, &info, &make_ebml_header("matroska"), None)?;
         assert!(sink.segment_started);
 
-        // Write a simple cluster
         let cluster = Cluster {
             timestamp: Timestamp(0),
             blocks: Vec::new(),
@@ -168,9 +178,9 @@ mod tests {
 
         sink.write_cluster(&cluster, 1)?;
         sink.finalize()?;
+        drop(sink); // closes the channel so collect_output terminates
 
-        // Verify buffer has content
-        let output = buffer.into_inner();
+        let output = collect_output(rx);
         assert!(output.len() > 100);
 
         Ok(())
@@ -179,19 +189,8 @@ mod tests {
     #[test]
     fn test_stream_sink_no_cues() -> Result<()> {
         // Verify that the output doesn't contain cues
-        let mut buffer = Cursor::new(Vec::new());
-        let mut sink = StreamSink::new(&mut buffer)?;
-
-        let tracks = Tracks {
-            track_entry: vec![TrackEntry {
-                track_number: TrackNumber(1),
-                track_uid: TrackUid(123),
-                track_type: TrackType(1),
-                codec_id: CodecId("V_VP8".to_string()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(100);
+        let mut sink = StreamSink::new(ChannelWriterWrapper { tx })?;
 
         let info = Info {
             timestamp_scale: TimestampScale(1_000_000),
@@ -201,20 +200,8 @@ mod tests {
             ..Default::default()
         };
 
-        let ebml_header = Ebml {
-            ebml_version: Some(EbmlVersion(1)),
-            ebml_read_version: Some(EbmlReadVersion(1)),
-            ebml_max_id_length: EbmlMaxIdLength(4),
-            ebml_max_size_length: EbmlMaxSizeLength(8),
-            doc_type: Some(DocType("matroska".to_string())),
-            doc_type_version: Some(DocTypeVersion(4)),
-            doc_type_read_version: Some(DocTypeReadVersion(2)),
-            crc32: None,
-            void: None,
-        };
+        sink.initialize(&make_tracks(), &info, &make_ebml_header("matroska"), None)?;
 
-        sink.initialize(&tracks, &info, &ebml_header, None)?;
-        
         // Write several clusters to simulate a longer file
         for i in 0..10 {
             let cluster = Cluster {
@@ -227,15 +214,16 @@ mod tests {
             };
             sink.write_cluster(&cluster, 1)?;
         }
-        
-        sink.finalize()?;
 
-        let output = buffer.into_inner();
-        
+        sink.finalize()?;
+        drop(sink); // closes the channel so collect_output terminates
+
+        let output = collect_output(rx);
+
         // The Cues element ID is 0x1C53BB6B
         // Make sure it doesn't appear in the output
-        let cues_id = vec![0x1C, 0x53, 0xBB, 0x6B];
-        let has_cues = output.windows(4).any(|window| window == cues_id.as_slice());
+        let cues_id = [0x1C, 0x53, 0xBB, 0x6B];
+        let has_cues = output.windows(4).any(|window| window == cues_id);
         assert!(!has_cues, "StreamSink should not write cues");
 
         Ok(())
