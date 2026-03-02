@@ -596,7 +596,7 @@ impl FileSource {
         let orig_block_count = cluster.blocks.len();
 
         let orig_cluster_ticks = cluster.timestamp.0 as i64;
-        let orig_cluster_ns = cluster.get_timestamp_ms(self.timecode_scale) as i64;
+        let orig_cluster_ns = cluster.get_timestamp_ns(self.timecode_scale) as i64;
 
         // Shift cluster timestamp
         let shift_reference = match self.seek_type {
@@ -846,8 +846,8 @@ impl Source for FileSource {
 
                 // Check if we should stop based on end time
                 if let Some(end_ns) = self.input_cut_interval.end_ns {
-                    if cluster.get_timestamp_ms(self.timecode_scale) > end_ns {
-                        trace!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ms(self.timecode_scale), end_ns);
+                    if cluster.get_timestamp_ns(self.timecode_scale) > end_ns {
+                        trace!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ns(self.timecode_scale), end_ns);
                         self.finished = true;
                         return Ok(None);
                     }

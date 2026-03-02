@@ -1,5 +1,5 @@
 use super::Sink;
-use crate::{ContainerFormat, Error, Result, sink::ChannelWriterWrapper, sink::ChannelWriterWrapperTokio};
+use crate::{ContainerFormat, Error, Result, sink::ChannelWriterWrapper};
 use mkv_element::prelude::*;
 use std::io::Write;
 

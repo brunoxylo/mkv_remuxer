@@ -1,7 +1,9 @@
+use std::fmt::Display;
 use std::io::Write;
 
 use crate::Result;
 use crate::ContainerFormat;
+use bytes::Bytes;
 use mkv_element::prelude::*;
 
 mod util;
@@ -35,40 +37,56 @@ pub trait Sink: Send {
     fn finalize(&mut self) -> Result<()>;
 }
 
-pub struct ChannelWriterWrapper {
-    pub tx: std::sync::mpsc::SyncSender<bytes::Bytes>,
+pub enum SinkSender {
+    Sync(std::sync::mpsc::SyncSender<bytes::Bytes>),
+    Tokio(tokio::sync::mpsc::Sender<bytes::Bytes>),
 }
-
+pub struct ChannelWriterWrapper {
+    pub tx: SinkSender,
+    prefill_buffer: Vec<Bytes>,
+    reading_started: bool,
+}
+impl ChannelWriterWrapper {
+    pub fn new(tx: SinkSender) -> Self {
+        Self {
+            tx,
+            prefill_buffer: Vec::new(),
+            reading_started: false,
+        }
+    }
+    fn send_err(e: &dyn Display) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
+    }
+}
 impl Write for ChannelWriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Send the data as bytes through the channel
-        self.tx.send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
-        })?;
+        if !self.reading_started && self.prefill_buffer.len() < 20 {
+            // Buffer the first few writes to allow the sink to initialize
+            self.prefill_buffer.push(bytes::Bytes::copy_from_slice(buf));
+            return Ok(buf.len());
+        } else {
+            self.flush()?;
+            match &self.tx {
+                SinkSender::Sync(tx) => {
+                    tx.send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| Self::send_err(&e))?;
+                },
+                SinkSender::Tokio(tx) => {
+                    tx.blocking_send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| Self::send_err(&e))?;
+                },
+            }
+            self.reading_started = true;
+        }
+
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // No buffering, so nothing to flush
-        Ok(())
-    }
-}
-
-pub struct ChannelWriterWrapperTokio {
-    pub tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
-}
-
-impl Write for ChannelWriterWrapperTokio {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Send the data as bytes through the channel
-        self.tx.blocking_send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
-        })?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        // No buffering, so nothing to flush
+        for buffered in self.prefill_buffer.drain(..) {
+            match &self.tx {
+                SinkSender::Sync(tx) => tx.send(buffered).map_err(|e| Self::send_err(&e))?,
+                SinkSender::Tokio(tx) => tx.blocking_send(buffered).map_err(|e| Self::send_err(&e))?,
+            };
+        }
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::mpsc;
 
 use super::Sink;
-use crate::sink::{ChannelWriterWrapper, ChannelWriterWrapperTokio};
+use crate::sink::{ChannelWriterWrapper};
 use crate::{ContainerFormat, Error, Result};
 use log::trace;
 use mkv_element::io::blocking_impl::*;
@@ -113,6 +113,8 @@ impl<W: Write + Send> Sink for StreamSink<W> {
 
 #[cfg(test)]
 mod tests {
+    use crate::sink::SinkSender;
+
     use super::*;
 
     fn collect_output(rx: std::sync::mpsc::Receiver<bytes::Bytes>) -> Vec<u8> {
@@ -153,7 +155,7 @@ mod tests {
     #[test]
     fn test_stream_sink_basic() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel(100);
-        let mut sink = StreamSink::new(ChannelWriterWrapper { tx })?;
+        let mut sink = StreamSink::new(ChannelWriterWrapper::new(SinkSender::Sync(tx)))?;
 
         let tracks = make_tracks();
         let info = Info {
@@ -190,7 +192,7 @@ mod tests {
     fn test_stream_sink_no_cues() -> Result<()> {
         // Verify that the output doesn't contain cues
         let (tx, rx) = std::sync::mpsc::sync_channel(100);
-        let mut sink = StreamSink::new(ChannelWriterWrapper { tx })?;
+        let mut sink = StreamSink::new(ChannelWriterWrapper::new(SinkSender::Sync(tx)))?;
 
         let info = Info {
             timestamp_scale: TimestampScale(1_000_000),

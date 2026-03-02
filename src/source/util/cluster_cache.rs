@@ -154,12 +154,12 @@ impl KeyframePositionCache {
             // For "after", only consider clusters whose timestamp is at or after
             // the anchor cluster (so we actually scan *past* the reference).
             nearby_clusters.into_iter()
-                .filter(|(_, ts)| *ts >= cluster.get_timestamp_ms(self.timecode_scale))
+                .filter(|(_, ts)| *ts >= cluster.get_timestamp_ns(self.timecode_scale))
                 .collect()
         } else {
             // For "before", use any cluster at or before the anchor.
             let mut before_clusters: Vec<_> = nearby_clusters.into_iter()
-                .filter(|(_, ts)| *ts <= cluster.get_timestamp_ms(self.timecode_scale))
+                .filter(|(_, ts)| *ts <= cluster.get_timestamp_ns(self.timecode_scale))
                 .collect();
             before_clusters.reverse(); // nearest-first
             before_clusters
@@ -249,7 +249,7 @@ impl KeyframePositionCache {
             if let Ok(header) = Header::read_from(&mut self.file) {
                 if header.id == Cluster::ID {
                     if let Ok(cluster) = Cluster::read_element(&header, &mut self.file) {
-                        let timestamp_ns = cluster.get_timestamp_ms(self.timecode_scale);
+                        let timestamp_ns = cluster.get_timestamp_ns(self.timecode_scale);
                         clusters.push((pos, timestamp_ns));
                     } else {
                         break;

@@ -21,7 +21,7 @@ use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::{
     ContainerFormat, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState,
-    sink::{ChannelWriterWrapper, ChannelWriterWrapperTokio, OutputSink, StreamSink, VttSink},
+    sink::{ChannelWriterWrapper, SinkSender, OutputSink, StreamSink, VttSink},
     source::{CutInterval, FileSource, InputSource, WebVttSource},
 };
 use std::collections::HashMap;
@@ -133,6 +133,8 @@ async fn handle_video_request(
     );
 
     // Create a channel for streaming chunks
+    // When the remuxer finishes it drops the sink → writer → tx, closing the channel,
+    // which makes the ReceiverStream yield None and signals end-of-response to the client.
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(20);
 
     // Spawn blocking task for remuxer intialization since it may involve file I/O and processing
@@ -239,11 +241,11 @@ fn process_video_request(
     };
 
     let output = if is_vtt {
-        let writer = ChannelWriterWrapperTokio { tx };
+        let writer = ChannelWriterWrapper::new(SinkSender::Tokio(tx));
         let vtt_sink = VttSink::new(writer);
         OutputSink::from(Box::new(vtt_sink) as Box<dyn mkv_remuxer::Sink>)
     } else {
-        let writer = ChannelWriterWrapperTokio { tx };
+        let writer = ChannelWriterWrapper::new(SinkSender::Tokio(tx));
         let stream_sink = StreamSink::new(writer)?;
         OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>)
     };
