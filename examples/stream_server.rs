@@ -135,7 +135,7 @@ async fn handle_video_request(
     // Create a channel for streaming chunks
     // When the remuxer finishes it drops the sink → writer → tx, closing the channel,
     // which makes the ReceiverStream yield None and signals end-of-response to the client.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(20);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1);
 
     // Spawn blocking task for remuxer intialization since it may involve file I/O and processing
     let (remuxer, output_interval) =  match tokio::task::spawn_blocking(move || {
