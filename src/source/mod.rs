@@ -258,11 +258,11 @@ mod tests {
                 )?;
                 let mut max_ts = CUT_MAX_NS;
                 println!("our actual interval is {}", offset);
-                if matches!(seek_type, SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_)) {
+                if matches!(seek_type, SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_) | SeekType::SnapNextKeyframe(_)) {
                     // Calculate the actual duration from the keyframe timestamps
                     if let (Some(start), Some(end)) = (offset.start_ns, offset.end_ns) {
                         max_ts = end - start;
-                        if matches!(seek_type, SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_)) {
+                        if matches!(seek_type, SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_) | SeekType::SnapNextKeyframe(_)) {
                             max_ts += 5_000_000_000; // allow 5s tolerance for snap nearest keyframe, we cnt get this universally for every input source to we just assume a key frame interval of 5s 
                         }
                     }

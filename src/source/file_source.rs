@@ -3,14 +3,12 @@ use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::source::CutInterval;
 use crate::source::util::basic_info::MkvBasicInfo;
 use crate::{Error, Result};
-use core::time;
 use log::{debug, info, trace};
 use mkv_element::io::blocking_impl::*;
-use mkv_element::{ClusterBlock, prelude::*};
-use std::collections::HashMap;
+use mkv_element::prelude::*;
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 
@@ -24,12 +22,12 @@ pub struct FileSource {
     chapters: Option<Chapters>,
     cues: Option<Cues>,
     seek_type: SeekType,
-    input_cut_interval: CutInterval,
+    //input_cut_interval: CutInterval,
     output_interval: CutInterval,
     original_duration_ns: Option<u64>,
     /// position in the file where our first cluster of interest starts (usually around the specified cut start position)
     initial_cluster_pos: KeyframePositionCache,
-    end_cluster_pos: KeyframePositionCache,
+    end_cluster_pos: Option<KeyframePositionCache>,
     finished: bool,
 }
 
@@ -93,11 +91,13 @@ impl FileSource {
             } else if header.id == Cues::ID {
                 cues = Some(Cues::read_element(&header, &mut file)?);
             } else if header.id == Cluster::ID {
+                let file_len = file.metadata()?.len();
                 initial_cluster_pos = Some(KeyframePositionCache::new(
-                    pos,
                     file.try_clone()?,
                     timecode_scale,
-                ));
+                    0,
+                    Some((pos, file_len)),
+                )?);
                 break;
             } else {
                 let size = header.size.value;
@@ -111,11 +111,8 @@ impl FileSource {
             .ok_or_else(|| Error::InvalidConfig("No clusters found".to_string()))?;
 
         // Initialize end_cluster_pos at the same position as initial, will be updated during initialize_with_cut
-        let end_cluster_pos = KeyframePositionCache::new(
-            initial_cluster_pos.position,
-            file.try_clone()?,
-            timecode_scale,
-        );
+        let file_len = file.metadata()?.len();
+        
 
         let original_duration_ns = info
             .as_ref()
@@ -132,14 +129,13 @@ impl FileSource {
             chapters,
             cues,
             seek_type: SeekType::Squeeze, // default, can be changed in initialize_with_cut
-            input_cut_interval: CutInterval::new(), // default, can be changed in initialize_with
             output_interval: CutInterval {
                 start_ns: Some(0),
                 end_ns: original_duration_ns,
             },
             original_duration_ns,
             initial_cluster_pos,
-            end_cluster_pos,
+            end_cluster_pos: None,
             finished: false,
         })
     }
@@ -184,412 +180,50 @@ impl FileSource {
         Some((start_pos, end_pos))
     }
 
-    /// Read only the Cluster timestamp at a given file position without parsing
-    /// any block data. Reads ~10-20 bytes instead of potentially megabytes.
-    /// Returns (timestamp_ns, position_after_this_cluster).
-    fn read_cluster_timestamp_at(&mut self, pos: u64) -> Result<(u64, u64)> {
-        self.file.seek(SeekFrom::Start(pos))?;
-        let header = Header::read_from(&mut self.file)?;
-        if header.id != Cluster::ID {
-            return Err(Error::InvalidConfig(format!(
-                "Expected Cluster at position {}, found ID: {:x}",
-                pos, header.id.value
-            )));
-        }
-
-        let body_start = self.file.stream_position()?;
-        let next_element_pos = if header.size.is_unknown {
-            // Can't determine end for unknown-size clusters;
-            // return body_start as a fallback (caller should use scan_to_next_cluster)
-            None
-        } else {
-            Some(body_start + header.size.value)
-        };
-
-        // The Timestamp child (ID 0xE7) is specified to be the first or second
-        // child element of a Cluster. Scan at most 5 children to be safe.
-        for _ in 0..5 {
-            if let Some(end) = next_element_pos {
-                if self.file.stream_position()? >= end {
-                    break;
-                }
-            }
-            let child_header = match Header::read_from(&mut self.file) {
-                Ok(h) => h,
-                Err(_) => break,
-            };
-            if child_header.id == Timestamp::ID {
-                let ts = Timestamp::read_element(&child_header, &mut self.file)?;
-                let timestamp_ns = ts.0 * self.timecode_scale;
-                let after = next_element_pos.unwrap_or_else(|| self.file.stream_position().unwrap_or(pos));
-                return Ok((timestamp_ns, after));
-            }
-            // Skip this child
-            if child_header.size.value > 0 && !child_header.size.is_unknown {
-                self.file.seek(SeekFrom::Current(child_header.size.value as i64))?;
-            } else {
-                break;
-            }
-        }
-
-        // Timestamp not found (shouldn't happen in valid MKV), default to 0
-        let after = next_element_pos.unwrap_or(self.file.stream_position().unwrap_or(pos));
-        Ok((0, after))
-    }
-
-    /// Scan forward from `from` looking for the 4-byte Cluster EBML ID pattern
-    /// (0x1F 0x43 0xB6 0x75). Returns the file position of the Cluster header,
-    /// or None if not found before `limit`.
-    /// Scan backward from `from` (exclusive) toward `limit` (a lower bound), looking
-    /// for the 4-byte Cluster ID `0x1F43B675`. Returns the file position of the last
-    /// byte of the ID (i.e. the start of the cluster element) if found.
-    fn scan_to_prev_cluster(&mut self, from: u64, limit: u64) -> Result<Option<u64>> {
-        const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
-        const BUF_SIZE: usize = 8192;
-
-        let mut end = from; // we read [start, end)
-        loop {
-            if end <= limit {
-                break;
-            }
-            let start = end.saturating_sub(BUF_SIZE as u64).max(limit);
-            let len = (end - start) as usize;
-            let mut buf = vec![0u8; len];
-            self.file.seek(SeekFrom::Start(start))?;
-            self.file.read_exact(&mut buf)?;
-
-            // Search the buffer from right to left for the ID
-            for i in (0..len.saturating_sub(3)).rev() {
-                if buf[i..i + 4] == CLUSTER_ID {
-                    return Ok(Some(start + i as u64));
-                }
-            }
-            end = start;
-        }
-        Ok(None)
-    }
-
-    fn scan_to_next_cluster(&mut self, from: u64, limit: u64) -> Result<Option<u64>> {
-        self.file.seek(SeekFrom::Start(from))?;
-
-        const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
-        const BUF_SIZE: usize = 8192;
-        let mut buf = [0u8; BUF_SIZE];
-        let mut file_pos = from;
-        let mut matched = 0usize;
-
-        while file_pos < limit {
-            let to_read = ((limit - file_pos) as usize).min(BUF_SIZE);
-            let n = self.file.read(&mut buf[..to_read])?;
-            if n == 0 {
-                break;
-            }
-
-            for i in 0..n {
-                if buf[i] == CLUSTER_ID[matched] {
-                    matched += 1;
-                    if matched == 4 {
-                        // Pattern matched; cluster header starts 3 bytes before current
-                        let cluster_pos = file_pos + i as u64 - 3;
-                        return Ok(Some(cluster_pos));
-                    }
-                } else if buf[i] == CLUSTER_ID[0] {
-                    matched = 1;
-                } else {
-                    matched = 0;
-                }
-            }
-
-            file_pos += n as u64;
-        }
-
-        Ok(None)
-    }
-
-    /// Sequentially scan from a known element boundary, reading only headers and
-    /// Cluster timestamps, skipping all block data. Returns a small Vec of
-    /// (file_position, timestamp_ns) for clusters in the range [from, limit).
-    fn collect_clusters_in_range(&mut self, from: u64, limit: u64) -> Result<Vec<(u64, u64)>> {
-        let mut clusters = Vec::new();
-        let mut pos = from;
-
-        loop {
-            if pos >= limit {
-                break;
-            }
-            self.file.seek(SeekFrom::Start(pos))?;
-
-            let header = match Header::read_from(&mut self.file) {
-                Ok(h) => h,
-                Err(_) => break,
-            };
-
-            let body_start = self.file.stream_position()?;
-
-            if header.id == Cluster::ID {
-                // Read only the Timestamp child, skip everything else
-                let mut timestamp_ticks = 0u64;
-                let body_end = if header.size.is_unknown {
-                    None
-                } else {
-                    Some(body_start + header.size.value)
-                };
-
-                for _ in 0..5 {
-                    if let Some(end) = body_end {
-                        if self.file.stream_position()? >= end {
-                            break;
-                        }
-                    }
-                    let child_h = match Header::read_from(&mut self.file) {
-                        Ok(h) => h,
-                        Err(_) => break,
-                    };
-                    if child_h.id == Timestamp::ID {
-                        if let Ok(ts) = Timestamp::read_element(&child_h, &mut self.file) {
-                            timestamp_ticks = ts.0;
-                        }
-                        break;
-                    }
-                    if child_h.size.value > 0 && !child_h.size.is_unknown {
-                        self.file.seek(SeekFrom::Current(child_h.size.value as i64))?;
-                    } else {
-                        break;
-                    }
-                }
-
-                clusters.push((pos, timestamp_ticks * self.timecode_scale));
-
-                // Skip past this cluster's body
-                if let Some(end) = body_end {
-                    pos = end;
-                } else {
-                    // Unknown-size cluster: fall back to byte-scanning for the next one
-                    match self.scan_to_next_cluster(body_start, limit)? {
-                        Some(next) => pos = next,
-                        None => break,
-                    }
-                }
-            } else if header.size.value > 0 && !header.size.is_unknown {
-                // Non-cluster element: skip its body
-                pos = body_start + header.size.value;
-            } else {
-                break;
-            }
-        }
-
-        Ok(clusters)
-    }
-
-    /// Find cluster position using binary search directly on the file.
-    ///
-    /// Instead of linearly reading every cluster body to build an index, this
-    /// performs O(log n) seeks into the file, scanning forward from each midpoint
-    /// for the 4-byte Cluster ID and reading only the ~10-byte Timestamp element.
-    /// Once the range is small enough, a sequential header-level scan collects the
-    /// remaining candidates.
-    fn find_cluster_by_binary_search(
-        &mut self,
-        target_timestamp_ns: u64,
-        is_start: bool,
-    ) -> Result<u64> {
-        // Try to narrow the initial search range using Cues
-        let (start_pos, end_pos) = if let Some((start, end)) = self.find_cluster_range_from_cues(target_timestamp_ns) {
-            trace!("Using Cues to narrow cluster search: start_pos={}, end_pos={:?}", start, end);
-            (Some(start), end)
-        } else {
-            trace!("No Cues available, searching all clusters");
-            (None, None)
-        };
-
-        let mut lo = start_pos.unwrap_or(self.initial_cluster_pos.position);
-        let file_len = self.file.metadata()?.len();
-        let mut hi = end_pos.unwrap_or(file_len);
-
-        // Phase 1: Binary search on file byte positions.
-        // Each iteration reads ~10 bytes (scan for 4-byte ID + read header + timestamp)
-        // instead of parsing megabytes of block data per cluster.
-        while hi.saturating_sub(lo) > 1_048_576 {
-            let mid = lo + (hi - lo) / 2;
-            match self.scan_to_next_cluster(mid, hi)? {
-                Some(cluster_pos) => {
-                    match self.read_cluster_timestamp_at(cluster_pos) {
-                        Ok((ts, _)) => {
-                            if ts <= target_timestamp_ns {
-                                lo = cluster_pos;
-                            } else {
-                                hi = cluster_pos;
-                            }
-                        }
-                        Err(_) => {
-                            // Invalid cluster (false positive from byte scan), narrow from above
-                            hi = cluster_pos;
-                        }
-                    }
-                }
-                None => {
-                    // No cluster between mid and hi
-                    hi = mid;
-                }
-            }
-        }
-
-        // Phase 2: Sequential scan of the remaining ≤1 MB range.
-        // Reads element headers and Cluster timestamps only — block data is skipped.
-        let cluster_index = self.collect_clusters_in_range(lo, hi)?;
-
-        if cluster_index.is_empty() {
-            return Err(Error::InvalidConfig("No clusters found".to_string()));
-        }
-
-        // Find the best cluster for the target timestamp
-        let result = cluster_index.binary_search_by_key(&target_timestamp_ns, |(_, ts)| *ts);
-
-        let cluster_idx = match result {
-            Ok(idx) => idx,
-            Err(idx) => {
-                if idx == 0 {
-                    0
-                } else if is_start {
-                    idx - 1
-                } else {
-                    idx.min(cluster_index.len() - 1)
-                }
-            }
-        };
-
-        // Phase 3: Ping-pong search — alternate one step backward, one step forward
-        // from the anchor cluster, so the first keyframe we find is the closest one.
-        // Stops once both directions have exceeded ±60 s from the anchor timestamp.
-        const KEYFRAME_WINDOW_NS: u64 = 60_000_000_000;
-        let video_track_numbers = self.tracks.get_all_video_tracks();
-        if let Some(&video_track_num) = video_track_numbers.first() {
-            let anchor_pos = cluster_index[cluster_idx].0;
-            let anchor_ts  = cluster_index[cluster_idx].1;
-            let back_limit_ts = anchor_ts.saturating_sub(KEYFRAME_WINDOW_NS);
-            let fwd_limit_ts  = anchor_ts.saturating_add(KEYFRAME_WINDOW_NS);
-            let file_len = self.file.metadata()?.len();
-            let file_start = self.initial_cluster_pos.position;
-
-            // Current backward/forward cursor positions
-            let mut back_pos: Option<u64> = Some(anchor_pos);
-            let mut fwd_pos: Option<u64> = Some(anchor_pos);
-            let mut back_exhausted = false;
-            let mut fwd_exhausted = false;
-            let mut first_iteration = true;
-
-            loop {
-                if back_exhausted && fwd_exhausted {
-                    break;
-                }
-
-                // --- backward step ---
-                if let Some(cur) = back_pos {
-                    if !back_exhausted {
-                        // On first iteration, check the anchor itself; after that scan to prev
-                        let check_pos = if first_iteration {
-                            Some(cur)
-                        } else {
-                            match self.scan_to_prev_cluster(cur, file_start)? {
-                                Some(prev) if prev < cur => Some(prev),
-                                _ => None,
-                            }
-                        };
-
-                        match check_pos {
-                            Some(pos) => {
-                                self.file.seek(SeekFrom::Start(pos))?;
-                                match Header::read_from(&mut self.file)
-                                    .ok()
-                                    .filter(|h| h.id == Cluster::ID)
-                                    .map(|h| Cluster::read_element(&h, &mut self.file))
-                                {
-                                    Some(Ok(cluster)) => {
-                                        let ts = cluster.timestamp.0 * self.timecode_scale;
-                                        if cluster.has_keyframes(video_track_num) {
-                                            return Ok(pos);
-                                        }
-                                        if ts < back_limit_ts {
-                                            back_exhausted = true;
-                                        }
-                                        back_pos = Some(pos);
-                                    }
-                                    // False positive or corrupt cluster — skip it
-                                    Some(Err(_)) => { back_pos = Some(pos); }
-                                    None => back_exhausted = true,
-                                }
-                            }
-                            None => back_exhausted = true,
-                        }
-                    }
-                }
-
-                // --- forward step ---
-                if let Some(cur) = fwd_pos {
-                    if !fwd_exhausted {
-                        // On first iteration the anchor was already checked above, skip it
-                        let check_pos = if first_iteration {
-                            // find the cluster right after the anchor
-                            match self.scan_to_next_cluster(cur + 1, file_len)? {
-                                Some(next) if next > cur => Some(next),
-                                _ => None,
-                            }
-                        } else {
-                            match self.scan_to_next_cluster(cur + 1, file_len)? {
-                                Some(next) if next > cur => Some(next),
-                                _ => None,
-                            }
-                        };
-
-                        match check_pos {
-                            Some(pos) => {
-                                self.file.seek(SeekFrom::Start(pos))?;
-                                match Header::read_from(&mut self.file)
-                                    .ok()
-                                    .filter(|h| h.id == Cluster::ID)
-                                    .map(|h| Cluster::read_element(&h, &mut self.file))
-                                {
-                                    Some(Ok(cluster)) => {
-                                        let ts = cluster.timestamp.0 * self.timecode_scale;
-                                        if cluster.has_keyframes(video_track_num) {
-                                            return Ok(pos);
-                                        }
-                                        if ts > fwd_limit_ts {
-                                            fwd_exhausted = true;
-                                        }
-                                        fwd_pos = Some(pos);
-                                    }
-                                    // False positive or corrupt cluster — skip it
-                                    Some(Err(_)) => { fwd_pos = Some(pos); }
-                                    None => fwd_exhausted = true,
-                                }
-                            }
-                            None => fwd_exhausted = true,
-                        }
-                    }
-                }
-
-                first_iteration = false;
-            }
-        }
-
-        Ok(cluster_index[cluster_idx].0)
-    }
-
     fn find_start_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
-        let pos = self.find_cluster_by_binary_search(target_timestamp_ns, true)?;
-        self.initial_cluster_pos.set_pos(pos);
+        let file_len = self.file.metadata()?.len();
+        let range = match self.find_cluster_range_from_cues(target_timestamp_ns) {
+            Some((start, end)) => {
+                trace!("Using Cues to narrow start cluster search: start_pos={}, end_pos={:?}", start, end);
+                (start, end.unwrap_or(file_len))
+            }
+            None => {
+                trace!("No Cues available, searching all clusters for start");
+                (self.initial_cluster_pos.position, file_len)
+            }
+        };
+        self.initial_cluster_pos = KeyframePositionCache::new(
+            self.file.try_clone()?,
+            self.timecode_scale,
+            target_timestamp_ns as i64,
+            Some(range),
+        )?;
         Ok(())
     }
     
     fn find_end_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
-        let pos = self.find_cluster_by_binary_search(target_timestamp_ns, false)?;
-        self.end_cluster_pos.set_pos(pos);
+        let file_len = self.file.metadata()?.len();
+        let range = match self.find_cluster_range_from_cues(target_timestamp_ns) {
+            Some((start, end)) => {
+                trace!("Using Cues to narrow end cluster search: start_pos={}, end_pos={:?}", start, end);
+                (start, end.unwrap_or(file_len))
+            }
+            None => {
+                trace!("No Cues available, searching all clusters for end");
+                (self.initial_cluster_pos.position, file_len)
+            }
+        };
+        self.end_cluster_pos = Some(KeyframePositionCache::new(
+            self.file.try_clone()?,
+            self.timecode_scale,
+            target_timestamp_ns as i64,
+            Some(range),
+        )?);
         Ok(())
     }
 
     fn process_cluster_for_cut(&mut self, mut cluster: Cluster) -> Result<Cluster> {
-        if self.input_cut_interval.start_ns.is_none() && self.input_cut_interval.end_ns.is_none() {
+        if self.initial_cluster_pos.get_timestamp_ns() == 0 && self.end_cluster_pos.is_none() {
             return Ok(cluster); // no cutting needed, just return original cluster
         }
 
@@ -602,38 +236,38 @@ impl FileSource {
         let shift_reference = match self.seek_type {
             SeekType::SnapNearestKeyframe(video_track_num) => {
                     self.initial_cluster_pos
-                        .get_closest_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64)?
+                        .get_closest_keyframe_timestamp_ns(video_track_num)?
             }
             SeekType::SnapPreviousKeyframe(video_track_num) => {
                 self.initial_cluster_pos
-                    .get_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64, false)?
+                    .get_keyframe_timestamp_ns(video_track_num, false)?
             }
             SeekType::SnapNextKeyframe(video_track_num) => {
                 self.initial_cluster_pos
-                    .get_keyframe_timestamp_ns(video_track_num, self.input_cut_interval.start_ns.unwrap_or(0) as i64, true)?
+                    .get_keyframe_timestamp_ns(video_track_num, true)?
             }
             _ => {
-                self.input_cut_interval.start_ns.unwrap_or(0) as i64
+                self.initial_cluster_pos.get_timestamp_ns()
             }
         };
-        let actual_end_pos = match self.input_cut_interval.end_ns {
-            Some(end_ns) => match self.seek_type {
+        let actual_end_pos = match &mut self.end_cluster_pos {
+            Some(end_pos) => match self.seek_type {
                 SeekType::SnapNearestKeyframe(video_track_num) => {
-                    Some(self.end_cluster_pos
-                        .get_closest_keyframe_timestamp_ns(video_track_num, end_ns as i64)?
+                    Some(end_pos
+                        .get_closest_keyframe_timestamp_ns(video_track_num)?
                     )
                 }
                 SeekType::SnapPreviousKeyframe(video_track_num) => {
-                    Some(self.end_cluster_pos
-                        .get_keyframe_timestamp_ns(video_track_num, end_ns as i64, false)?
+                    Some(end_pos
+                        .get_keyframe_timestamp_ns(video_track_num, false)?
                     )
                 }
                 SeekType::SnapNextKeyframe(video_track_num) => {
-                    Some(self.end_cluster_pos
-                        .get_keyframe_timestamp_ns(video_track_num, end_ns as i64, true)?
+                    Some(end_pos
+                        .get_keyframe_timestamp_ns(video_track_num, true)?
                     )
                 }
-                _ => Some(end_ns as i64),
+                _ => Some(end_pos.get_timestamp_ns()),
             },
             None => None,
         };
@@ -665,7 +299,13 @@ impl FileSource {
                         cluster.timestamp.0 as i64,
                         self.output_timecode_scale,
                     )?;
-                    trace!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", block.timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?, abs_ns, self.input_cut_interval.end_ns, shift_reference);
+                    trace!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", 
+                        block.timestamp_ns(cluster.timestamp.0 as i64, 
+                        self.output_timecode_scale,)?, 
+                        abs_ns, 
+                        self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns()), 
+                        shift_reference
+                    );
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
@@ -675,25 +315,22 @@ impl FileSource {
                 // Drop frames outside range
                 for mut block in cluster.blocks {
                     let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
-                    let abs_ns = abs_ns as u64;
-                    if let Some(start) = self.input_cut_interval.start_ns {
-                        if abs_ns < start {
-                            continue;
-                        }
+                    let start = self.initial_cluster_pos.get_timestamp_ns();
+                    if abs_ns  < start {
+                        continue;
                     }
-                    if let Some(end) = self.input_cut_interval.end_ns {
+                    if let Some(end) = &self.end_cluster_pos {
+                        let end = end.get_timestamp_ns();
                         if abs_ns > end {
                             continue;
                         }
                     }
-                    if let Some(start) = self.input_cut_interval.start_ns {
-                        let offset = abs_ns as i64 - start as i64;
-                        block.set_timestamp_ns(
-                            offset,
-                            cluster.timestamp.0 as i64,
-                            self.output_timecode_scale,
-                        )?;
-                    }
+                    let offset = abs_ns as i64 - start as i64;
+                    block.set_timestamp_ns(
+                        offset,
+                        cluster.timestamp.0 as i64,
+                        self.output_timecode_scale,
+                    )?;
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
@@ -710,8 +347,8 @@ impl FileSource {
                     "Cluster filtering removed all {} blocks (cluster_ns={}, start_ns={:?}, end_ns={:?})",
                     orig_block_count,
                     orig_cluster_ns,
-                    self.input_cut_interval.start_ns,
-                    self.input_cut_interval.end_ns
+                    self.initial_cluster_pos.get_timestamp_ns(),
+                    self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns())
                 );
             }
         }
@@ -740,35 +377,26 @@ impl FileSource {
             match kind {
                 TrackKind::Video => {
                     // Drop after end
-                    if let Some(end) = self.input_cut_interval.end_ns {
-                        if abs_ns > end as i64 {
+                    if let Some(end_pos) = &self.end_cluster_pos {
+                        if abs_ns > end_pos.get_timestamp_ns() as i64 {
                             continue;
                         }
                     }
-                    if let Some(start) = self.input_cut_interval.start_ns {
-                        if abs_ns < start as i64 {
-                            // Pre-roll: squeeze to time 0 and mark invisible
-                            block.set_timestamp_ns(
-                                0,
-                                shifted_cluster_ticks,
-                                self.output_timecode_scale,
-                            )?;
-                            block.set_invisible(true)?;
-                            trace!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
-                        } else if let Some(end) = self.input_cut_interval.end_ns {
-                            if abs_ns > end as i64 {
-                                continue; // Drop post-roll for now (could squeeze at end)
-                            } else {
-                                // Main content: shift by squeeze window
-                                let offset = abs_ns - start as i64;
-                                block.set_timestamp_ns(
-                                    offset,
-                                    shifted_cluster_ticks,
-                                    self.output_timecode_scale,
-                                )?;
-                            }
+                    let start = self.initial_cluster_pos.get_timestamp_ns();
+                    if abs_ns < start as i64 {
+                        // Pre-roll: squeeze to time 0 and mark invisible
+                        block.set_timestamp_ns(
+                            0,
+                            shifted_cluster_ticks,
+                            self.output_timecode_scale,
+                        )?;
+                        block.set_invisible(true)?;
+                        trace!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
+                    } else if let Some(end_pos) = &self.end_cluster_pos {
+                        if abs_ns > end_pos.get_timestamp_ns() as i64 {
+                            continue; // Drop post-roll for now (could squeeze at end)
                         } else {
-                            // No end: just shift by squeeze window
+                            // Main content: shift by squeeze window
                             let offset = abs_ns - start as i64;
                             block.set_timestamp_ns(
                                 offset,
@@ -776,17 +404,25 @@ impl FileSource {
                                 self.output_timecode_scale,
                             )?;
                         }
+                    } else {
+                        // No end: just shift by squeeze window
+                        let offset = abs_ns - start as i64;
+                        block.set_timestamp_ns(
+                            offset,
+                            shifted_cluster_ticks,
+                            self.output_timecode_scale,
+                        )?;
                     }
                 }
                 _ => {
                     // Other tracks: just shift timestamps
                     // Drop after end
-                    if let Some(end) = self.input_cut_interval.end_ns {
-                        if abs_ns > end as i64 {
+                    if let Some(end_pos) = &self.end_cluster_pos {
+                        if abs_ns > end_pos.get_timestamp_ns() as i64 {
                             continue;
                         }
                     }
-                    if let Some(start) = self.input_cut_interval.start_ns {
+                    let start = self.initial_cluster_pos.get_timestamp_ns(); {
                         // Drop  before start (pre-roll is video-only)
                         if abs_ns < start as i64 {
                             continue;
@@ -866,9 +502,9 @@ impl Source for FileSource {
                 };
 
                 // Check if we should stop based on end time
-                if let Some(end_ns) = self.input_cut_interval.end_ns {
-                    if cluster.get_timestamp_ns(self.timecode_scale) > end_ns {
-                        trace!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ns(self.timecode_scale), end_ns);
+                if let Some(end_pos) = &self.end_cluster_pos {
+                    if cluster.get_timestamp_ns(self.timecode_scale) as i64 > end_pos.get_timestamp_ns() {
+                        trace!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ns(self.timecode_scale), end_pos.get_timestamp_ns());
                         self.finished = true;
                         return Ok(None);
                     }
@@ -931,20 +567,17 @@ impl Source for FileSource {
             self.find_end_cluster(end)?;
         }
 
-        self.input_cut_interval = cut_interval;
         self.seek_type = seek_type;
 
         let output_interval: CutInterval = match self.seek_type {
             SeekType::SnapNearestKeyframe(video_track_num) => {
                 let actual_start_ns = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
                     video_track_num,
-                    self.input_cut_interval.start_ns.unwrap_or(0) as i64,
                 )?;
-                let actual_end_ns = if let Some(end_ns) = self.input_cut_interval.end_ns {
+                let actual_end_ns = if let Some(end_pos) = & mut self.end_cluster_pos {
                     Some(
-                        self.end_cluster_pos.get_closest_keyframe_timestamp_ns(
+                        end_pos.get_closest_keyframe_timestamp_ns(
                             video_track_num,
-                            end_ns as i64,
                         )? as u64
                     )
                 } else {
@@ -958,14 +591,12 @@ impl Source for FileSource {
             SeekType::SnapPreviousKeyframe(video_track_num) => {
                 let actual_start_ns = self.initial_cluster_pos.get_keyframe_timestamp_ns(
                     video_track_num,
-                    self.input_cut_interval.start_ns.unwrap_or(0) as i64,
                     false,
                 )?;
-                let actual_end_ns = if let Some(end_ns) = self.input_cut_interval.end_ns {
+                let actual_end_ns = if let Some(end_pos) = &mut self.end_cluster_pos {
                     Some(
-                        self.end_cluster_pos.get_keyframe_timestamp_ns(
+                        end_pos.get_keyframe_timestamp_ns(
                             video_track_num,
-                            end_ns as i64,
                             false,
                         )? as u64
                     )
@@ -980,14 +611,12 @@ impl Source for FileSource {
             SeekType::SnapNextKeyframe(video_track_num) => {
                 let actual_start_ns = self.initial_cluster_pos.get_keyframe_timestamp_ns(
                     video_track_num,
-                    self.input_cut_interval.start_ns.unwrap_or(0) as i64,
                     true,
                 )?;
-                let actual_end_ns = if let Some(end_ns) = self.input_cut_interval.end_ns {
+                let actual_end_ns = if let Some(end_pos) = & mut self.end_cluster_pos {
                     Some(
-                        self.end_cluster_pos.get_keyframe_timestamp_ns(
+                        end_pos.get_keyframe_timestamp_ns(
                             video_track_num,
-                            end_ns as i64,
                             true,
                         )? as u64
                     )
@@ -1001,8 +630,8 @@ impl Source for FileSource {
             }
             SeekType::DirtyCut | SeekType::Squeeze => {
                 CutInterval {
-                    start_ns: self.input_cut_interval.start_ns.or(Some(0)),
-                    end_ns: self.input_cut_interval.end_ns.or_else(|| self.original_duration_ns),
+                    start_ns: Some(self.initial_cluster_pos.get_timestamp_ns().max(0) as u64),
+                    end_ns: self.end_cluster_pos.as_ref().map(|end_pos| end_pos.get_timestamp_ns().max(0) as u64).or_else(|| self.original_duration_ns),
                 }
             }
         };
