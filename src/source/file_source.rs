@@ -616,6 +616,27 @@ impl FileSource {
                 self.input_cut_interval.start_ns.unwrap_or(0) as i64
             }
         };
+        let actual_end_pos = match self.input_cut_interval.end_ns {
+            Some(end_ns) => match self.seek_type {
+                SeekType::SnapNearestKeyframe(video_track_num) => {
+                    Some(self.end_cluster_pos
+                        .get_closest_keyframe_timestamp_ns(video_track_num, end_ns as i64)?
+                    )
+                }
+                SeekType::SnapPreviousKeyframe(video_track_num) => {
+                    Some(self.end_cluster_pos
+                        .get_keyframe_timestamp_ns(video_track_num, end_ns as i64, false)?
+                    )
+                }
+                SeekType::SnapNextKeyframe(video_track_num) => {
+                    Some(self.end_cluster_pos
+                        .get_keyframe_timestamp_ns(video_track_num, end_ns as i64, true)?
+                    )
+                }
+                _ => Some(end_ns as i64),
+            },
+            None => None,
+        };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
         cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
         let shifted_cluster_ticks = cluster.timestamp.0 as i64;
@@ -628,8 +649,8 @@ impl FileSource {
                 let mut filtered = Vec::with_capacity(cluster.blocks.len());
                 for mut block in cluster.blocks {
                     let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
-                    if let Some(end) = self.input_cut_interval.end_ns {
-                        if abs_ns as u64 > end {
+                    if let Some(end) = actual_end_pos {
+                        if abs_ns > end {
                             //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
                             continue;
                         }
