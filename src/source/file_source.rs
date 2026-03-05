@@ -344,7 +344,7 @@ impl FileSource {
     }
 
     fn process_squeeze_cluster(
-        &self,
+        &mut self,
         mut cluster: Cluster,
         orig_cluster_ticks: i64,
         shifted_cluster_ticks: i64,
@@ -363,13 +363,21 @@ impl FileSource {
 
             match kind {
                 TrackKind::Video => {
+                    let start = self.initial_cluster_pos.get_timestamp_ns();
+                    let last_keyframe_before_start_timestamp =  self.initial_cluster_pos.get_keyframe_timestamp_ns(track_num, false)?;
+
+                    // drop before last keyframe before start (before pre-roll is video-only)
+                    if abs_ns < last_keyframe_before_start_timestamp as i64 {
+                        continue;
+                    }
+
                     // Drop after end
                     if let Some(end_pos) = &self.end_cluster_pos {
                         if abs_ns > end_pos.get_timestamp_ns() as i64 {
                             continue;
                         }
                     }
-                    let start = self.initial_cluster_pos.get_timestamp_ns();
+                    
                     if abs_ns < start as i64 {
                         // Pre-roll: squeeze to time 0 and mark invisible
                         block.set_timestamp_ns(
@@ -379,18 +387,6 @@ impl FileSource {
                         )?;
                         block.set_invisible(true)?;
                         trace!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
-                    } else if let Some(end_pos) = &self.end_cluster_pos {
-                        if abs_ns > end_pos.get_timestamp_ns() as i64 {
-                            continue; // Drop post-roll for now (could squeeze at end)
-                        } else {
-                            // Main content: shift by squeeze window
-                            let offset = abs_ns - start as i64;
-                            block.set_timestamp_ns(
-                                offset,
-                                shifted_cluster_ticks,
-                                self.output_timecode_scale,
-                            )?;
-                        }
                     } else {
                         // No end: just shift by squeeze window
                         let offset = abs_ns - start as i64;
@@ -629,9 +625,11 @@ impl Source for FileSource {
             }
             SeekType::Squeeze => {
                 let video_track_nums = self.tracks.get_all_video_tracks();
+                println!("Video track numbers: {:?}", video_track_nums);
                 let mut earliest_keyframe_cluster_pos = self.initial_cluster_pos.position;
                 for track_num in video_track_nums {
                     let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(track_num, false)?;
+                    //println!("Track {}, keyframe cluster position: {} original position: {}", track_num, keyframe_cluster_pos, self.initial_cluster_pos.position);
                     if keyframe_cluster_pos < earliest_keyframe_cluster_pos {
                         earliest_keyframe_cluster_pos = keyframe_cluster_pos;
                     }
@@ -650,8 +648,8 @@ impl Source for FileSource {
     }
 
     fn start_remuxing(&mut self) -> Result<()> {
-        self.file
-            .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
+        // dont seek here bc we already seeked to the correct position in initialize() or cut()
         Ok(())
     }
+    
 }
