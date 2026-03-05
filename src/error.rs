@@ -1,3 +1,4 @@
+use std::f32::consts::E;
 use std::fmt;
 use std::io;
 
@@ -12,6 +13,8 @@ pub enum Error {
 
     /// mkv_element library error
     MkvElement(mkv_element::Error),
+
+    InvalidFilePos(String),
 
     /// Track not found with the specified number
     TrackNotFound(u64),
@@ -30,6 +33,8 @@ pub enum Error {
         target_ns: u64,
         reason: String,
     },
+
+    NotFound(String),
 
     /// Invalid configuration
     InvalidConfig(String),
@@ -71,6 +76,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(err) => write!(f, "IO error: {}", err),
             Error::MkvElement(err) => write!(f, "MKV element error: {}", err),
+            Error::InvalidFilePos(msg) => write!(f, "Invalid file position: {}", msg),
             Error::TrackNotFound(num) => write!(f, "Track #{} not found", num),
             Error::NoTracksOfType(track_type) => {
                 write!(f, "No tracks of type '{}' found", track_type)
@@ -80,6 +86,7 @@ impl fmt::Display for Error {
             Error::SeekFailed { target_ns, reason } => {
                 write!(f, "Seek to {} ns failed: {}", target_ns, reason)
             }
+            Error::NotFound(msg) => write!(f, "Not found: {}", msg),
             Error::InvalidConfig(msg) => write!(f, "Invalid configuration: {}", msg),
             Error::TrackMappingError(msg) => write!(f, "Track mapping error: {}", msg),
             Error::UnsupportedCodec { codec_id, reason } => {
@@ -133,6 +140,11 @@ impl Error {
     /// Create a missing element error
     pub fn missing_element(name: impl Into<String>) -> Self {
         Error::MissingElement(name.into())
+    }
+
+    /// Create a not found error
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Error::NotFound(msg.into())
     }
 
     /// Create an invalid timestamp error

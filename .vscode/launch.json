@@ -46,6 +46,22 @@
                 }
             },
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run Cargo Tests",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=mkv_remuxer"
+                ],
+                "filter": {
+                    "kind": "test"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
         }
     ]
 }

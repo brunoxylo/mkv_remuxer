@@ -36,22 +36,12 @@ impl FileSource {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_string_lossy().to_string();
 
-        // Determine expected DocType from file extension
-        let ext_expected_doctype = path_ref
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| match e.to_lowercase().as_str() {
-                "webm" => Some("webm"),
-                "mkv" | "mka" | "mks" => Some("matroska"),
-                _ => None,
-            })
-            .flatten();
 
         let mut file = File::open(path_ref)?;
 
         // Read EBML header
         let ebml_header = Header::read_from(&mut file)?;
-        let ebml = Ebml::read_element(&ebml_header, &mut file)?;
+        let _ebml = Ebml::read_element(&ebml_header, &mut file)?;
 
 
         // Read Segment header
@@ -76,7 +66,7 @@ impl FileSource {
             let header = match Header::read_from(&mut file) {
                 Ok(h) => h,
                 Err(e) => {
-                    return Err(Error::MkvElement(e));
+                    return Err(Error::InvalidFilePos(format!("header could not be loaded during init: {}", e)));
                 }
             };
 
@@ -109,9 +99,6 @@ impl FileSource {
 
         let initial_cluster_pos = initial_cluster_pos
             .ok_or_else(|| Error::InvalidConfig("No clusters found".to_string()))?;
-
-        // Initialize end_cluster_pos at the same position as initial, will be updated during initialize_with_cut
-        let file_len = file.metadata()?.len();
         
 
         let original_duration_ns = info
@@ -195,7 +182,7 @@ impl FileSource {
         self.initial_cluster_pos = KeyframePositionCache::new(
             self.file.try_clone()?,
             self.timecode_scale,
-            target_timestamp_ns as i64,
+            target_timestamp_ns,
             Some(range),
         )?;
         Ok(())
@@ -216,7 +203,7 @@ impl FileSource {
         self.end_cluster_pos = Some(KeyframePositionCache::new(
             self.file.try_clone()?,
             self.timecode_scale,
-            target_timestamp_ns as i64,
+            target_timestamp_ns,
             Some(range),
         )?);
         Ok(())
@@ -569,11 +556,20 @@ impl Source for FileSource {
 
         self.seek_type = seek_type;
 
+        // resolve the original cut position by filling in the duration and setting the start
+        let cut_resolved = CutInterval {
+                    start_ns: Some(self.initial_cluster_pos.get_timestamp_ns().max(0) as u64),
+                    end_ns: self.end_cluster_pos.as_ref().map(|end_pos| end_pos.get_timestamp_ns().max(0) as u64).or_else(|| self.original_duration_ns),
+                };
+
         let output_interval: CutInterval = match self.seek_type {
             SeekType::SnapNearestKeyframe(video_track_num) => {
                 let actual_start_ns = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
                     video_track_num,
                 )?;
+                // seek to cluster of the last keyframe to preserve all frames
+                let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(video_track_num, false)?;
+                self.file.seek(SeekFrom::Start(keyframe_cluster_pos))?;
                 let actual_end_ns = if let Some(end_pos) = & mut self.end_cluster_pos {
                     Some(
                         end_pos.get_closest_keyframe_timestamp_ns(
@@ -593,6 +589,9 @@ impl Source for FileSource {
                     video_track_num,
                     false,
                 )?;
+                // seek to cluster of the last keyframe to preserve all frames
+                let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(video_track_num, false)?;
+                self.file.seek(SeekFrom::Start(keyframe_cluster_pos))?;
                 let actual_end_ns = if let Some(end_pos) = &mut self.end_cluster_pos {
                     Some(
                         end_pos.get_keyframe_timestamp_ns(
@@ -628,11 +627,21 @@ impl Source for FileSource {
                     end_ns: actual_end_ns,
                 }
             }
-            SeekType::DirtyCut | SeekType::Squeeze => {
-                CutInterval {
-                    start_ns: Some(self.initial_cluster_pos.get_timestamp_ns().max(0) as u64),
-                    end_ns: self.end_cluster_pos.as_ref().map(|end_pos| end_pos.get_timestamp_ns().max(0) as u64).or_else(|| self.original_duration_ns),
+            SeekType::Squeeze => {
+                let video_track_nums = self.tracks.get_all_video_tracks();
+                let mut earliest_keyframe_cluster_pos = self.initial_cluster_pos.position;
+                for track_num in video_track_nums {
+                    let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(track_num, false)?;
+                    if keyframe_cluster_pos < earliest_keyframe_cluster_pos {
+                        earliest_keyframe_cluster_pos = keyframe_cluster_pos;
+                    }
                 }
+                // seek to the earliest keyframe cluster to preserve all frames, bc we dont know which track are picked we use the earliest cluster among all video tracks
+                self.file.seek(SeekFrom::Start(earliest_keyframe_cluster_pos))?;
+                cut_resolved
+            }
+            SeekType::DirtyCut => {
+                cut_resolved
             }
         };
         self.output_interval = output_interval.clone();

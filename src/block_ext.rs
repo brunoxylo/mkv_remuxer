@@ -161,6 +161,7 @@ impl ClusterExt for Cluster {
                             if let Ok(block_ts_ns) =
                                 block.timestamp_ns(self.timestamp.0 as i64, timecode_scale)
                             {
+                                println!("Block {}: timestamp {} ns, reference {}", i, block_ts_ns, timestamp_ns);
                                 if block_ts_ns <= timestamp_ns {
                                     return Some((i, block_ts_ns));
                                 }
@@ -202,7 +203,7 @@ impl ClusterExt for Cluster {
         file.seek(SeekFrom::Start(file_pos))?;
         let header = match Header::read_from(file) {
             Ok(h) => h,
-            Err(e) => return Err(Error::MkvElement(e)),
+            Err(e) => return Err(Error::InvalidFilePos(format!("Cluster header could not be read - wrong position? {}", e))),
         };
 
         if header.id == Cluster::ID {
@@ -210,7 +211,7 @@ impl ClusterExt for Cluster {
             file.seek(SeekFrom::Start(old_pos))?;
             match cluster {
                 Ok(c) => return Ok(c),
-                Err(e) => return Err(Error::MkvElement(e)),
+                Err(e) => return Err(Error::InvalidFilePos(format!("Cluster element could not be read - wrong position? {}", e)))
             };
         } else {
             file.seek(SeekFrom::Start(old_pos))?;

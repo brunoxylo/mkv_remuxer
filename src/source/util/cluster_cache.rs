@@ -15,7 +15,7 @@ pub struct KeyframePositionCache {
     pub position: u64,
     file: File,
     timecode_scale: u64,
-    reference_timestamp_ns: i64,
+    reference_timestamp_ns: u64,
     keyframe_timestamp_ns: HashMap<(u64, bool), i64>, // (track_num, after or before) -> timestamp_ns of keyframe
     keyframe_cluster_position: HashMap<(u64, bool), u64>, // (track_num, after or before) -> file position of the cluster that holds the keyframe
 }
@@ -31,7 +31,7 @@ impl KeyframePositionCache {
     pub fn new(
         mut file: File,
         timecode_scale: u64,
-        timestamp_ns: i64,
+        timestamp_ns: u64,
         range: Option<(u64, u64)>,
     ) -> Result<Self> {
         let (lo, hi) = match range {
@@ -42,7 +42,7 @@ impl KeyframePositionCache {
             }
         };
 
-        let position = Self::binary_search_cluster(&mut file, timecode_scale, timestamp_ns, lo, hi)?;
+        let position = Self::binary_search_cluster(&mut file, timecode_scale, timestamp_ns as i64, lo, hi)?;
 
         Ok(Self {
             position,
@@ -57,7 +57,7 @@ impl KeyframePositionCache {
     /// Returns the reference timestamp (in nanoseconds) that this cache was
     /// constructed with.
     pub fn get_timestamp_ns(&self) -> i64 {
-        self.reference_timestamp_ns
+        self.reference_timestamp_ns as i64
     }
 
     pub fn get_keyframe_timestamp_ns(
@@ -89,8 +89,8 @@ impl KeyframePositionCache {
         let after_ts = self.get_keyframe_timestamp_ns(track_num, true)?;
         let before_ts = self.get_keyframe_timestamp_ns(track_num, false)?;
 
-        let after_diff = (after_ts - self.reference_timestamp_ns).abs();
-        let before_diff = (before_ts - self.reference_timestamp_ns).abs();
+        let after_diff = (after_ts - self.reference_timestamp_ns as i64).abs();
+        let before_diff = (before_ts - self.reference_timestamp_ns as i64).abs();
 
         if after_diff < before_diff {
             Ok(after_ts)
@@ -116,7 +116,7 @@ impl KeyframePositionCache {
             let pos = self
                 .keyframe_cluster_position
                 .get(&(track_num, after))
-                .ok_or(Error::InvalidConfig(
+                .ok_or(Error::NotFound(
                     "Keyframe cluster position not found".to_string(),
                 ))?;
             Ok(*pos)
@@ -136,231 +136,124 @@ impl KeyframePositionCache {
     ) -> Result<u64> {
         let target_unsigned = target_timestamp_ns.max(0) as u64;
 
-        // Phase 1: Binary search on file byte positions.
-        // Each iteration reads ~10 bytes (scan for 4-byte ID + read header + timestamp)
-        // instead of parsing megabytes of block data per cluster.
-        while hi.saturating_sub(lo) > 1_048_576 {
+        // lo and hi track the best-known cluster positions (or file bounds).
+        // We converge until no new cluster is found between them.
+        let mut lo_is_cluster = false;
+
+        let mut old_mid :Option<u64> = None;
+        let mut sanity_check_counter = 0;
+
+        loop {
+            if sanity_check_counter > 100 {
+                return Err(Error::InvalidConfig(
+                    "Binary search failed to converge after 100 iterations - timestamps corrupted?".to_string(),
+                ));
+            }
+            sanity_check_counter += 1;
+
             let mid = lo + (hi - lo) / 2;
-            match Self::scan_to_next_cluster_in(file, mid, hi)? {
-                Some(cluster_pos) => {
-                    match Self::read_cluster_timestamp_at(file, cluster_pos, timecode_scale) {
-                        Ok((ts, _)) => {
-                            if ts <= target_unsigned {
-                                lo = cluster_pos;
-                            } else {
-                                hi = cluster_pos;
-                            }
-                        }
-                        Err(_) => {
-                            // Invalid cluster (false positive from byte scan), narrow from above
-                            hi = cluster_pos;
-                        }
+
+            // we convered mid in no longer changing
+            if let Some(old_mid_val) = old_mid {
+                if mid == old_mid_val {
+                    // No progress in narrowing, break to avoid infinite loop
+                    break;
+                }
+            }
+            old_mid = Some(mid);
+
+
+            match scan_cluster_in_direction(file, mid, Direction::Forward)? {
+                 Some(cluster_pos) => {
+                    let time_stamp = Self::read_cluster_timestamp_at(file, cluster_pos, timecode_scale)?;
+                    if time_stamp <= target_unsigned {
+                        lo = cluster_pos;
+                        lo_is_cluster = true;
+                    } else {
+                        hi = cluster_pos;
                     }
                 }
-                None => {
-                    // No cluster between mid and hi
+                _ => {
+                    // No cluster found between lo and hi (or found one outside range).
+                    // We might have reached the end of the file
                     hi = mid;
                 }
             }
         }
 
-        // Phase 2: Sequential scan of the remaining ≤1 MB range.
-        // Reads element headers and Cluster timestamps only — block data is skipped.
-        let cluster_index = Self::collect_clusters_in(file, timecode_scale, lo, hi)?;
-
-        if cluster_index.is_empty() {
-            return Err(Error::InvalidConfig("No clusters found".to_string()));
+        if lo_is_cluster {
+            Ok(lo)
+        } else {
+            // lo was never set to a cluster — try scanning forward from lo
+            match scan_cluster_in_direction(file, lo, Direction::Forward)? {
+                Some(cluster_pos) => Ok(cluster_pos),
+                None => Err(Error::InvalidConfig("No clusters found".to_string())),
+            }
         }
-
-        // Find the best cluster for the target timestamp
-        let result = cluster_index.binary_search_by_key(&target_unsigned, |(_, ts)| *ts);
-
-        let cluster_idx = match result {
-            Ok(idx) => idx,
-            Err(idx) => idx.saturating_sub(1),
-        };
-
-        Ok(cluster_index[cluster_idx].0)
     }
 
     /// Read only the Cluster timestamp at a given file position without parsing
-    /// any block data. Reads ~10-20 bytes instead of potentially megabytes.
-    /// Returns (timestamp_ns, position_after_this_cluster).
+    /// any block data. Reads a small buffer and parses EBML inline.
+    /// Assumes `pos` points to a valid Cluster header.
+    /// The file seek position is preserved after this operation.
     fn read_cluster_timestamp_at(
         file: &mut File,
         pos: u64,
         timecode_scale: u64,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<u64> {
+        let old_file_pos = file.stream_position()?;
         file.seek(SeekFrom::Start(pos))?;
-        let header = Header::read_from(file)?;
-        if header.id != Cluster::ID {
-            return Err(Error::InvalidConfig(format!(
-                "Expected Cluster at position {}, found ID: {:x}",
-                pos, header.id.value
-            )));
+        // Cluster header (4 ID + up to 8 size) + Timestamp element is typically
+        // within the first ~20 bytes. 64 bytes is plenty of headroom.
+        let mut buf = [0u8; 64];
+        let n = file.read(&mut buf)?;
+        file.seek(SeekFrom::Start(old_file_pos))?;
+
+        let buf = &buf[..n];
+
+        // Skip Cluster element ID (4 bytes)
+        let mut i: usize = 4;
+        if i >= buf.len() {
+            return Ok(0);
         }
+        // Skip Cluster size (variable-length VINT)
+        let size_width = ebml_vint_width(buf[i]);
+        i += size_width;
 
-        let body_start = file.stream_position()?;
-        let next_element_pos = if header.size.is_unknown {
-            None
-        } else {
-            Some(body_start + header.size.value)
-        };
-
-        // The Timestamp child (ID 0xE7) is specified to be the first or second
-        // child element of a Cluster. Scan at most 5 children to be safe.
+        // Scan up to 5 child elements looking for Timestamp (ID 0xE7)
         for _ in 0..5 {
-            if let Some(end) = next_element_pos {
-                if file.stream_position()? >= end {
-                    break;
+            if i >= buf.len() { break; }
+
+            let id_width = ebml_vint_width(buf[i]);
+            if i + id_width > buf.len() { break; }
+            let is_timestamp = id_width == 1 && buf[i] == 0xE7;
+            i += id_width;
+
+            if i >= buf.len() { break; }
+            let data_size_width = ebml_vint_width(buf[i]);
+            if i + data_size_width > buf.len() { break; }
+            let data_size = ebml_vint_value(&buf[i..]) as usize;
+            i += data_size_width;
+
+            if is_timestamp {
+                if i + data_size > buf.len() { break; }
+                let mut ticks: u64 = 0;
+                for &b in &buf[i..i + data_size] {
+                    ticks = (ticks << 8) | b as u64;
                 }
+                return Ok(ticks * timecode_scale);
             }
-            let child_header = match Header::read_from(file) {
-                Ok(h) => h,
-                Err(_) => break,
-            };
-            if child_header.id == Timestamp::ID {
-                let ts = Timestamp::read_element(&child_header, file)?;
-                let timestamp_ns = ts.0 * timecode_scale;
-                let after = next_element_pos.unwrap_or_else(|| file.stream_position().unwrap_or(pos));
-                return Ok((timestamp_ns, after));
-            }
-            // Skip this child
-            if child_header.size.value > 0 && !child_header.size.is_unknown {
-                file.seek(SeekFrom::Current(child_header.size.value as i64))?;
-            } else {
-                break;
-            }
+
+            i += data_size;
         }
 
         // Timestamp not found (shouldn't happen in valid MKV), default to 0
-        let after = next_element_pos.unwrap_or(file.stream_position().unwrap_or(pos));
-        Ok((0, after))
+        Err(Error::NotFound(
+            "Cluster timestamp not found or invalid".to_string(),
+        ))
     }
 
-    /// Scan forward from `from` looking for the 4-byte Cluster EBML ID pattern
-    /// (0x1F 0x43 0xB6 0x75). Returns the file position of the Cluster header,
-    /// or `None` if not found before `limit`.
-    fn scan_to_next_cluster_in(
-        file: &mut File,
-        from: u64,
-        limit: u64,
-    ) -> Result<Option<u64>> {
-        file.seek(SeekFrom::Start(from))?;
 
-        const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
-        const BUF_SIZE: usize = 8192;
-        let mut buf = [0u8; BUF_SIZE];
-        let mut file_pos = from;
-        let mut matched = 0usize;
-
-        while file_pos < limit {
-            let to_read = ((limit - file_pos) as usize).min(BUF_SIZE);
-            let n = file.read(&mut buf[..to_read])?;
-            if n == 0 {
-                break;
-            }
-
-            for i in 0..n {
-                if buf[i] == CLUSTER_ID[matched] {
-                    matched += 1;
-                    if matched == 4 {
-                        // Pattern matched; cluster header starts 3 bytes before current
-                        let cluster_pos = file_pos + i as u64 - 3;
-                        return Ok(Some(cluster_pos));
-                    }
-                } else if buf[i] == CLUSTER_ID[0] {
-                    matched = 1;
-                } else {
-                    matched = 0;
-                }
-            }
-
-            file_pos += n as u64;
-        }
-
-        Ok(None)
-    }
-
-    /// Sequentially scan from a known element boundary, reading only headers and
-    /// Cluster timestamps, skipping all block data. Returns a small Vec of
-    /// (file_position, timestamp_ns) for clusters in the range [from, limit).
-    fn collect_clusters_in(
-        file: &mut File,
-        timecode_scale: u64,
-        from: u64,
-        limit: u64,
-    ) -> Result<Vec<(u64, u64)>> {
-        let mut clusters = Vec::new();
-        let mut pos = from;
-
-        loop {
-            if pos >= limit {
-                break;
-            }
-            file.seek(SeekFrom::Start(pos))?;
-
-            let header = match Header::read_from(file) {
-                Ok(h) => h,
-                Err(_) => break,
-            };
-
-            let body_start = file.stream_position()?;
-
-            if header.id == Cluster::ID {
-                // Read only the Timestamp child, skip everything else
-                let mut timestamp_ticks = 0u64;
-                let body_end = if header.size.is_unknown {
-                    None
-                } else {
-                    Some(body_start + header.size.value)
-                };
-
-                for _ in 0..5 {
-                    if let Some(end) = body_end {
-                        if file.stream_position()? >= end {
-                            break;
-                        }
-                    }
-                    let child_h = match Header::read_from(file) {
-                        Ok(h) => h,
-                        Err(_) => break,
-                    };
-                    if child_h.id == Timestamp::ID {
-                        if let Ok(ts) = Timestamp::read_element(&child_h, file) {
-                            timestamp_ticks = ts.0;
-                        }
-                        break;
-                    }
-                    if child_h.size.value > 0 && !child_h.size.is_unknown {
-                        file.seek(SeekFrom::Current(child_h.size.value as i64))?;
-                    } else {
-                        break;
-                    }
-                }
-
-                clusters.push((pos, timestamp_ticks * timecode_scale));
-
-                // Skip past this cluster's body
-                if let Some(end) = body_end {
-                    pos = end;
-                } else {
-                    // Unknown-size cluster: fall back to byte-scanning for the next one
-                    match Self::scan_to_next_cluster_in(file, body_start, limit)? {
-                        Some(next) => pos = next,
-                        None => break,
-                    }
-                }
-            } else if header.size.value > 0 && !header.size.is_unknown {
-                // Non-cluster element: skip its body
-                pos = body_start + header.size.value;
-            } else {
-                break;
-            }
-        }
-
-        Ok(clusters)
-    }
 
     // ── Keyframe caching (instance methods, existing logic preserved) ───
 
@@ -371,12 +264,20 @@ impl KeyframePositionCache {
     ) -> Result<()> {
         let reference_timestamp_ns = self.reference_timestamp_ns;
 
+        /* 
+        // If reference timestamp is 0, we can just use the current cluster position as the keyframe cluster
+        if reference_timestamp_ns == 0 {
+            self.keyframe_cluster_position.insert((track_num, after), self.position);
+            self.keyframe_timestamp_ns.insert((track_num, after), reference_timestamp_ns as i64);
+            return Ok(());
+        }*/
+
         // Try to find keyframe in current cluster first
         let cluster = Cluster::from_file_pos(&mut self.file, self.position)?;
         let keyframe_idx_opt = if after {
-            cluster.get_keyframe_after(track_num, reference_timestamp_ns, self.timecode_scale)
+            cluster.get_keyframe_after(track_num, reference_timestamp_ns as i64, self.timecode_scale)
         } else {
-            cluster.get_keyframe_before(track_num, reference_timestamp_ns, self.timecode_scale)
+            cluster.get_keyframe_before(track_num, reference_timestamp_ns as i64, self.timecode_scale)
         };
 
         // If found a suitable keyframe in current cluster, use it
@@ -391,9 +292,9 @@ impl KeyframePositionCache {
             
             // Verify it actually meets the criteria
             let meets_criteria = if after {
-                keyframe_timestamp_ns >= reference_timestamp_ns
+                keyframe_timestamp_ns >= reference_timestamp_ns as i64
             } else {
-                keyframe_timestamp_ns <= reference_timestamp_ns
+                keyframe_timestamp_ns <= reference_timestamp_ns as i64
             };
             
             if meets_criteria {
@@ -407,137 +308,189 @@ impl KeyframePositionCache {
             }
         }
 
-        // No suitable keyframe in current cluster, search neighboring clusters.
-        // Use a generous limit — keyframe intervals can easily exceed 5–10 s on
-        // streaming content, so we scan up to 60 clusters forward.
+        // No suitable keyframe in current cluster, search neighboring clusters
+        // using scan_cluster_in_direction.
         const MAX_NEIGHBOR_SEARCH: usize = 60;
-        
-        // Scan to build a list of nearby cluster positions
-        let nearby_clusters = self.scan_nearby_clusters(MAX_NEIGHBOR_SEARCH)?;
-        
-        // Search in the appropriate direction
-        let search_clusters: Vec<(u64, u64)> = if after {
-            // For "after", only consider clusters whose timestamp is at or after
-            // the anchor cluster (so we actually scan *past* the reference).
-            nearby_clusters.into_iter()
-                .filter(|(_, ts)| *ts >= cluster.get_timestamp_ns(self.timecode_scale))
-                .collect()
-        } else {
-            // For "before", use any cluster at or before the anchor.
-            let mut before_clusters: Vec<_> = nearby_clusters.into_iter()
-                .filter(|(_, ts)| *ts <= cluster.get_timestamp_ns(self.timecode_scale))
-                .collect();
-            before_clusters.reverse(); // nearest-first
-            before_clusters
-        };
+        let mut direction = if after { Direction::Next } else { Direction::Previous };
+        let mut search_pos = self.position;
 
-        for (cluster_pos, _cluster_ts) in search_clusters {
-            
-            if let Ok(neighbor_cluster) = Cluster::from_file_pos(&mut self.file, cluster_pos) {
-                let keyframe_idx_opt = if after {
-                    neighbor_cluster.get_keyframe_after(track_num, reference_timestamp_ns, self.timecode_scale)
+        for _ in 0..MAX_NEIGHBOR_SEARCH {
+            let (cluster_pos, neighbor_cluster) = match scan_cluster_in_direction(&mut self.file, search_pos, direction)? {
+                Some(result) =>   {
+                    let cluster = Cluster::from_file_pos(&mut self.file, result)?;
+                    (result, cluster)
+                },
+                None => { // we have reached a file end so reverse and search to get at least a keyframe that is close to the reference timestamp
+                    direction = match direction {
+                         // if we cant find something in one direction, we change the direction but include the current cluster
+                        Direction::Next => Direction::Backward,
+                        Direction::Previous => Direction::Forward,
+                        _ => break, // we have already reversed once, break to avoid infinite loop
+                    };
+                    continue;
+                }
+            };
+
+            let new_after: bool = direction == Direction::Next || direction == Direction::Forward;
+
+            let keyframe_idx_opt = if new_after {
+                neighbor_cluster.get_keyframe_after(track_num, reference_timestamp_ns as i64, self.timecode_scale)
+            } else {
+                neighbor_cluster.get_keyframe_before(track_num, reference_timestamp_ns as i64, self.timecode_scale)
+            };
+
+            if let Some(keyframe_idx) = keyframe_idx_opt {
+                let keyframe_timestamp_ns = neighbor_cluster
+                    .blocks
+                    .get(keyframe_idx)
+                    .ok_or(Error::InvalidConfig("Keyframe Index out of bounds".to_string()))?
+                    .timestamp_ns(neighbor_cluster.timestamp.0 as i64, self.timecode_scale)?;
+
+                let meets_criteria = if new_after {
+                    keyframe_timestamp_ns >= reference_timestamp_ns as i64
                 } else {
-                    neighbor_cluster.get_keyframe_before(track_num, reference_timestamp_ns, self.timecode_scale)
+                    keyframe_timestamp_ns <= reference_timestamp_ns as i64
                 };
-                
-                if let Some(keyframe_idx) = keyframe_idx_opt {
-                    if let Ok(keyframe_timestamp_ns) = neighbor_cluster
-                        .blocks
-                        .get(keyframe_idx)
-                        .ok_or(Error::InvalidConfig("Keyframe Index out of bounds".to_string()))?
-                        .timestamp_ns(neighbor_cluster.timestamp.0 as i64, self.timecode_scale)
-                    {
-                        // Verify it meets the criteria
-                        let meets_criteria = if after {
-                            keyframe_timestamp_ns >= reference_timestamp_ns
-                        } else {
-                            keyframe_timestamp_ns <= reference_timestamp_ns
-                        };
-                        
-                        if meets_criteria {
-                            self.keyframe_cluster_position.insert(
-                                (track_num, after),
-                                cluster_pos,
-                            );
-                            self.keyframe_timestamp_ns.insert(
-                                (track_num, after),
-                                keyframe_timestamp_ns,
-                            );
-                            return Ok(());
-                        }
-                    }
+
+                if meets_criteria {
+                    self.keyframe_cluster_position.insert(
+                        (track_num, after),
+                        cluster_pos,
+                    );
+                    self.keyframe_timestamp_ns.insert(
+                        (track_num, after),
+                        keyframe_timestamp_ns,
+                    );
+                    return Ok(());
                 }
             }
+
+            search_pos = cluster_pos;
         }
 
-        // Fallback: use first/last keyframe from original cluster if no suitable keyframe found
-        let all_keyframes = cluster.get_keyframes(track_num);
-        let keyframe_idx: usize = if after {
-            match all_keyframes.last() {
-                Some(keyframe) => keyframe.clone(),
-                None => return Err(Error::InvalidConfig("No keyframes found in any nearby cluster".to_string())),
-            }
-        } else {
-            match all_keyframes.first() {
-                Some(keyframe) => keyframe.clone(),
-                None => return Err(Error::InvalidConfig("No keyframes found in any nearby cluster".to_string())),
-            }
-        };
-        
-        self.keyframe_cluster_position
-            .insert((track_num, after), self.position);
+        Err(Error::InvalidConfig("No keyframes found in any nearby cluster".to_string()))
+    }
+}
 
-        let keyframe_timestamp_ns = cluster
-            .blocks
-            .get(keyframe_idx)
-            .ok_or(Error::InvalidConfig(
-                "Keyframe Index out of bounds".to_string(),
-            ))?
-            .timestamp_ns(cluster.timestamp.0 as i64, self.timecode_scale)?;
-        self.keyframe_timestamp_ns.insert(
-            (track_num, after),
-            keyframe_timestamp_ns,
-        );
 
-        Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// scan to next cluster but ignore the current
+    Next,
+    /// scan to previous cluster but ignore the current
+    Previous,
+    /// scan forward to next cluster including the current
+    Forward,
+    /// scan backward to previous cluster including the current
+    Backward,
+}
+
+
+/// returns (position_of_cluster_in_file) of the next or previous cluster of the specified position
+/// The position can be in the middle of a cluster and does not have top point to a valid cluster header
+/// IF the pos points to a valid cluster header, this cluster will be skipped and the next/previous one will be returned
+/// The files seek position is preseved after this operation
+fn scan_cluster_in_direction(file: &mut File, pos :u64, direction: Direction) -> Result<Option<(u64)>> {
+    const BUF_SIZE: usize = 8192;
+    let old_file_pos = file.stream_position()?;
+    let file_end_pos = file.metadata()?.len();
+
+
+    fn read_cluster_headers_pos_from_buffer(buf: &[u8]) -> Vec<usize> {
+                const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
+                buf.windows(4).enumerate().filter_map(|(i, w)| if w == CLUSTER_ID { Some(i) } else { None }).collect()
     }
 
-    /// Scan nearby clusters (up to max_count before and after current position)
-    fn scan_nearby_clusters(&mut self, max_count: usize) -> Result<Vec<(u64, u64)>> {
-        let mut clusters = Vec::new();
-        let original_pos = self.file.stream_position()?;
-        
-        // Start from current cluster position and scan forward
-        self.file.seek(SeekFrom::Start(self.position))?;
-        
-        for _ in 0..max_count {
-            let pos = self.file.stream_position()?;
-            if let Ok(header) = Header::read_from(&mut self.file) {
-                if header.id == Cluster::ID {
-                    if let Ok(cluster) = Cluster::read_element(&header, &mut self.file) {
-                        let timestamp_ns = cluster.get_timestamp_ns(self.timecode_scale);
-                        clusters.push((pos, timestamp_ns));
-                    } else {
-                        break;
-                    }
-                } else {
-                    // Skip non-cluster elements
-                    let size = header.size.value;
-                    if size > 0 && !header.size.is_unknown {
-                        if self.file.seek(SeekFrom::Current(size as i64)).is_err() {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            } else {
+    fn filter_valid_cluster_pos(file: &mut File, direction :Direction, candidate_pos: Vec<u64>) -> Result<Option<u64>> {
+        // we need to travers backward if the direction is backward to find the nearest cluster header
+        let iterator: Box<dyn Iterator<Item = &u64>> = match direction {
+            Direction::Forward | Direction::Next => Box::new(candidate_pos.iter()),
+            Direction::Backward | Direction::Previous => Box::new(candidate_pos.iter().rev()),
+        };
+        let mut output_position :Option<u64> = None;
+        let orig_file_pos = file.stream_position()?;
+        for pos in iterator {
+            file.seek(SeekFrom::Start(*pos as u64))?;
+            // we need to check wherter the cluster header is acually valid or just a false positive in the block data
+            let header = match Header::read_from(file) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if header.id == Cluster::ID {
+                output_position = Some(*pos as u64);
                 break;
             }
         }
-        
-        // Restore original position
-        self.file.seek(SeekFrom::Start(original_pos))?;
-        Ok(clusters)
+        file.seek(SeekFrom::Start(orig_file_pos))?;
+        Ok(output_position)
     }
+
+    let mut current_position = match direction {
+        Direction::Forward | Direction::Next => pos,
+        Direction::Backward | Direction::Previous => pos.saturating_sub(BUF_SIZE as u64),
+    };
+    let mut buffer = [0u8; BUF_SIZE];
+    let mut output_position :Option<u64> = None;
+    let mut sanity_check_counter = 0;
+    while current_position > 0 && current_position < file_end_pos {
+        if sanity_check_counter > 1000_000 {
+            return Err(Error::InvalidConfig(
+                format!("Cluster {:?} scan at {} reached position {} but failed to converge after 1000000 iterations", direction, pos, current_position),
+            ));
+        }
+        sanity_check_counter += 1;
+        file.seek(SeekFrom::Start(current_position))?;
+        let n = file.read(&mut buffer)?;
+        if n < 4 {
+            // not enough data to contain a cluster header, stop searching
+            break;
+        }
+        let cluster_positions_n_buffer = read_cluster_headers_pos_from_buffer(&buffer[..n]);
+        let skip_input_pos = match direction {
+            Direction::Next | Direction::Previous => true,
+            Direction::Backward | Direction::Forward => false,
+        };
+        // convert to absolute positions and exclude the position we want to skip
+        let cluster_positions_absolute: Vec<u64> = cluster_positions_n_buffer.iter()
+            .map(|offset| current_position + *offset as u64)
+            .filter(|abs_pos| *abs_pos != pos || !skip_input_pos)
+            .collect();
+        if let Some(cluster_absolute_pos) = filter_valid_cluster_pos(file, direction, cluster_positions_absolute)? {
+            output_position = Some(cluster_absolute_pos);
+            break;
+        } else { // no valid cluster header found in this buffer, continue searching
+            match direction {
+                // overscan to avoid missing cluster headers that are at the end of the buffer, 4 the cluster id (4 bytes)
+                Direction::Forward | Direction::Next => current_position += (n as u64 - 4), 
+                Direction::Backward | Direction::Previous => current_position = current_position.saturating_sub(BUF_SIZE as u64 - 4)
+            }
+        }
+        if n < BUF_SIZE {
+            // reached end of file
+            break;
+        }
+    }
+    file.seek(SeekFrom::Start(old_file_pos))?;
+    if let Some(out_pos) = output_position {
+        Ok(Some((out_pos)))
+    } else {
+        Ok(None)
+    }
+
+}
+
+/// Returns the byte-width of an EBML variable-length integer given its first byte.
+fn ebml_vint_width(first_byte: u8) -> usize {
+    if first_byte == 0 { return 8; }
+    first_byte.leading_zeros() as usize + 1
+}
+
+/// Parses the numeric value of an EBML VINT from a byte slice (stripping the width marker bits).
+fn ebml_vint_value(buf: &[u8]) -> u64 {
+    let width = ebml_vint_width(buf[0]);
+    let mut val = (buf[0] & (0xFF >> width)) as u64;
+    for i in 1..width.min(buf.len()) {
+        val = (val << 8) | buf[i] as u64;
+    }
+    val
 }
