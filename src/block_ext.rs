@@ -1,9 +1,18 @@
 use crate::Error;
+use bytes::{Bytes, BytesMut};
 use mkv_element::ClusterBlock;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
-use std::fs::File;
-use std::io::{Cursor, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
+/// Returns a mutable reference to the raw block bytes inside a `ClusterBlock`.
+/// Used by all `set_*` methods so they can write the modified `BytesMut` back.
+fn block_raw_data_mut(block: &mut ClusterBlock) -> &mut Bytes {
+    match block {
+        ClusterBlock::Simple(sb) => &mut sb.0,
+        ClusterBlock::Group(bg) => &mut bg.block.0,
+    }
+}
 
 /// Helper function to get VINT length from first byte
 fn vint_length(byte: u8) -> usize {
@@ -76,8 +85,8 @@ pub trait ClusterBlockExt {
     fn set_discardable(&mut self, discardable: bool) -> Result<(), Error>;
 
     // get the data of a block
-    fn get_data_mut(&mut self) -> Result<&mut Vec<u8>, Error>;
-    fn get_data(&self) -> Result<&Vec<u8>, Error>;
+    fn get_data_mut(&mut self) -> Result<BytesMut, Error>;
+    fn get_data(&self) -> Result<Bytes, Error>;
 
     /// Get the block duration in Track Ticks
     /// Returns None if:
@@ -118,7 +127,7 @@ pub trait ClusterExt {
         timestamp_ns: i64,
         timecode_scale: u64,
     ) -> Option<usize>;
-    fn from_file_pos(file: &mut File, file_pos: u64) -> Result<Cluster, Error>;
+    fn from_file_pos(file: &mut (impl Read + Seek), file_pos: u64) -> Result<Cluster, Error>;
 }
 
 impl ClusterExt for Cluster {
@@ -198,7 +207,7 @@ impl ClusterExt for Cluster {
         })
     }
     /// Read a Cluster from a file at the given position, preserving the initial file position after reading
-    fn from_file_pos(file: &mut File, file_pos: u64) -> Result<Self, Error> {
+    fn from_file_pos(file: &mut (impl Read + Seek), file_pos: u64) -> Result<Self, Error> {
         let old_pos = file.stream_position()?;
         file.seek(SeekFrom::Start(file_pos))?;
         let header = match Header::read_from(file) {
@@ -293,7 +302,10 @@ impl ClusterBlockExt for ClusterBlock {
         })
     }
     fn set_track_number(&mut self, track_num: u64) -> Result<(), Error> {
-        let data = self.get_data_mut()?;
+        let data_ref = block_raw_data_mut(self);
+        if data_ref.len() < 4 {
+            return Err(Error::InvalidBlockData("Block data too short".to_string()));
+        }
 
         let track_num_vint = VInt64::new(track_num);
         let mut track_num_bytes = Vec::new();
@@ -301,29 +313,34 @@ impl ClusterBlockExt for ClusterBlock {
             .write_to(&mut track_num_bytes)
             .map_err(|e| Error::InvalidBlockData(format!("Failed to write track number: {}", e)))?;
 
-        let old_track_len = vint_length(data[0]);
+        let old_track_len = vint_length(data_ref[0]);
         let new_track_len = track_num_bytes.len();
 
+        let mut data = BytesMut::from(data_ref.clone());
         if new_track_len != old_track_len {
-            // Size mismatch - need to reconstruct the entire block
-            let mut new_data = track_num_bytes.clone();
-            new_data.extend_from_slice(&data[old_track_len..]);
-            *data = new_data;
+            let tail = data[old_track_len..].to_vec();
+            data.clear();
+            data.extend_from_slice(&track_num_bytes);
+            data.extend_from_slice(&tail);
         } else {
-            // Same size - safe to overwrite in place
             data[0..new_track_len].copy_from_slice(&track_num_bytes);
         }
+        *data_ref = data.freeze();
 
         Ok(())
     }
 
     fn set_timestamp(&mut self, timestamp: i16) -> Result<(), Error> {
-        let data = self.get_data_mut()?;
-
-        let track_len = vint_length(data[0]);
+        let data_ref = block_raw_data_mut(self);
+        if data_ref.len() < 4 {
+            return Err(Error::InvalidBlockData("Block data too short".to_string()));
+        }
+        let track_len = vint_length(data_ref[0]);
+        let mut data = BytesMut::from(data_ref.clone());
         let bytes = timestamp.to_be_bytes();
         data[track_len] = bytes[0];
         data[track_len + 1] = bytes[1];
+        *data_ref = data.freeze();
         Ok(())
     }
 
@@ -340,51 +357,60 @@ impl ClusterBlockExt for ClusterBlock {
     }
 
     fn set_keyframe(&mut self, is_keyframe: bool) -> Result<(), Error> {
-        let data = self.get_data_mut()?;
-
-        let track_len = vint_length(data[0]);
-        if is_keyframe {
-            data[track_len + 2] |= 0x80; // Set bit 7
-        } else {
-            data[track_len + 2] &= !0x80; // Clear bit 7
+        let data_ref = block_raw_data_mut(self);
+        if data_ref.len() < 4 {
+            return Err(Error::InvalidBlockData("Block data too short".to_string()));
         }
+        let track_len = vint_length(data_ref[0]);
+        let mut data = BytesMut::from(data_ref.clone());
+        if is_keyframe {
+            data[track_len + 2] |= 0x80;
+        } else {
+            data[track_len + 2] &= !0x80;
+        }
+        *data_ref = data.freeze();
         Ok(())
     }
 
     fn set_invisible(&mut self, invisible: bool) -> Result<(), Error> {
-        let data = self.get_data_mut()?;
-
-        let track_len = vint_length(data[0]);
-        if invisible {
-            data[track_len + 2] |= 0x08; // Set bit 3
-        } else {
-            data[track_len + 2] &= !0x08; // Clear bit 3
+        let data_ref = block_raw_data_mut(self);
+        if data_ref.len() < 4 {
+            return Err(Error::InvalidBlockData("Block data too short".to_string()));
         }
+        let track_len = vint_length(data_ref[0]);
+        let mut data = BytesMut::from(data_ref.clone());
+        if invisible {
+            data[track_len + 2] |= 0x08;
+        } else {
+            data[track_len + 2] &= !0x08;
+        }
+        *data_ref = data.freeze();
         Ok(())
     }
 
     fn set_discardable(&mut self, discardable: bool) -> Result<(), Error> {
-        let data = self.get_data_mut()?;
-
-        let track_len = vint_length(data[0]);
-        if discardable {
-            data[track_len + 2] |= 0x01; // Set bit 0
-        } else {
-            data[track_len + 2] &= !0x01; // Clear bit 0
+        let data_ref = block_raw_data_mut(self);
+        if data_ref.len() < 4 {
+            return Err(Error::InvalidBlockData("Block data too short".to_string()));
         }
+        let track_len = vint_length(data_ref[0]);
+        let mut data = BytesMut::from(data_ref.clone());
+        if discardable {
+            data[track_len + 2] |= 0x01;
+        } else {
+            data[track_len + 2] &= !0x01;
+        }
+        *data_ref = data.freeze();
         Ok(())
     }
-    fn get_data_mut(&mut self) -> Result<&mut Vec<u8>, Error> {
-        let data = match self {
-            ClusterBlock::Simple(sb) => &mut sb.0,
-            ClusterBlock::Group(bg) => &mut bg.block.0,
-        };
+    fn get_data_mut(&mut self) -> Result<BytesMut, Error> {
+        let data = block_raw_data_mut(self);
         if data.len() < 4 {
             return Err(Error::InvalidBlockData("Block data too short".to_string()));
         }
-        Ok(data)
+        Ok(BytesMut::from(data.clone()))
     }
-    fn get_data(&self) -> Result<&Vec<u8>, Error> {
+    fn get_data(&self) -> Result<Bytes, Error> {
         let data = match self {
             ClusterBlock::Simple(sb) => &sb.0,
             ClusterBlock::Group(bg) => &bg.block.0,
@@ -392,7 +418,7 @@ impl ClusterBlockExt for ClusterBlock {
         if data.len() < 4 {
             return Err(Error::InvalidBlockData("Block data too short".to_string()));
         }
-        Ok(data)
+        Ok(data.clone())
     }
 
     fn get_block_duration(&self) -> Option<u64> {

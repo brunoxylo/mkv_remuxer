@@ -8,17 +8,20 @@ use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::collections::HashSet;
+use log4rs::append::file;
 use mkv_element::prelude::*;
 use mkv_element::io::blocking_impl::*;
 
 
 pub fn test_file_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("test_av1.webm")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_av1.webm")
 }
 
 pub fn sources_implementations() -> Vec<InputSource<Uninitialized>> {
+    let test_file = test_file_path();
+    let file = File::open(&test_file).expect("Failed to open test file");
     vec![
-        FileSource::new(test_file_path()).unwrap().into(),
+        FileSource::new(file).unwrap().into(),
         // Add other Source implementations here as needed
     ]
 }

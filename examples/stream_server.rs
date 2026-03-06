@@ -19,6 +19,7 @@
 ///
 use bytes::Bytes;
 use log::{error, info};
+use log4rs::append::file;
 use mkv_remuxer::{
     ContainerFormat, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState,
     sink::{ChannelWriterWrapper, SinkSender, OutputSink, StreamSink, VttSink},
@@ -213,9 +214,18 @@ fn process_video_request(
 ) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
     let is_vtt = input_path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
     let input: InputSource = if is_vtt {
-        InputSource::from(WebVttSource::new(&input_path, "und")?)
+        let vtt_file = std::fs::File::open(&input_path)?;
+        let file_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let file_stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        let  vtt_source = WebVttSource::new(vtt_file, file_stem, false)?
+            .with_file_name(file_name);
+        InputSource::from(vtt_source)
     } else {
-        InputSource::from(FileSource::new(&input_path)?)
+        let input_file = std::fs::File::open(&input_path)?;
+        let file_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let  file_source = FileSource::new(input_file)?
+             .with_file_name(file_name);
+        InputSource::from(file_source)
     };
 
     let cut_interval = if start_sec > 0.0 || end_sec.is_some() {
@@ -261,10 +271,15 @@ async fn handle_files_request() -> Result<warp::reply::Response, Infallible> {
             .into_iter()
             .filter_map(|path| {
                 let is_vtt = path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
+                let file = std::fs::File::open(&path).ok()?;
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
                 let result: mkv_remuxer::Result<Box<dyn Source>> = if is_vtt {
-                    WebVttSource::new(&path, "und").map(|s| Box::new(s) as Box<dyn Source>)
+                    WebVttSource::new(file, file_stem, false)
+                        .map(|s| Box::new(s.with_file_name(file_name)) as Box<dyn Source>)
                 } else {
-                    FileSource::new(&path).map(|s| Box::new(s) as Box<dyn Source>)
+                    FileSource::new(file)
+                        .map(|s| Box::new(s.with_file_name(file_name)) as Box<dyn Source>)
                 };
                 match result {
                     Ok(src) => src.get_basic_info().ok(),

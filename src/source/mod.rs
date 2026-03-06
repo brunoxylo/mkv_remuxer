@@ -6,7 +6,7 @@ pub mod util;
 mod file_source;
 mod webvtt_source;
 
-pub use util::{KeyframePositionCache, InputSource, Uninitialized, Cutting, Remuxing};
+pub use util::{KeyframePositionCache, InputSource, Uninitialized, Cutting, Remuxing, MkvReader};
 pub use file_source::FileSource;
 pub use webvtt_source::WebVttSource;
 

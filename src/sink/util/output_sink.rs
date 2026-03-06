@@ -65,7 +65,7 @@ impl OutputSink<Uninitialized> {
             duration: Some(Duration((duration_ns / timecode_scale) as f64)),
             date_utc: Some(DateUtc(chrono::Utc::now().timestamp())),
             title: None,
-            segment_uuid: Some(SegmentUuid(uuid::Uuid::new_v4().as_bytes().to_vec())),
+            segment_uuid: Some(SegmentUuid(uuid::Uuid::new_v4().as_bytes().to_vec().into())),
             segment_filename: None,
             prev_uuid: None,
             prev_filename: None,

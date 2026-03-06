@@ -2,12 +2,13 @@ use super::{SeekType, Source};
 use crate::source::CutInterval;
 use crate::source::util::basic_info::MkvBasicInfo;
 use crate::{Error, Result};
+use bytes::BytesMut;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use mkv_element::ClusterBlock;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -26,8 +27,6 @@ struct VttCue {
 }
 
 pub struct WebVttSource {
-    /// Path to the VTT file
-    path: String,
     /// Parsed cues
     cues: Vec<VttCue>,
     /// Current cue index for iteration
@@ -42,6 +41,7 @@ pub struct WebVttSource {
     track_uid: u64,
     /// Language code (default: "eng")
     language: String,
+    forced: bool,
     /// Track name
     track_name: Option<String>,
     /// Cut parameters
@@ -53,17 +53,16 @@ pub struct WebVttSource {
     cluster_batch_size: usize,
     /// Is the source finished?
     finished: bool,
+    bytes_read: u64,
+    file_name: String,
 }
 
 impl WebVttSource {
-    pub fn new<P: AsRef<Path>>(path: P, language :&str) -> Result<Self> {
-        let path_str = path.as_ref().to_string_lossy().to_string();
-        
+    pub fn new<R : Read + Send>(reader: R, language :String, forced :bool) -> Result<Self> {
         // Parse the VTT file
-        let cues = Self::parse_vtt_file(&path)?;
+        let (cues, bytes_read) = Self::parse_vtt_file(reader)?;
         
         Ok(Self {
-            path: path_str,
             cues,
             current_cue_idx: 0,
             timecode_scale: 1_000_000, // 1ms in nanoseconds
@@ -71,13 +70,21 @@ impl WebVttSource {
             track_number: 1,
             track_uid: Uuid::new_v4().as_u128() as u64, // Generate random UID from UUID
             language: language.to_string(),
+            forced,
             track_name: None,
             start_ns: None,
             end_ns: None,
             output_interval: CutInterval::new(),
             cluster_batch_size: 10,
             finished: false,
+            bytes_read,
+            file_name: language.to_string(), // Placeholder, since we don't have a file path
         })
+    }
+
+    pub fn with_file_name(mut self, file_name: String) -> Self {
+        self.file_name = file_name;
+        self
     }
 
     /// Set the language code for the subtitle track
@@ -99,15 +106,14 @@ impl WebVttSource {
     }
 
     /// Parse a WebVTT file into cues
-    fn parse_vtt_file<P: AsRef<Path>>(path: P) -> Result<Vec<VttCue>> {
-        let file = fs::File::open(&path).map_err(|e| {
-            Error::InvalidConfig(format!("Failed to open VTT file: {}", e))
-        })?;
-        let reader = BufReader::new(file);
+    fn parse_vtt_file<R: Read>(reader: R) -> Result<(Vec<VttCue>, u64)> {
+        let mut bytes_read :u64 = 0;
+        let reader = BufReader::new(reader);
         let mut lines = reader.lines();
 
         // Check for WEBVTT header
         if let Some(Ok(first_line)) = lines.next() {
+            bytes_read += first_line.len() as u64 + 1; // +1 for newline
             if !first_line.starts_with("WEBVTT") {
                 return Err(Error::InvalidConfig(
                     "Invalid VTT file: missing WEBVTT header".to_string(),
@@ -124,6 +130,7 @@ impl WebVttSource {
         let mut line_iter = lines.peekable();
         
         while let Some(Ok(line)) = line_iter.next() {
+            bytes_read += line.len() as u64 + 1; // +1 for newline
             let trimmed = line.trim();
 
             // Skip empty lines between cues
@@ -136,6 +143,7 @@ impl WebVttSource {
             // Skip NOTE blocks
             if trimmed.starts_with("NOTE") {
                 while let Some(Ok(note_line)) = line_iter.next() {
+                    bytes_read += note_line.len() as u64 + 1; // +1 for newline
                     if note_line.trim().is_empty() {
                         break;
                     }
@@ -154,6 +162,7 @@ impl WebVttSource {
                     match line_iter.peek() {
                         Some(Ok(next_line)) if !next_line.trim().is_empty() => {
                             if let Some(Ok(text_line)) = line_iter.next() {
+                                bytes_read += text_line.len() as u64 + 1; // +1 for newline
                                 text_lines.push(text_line);
                             }
                         }
@@ -169,8 +178,8 @@ impl WebVttSource {
                 current_id = Some(trimmed.to_string());
             }
         }
-
-        Ok(cues)
+        
+        Ok((cues, bytes_read))
     }
 
     /// Parse a timing line like "00:00:10.500 --> 00:00:13.000" or with settings
@@ -270,19 +279,21 @@ impl WebVttSource {
                 .clamp(i16::MIN as i64, i16::MAX as i64) as i16;
 
             // Encode block data: track number (vint) + timestamp (2 bytes) + flags (1 byte) + frame data
-            let mut block_data = Vec::new();
+            let mut block_data = BytesMut::new();
             
-            // Track number as VINT
+            // Track number as VINT — write_to needs std::io::Write; use a small scratch Vec
             let track_vint = VInt64::new(self.track_number);
-            track_vint.write_to(&mut block_data).map_err(|e| {
+            let mut vint_bytes = Vec::with_capacity(8);
+            track_vint.write_to(&mut vint_bytes).map_err(|e| {
                 Error::InvalidConfig(format!("Failed to write track number: {}", e))
             })?;
+            block_data.extend_from_slice(&vint_bytes);
 
             // Timestamp (2 bytes, big-endian signed)
             block_data.extend_from_slice(&relative_timestamp.to_be_bytes());
 
             // Flags byte (0x00 - no special flags for subtitles)
-            block_data.push(0x00);
+            block_data.extend_from_slice(&[0x00]);
 
             // Frame data format according to WebVTT-in-WebM spec:
             // 1. Cue identifier + line terminator (or just line terminator if no ID)
@@ -293,13 +304,13 @@ impl WebVttSource {
             if let Some(ref id) = cue.id {
                 block_data.extend_from_slice(id.as_bytes());
             }
-            block_data.push(b'\n');
+            block_data.extend_from_slice(&[b'\n']);
 
             // Write cue settings or empty line
             if let Some(ref settings) = cue.settings {
                 block_data.extend_from_slice(settings.as_bytes());
             }
-            block_data.push(b'\n');
+            block_data.extend_from_slice(&[b'\n']);
 
             // Write cue payload text
             block_data.extend_from_slice(cue.text.as_bytes());
@@ -308,7 +319,7 @@ impl WebVttSource {
             let block_group = BlockGroup {
                 crc32: None,
                 void: None,
-                block: Block(block_data),
+                block: Block(block_data.freeze()),
                 block_duration: Some(BlockDuration(duration_ticks)),
                 reference_priority: ReferencePriority(0),
                 reference_block: Vec::new(), // Empty for subtitles (no references)
@@ -333,7 +344,7 @@ impl WebVttSource {
 
 impl fmt::Display for WebVttSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WebVTT: {} ({} cues)", self.path, self.cues.len())
+        write!(f, "WebVTT: {} forced: {}({} cues)", self.language, self.forced, self.cues.len())
     }
 }
 
@@ -348,7 +359,7 @@ impl Source for WebVttSource {
             track_type: TrackType(17), // 17 = Subtitle track type
             flag_enabled: FlagEnabled(1),
             flag_default: FlagDefault(1),
-            flag_forced: FlagForced(0),
+            flag_forced: FlagForced(self.forced as u64),
             flag_hearing_impaired: None,
             flag_visual_impaired: None,
             flag_text_descriptions: None,
@@ -386,14 +397,9 @@ impl Source for WebVttSource {
     }
 
     fn get_basic_info(&self) -> Result<MkvBasicInfo> {
-        let file_size = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        let file_name = std::path::Path::new(&self.path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.clone());
         let tracks = self.get_tracks()?;
         let info = self.get_info()?;
-        Ok(MkvBasicInfo::new(&tracks, &info, file_size, file_name))
+        Ok(MkvBasicInfo::new(&tracks, &info, self.bytes_read, self.language.clone()))
     }
 
     fn get_info(&self) -> Result<Info> {

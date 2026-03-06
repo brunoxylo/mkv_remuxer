@@ -1,20 +1,21 @@
-use super::{KeyframePositionCache, SeekType, Source};
+use super::{KeyframePositionCache, MkvReader, SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::source::CutInterval;
 use crate::source::util::basic_info::MkvBasicInfo;
 use crate::{Error, Result};
+use clap::builder::Str;
 use log::{debug, info, trace};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::fmt;
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 
-pub struct FileSource {
-    file: File,
-    path: String,
+pub struct FileSource<T : MkvReader> {
+    file: T,
+    file_name: Option<String>,
     timecode_scale: u64,
     output_timecode_scale: u64,
     tracks: Tracks,
@@ -31,21 +32,16 @@ pub struct FileSource {
     finished: bool,
 }
 
-impl FileSource {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let path_str = path_ref.to_string_lossy().to_string();
-
-
-        let mut file = File::open(path_ref)?;
+impl<T: MkvReader> FileSource<T> {
+    pub fn new(mut reader: T) -> Result<Self> {
 
         // Read EBML header
-        let ebml_header = Header::read_from(&mut file)?;
-        let _ebml = Ebml::read_element(&ebml_header, &mut file)?;
+        let ebml_header = Header::read_from(&mut reader)?;
+        let _ebml = Ebml::read_element(&ebml_header, &mut reader)?;
 
 
         // Read Segment header
-        let segment_header = Header::read_from(&mut file)?;
+        let segment_header = Header::read_from(&mut reader)?;
         if segment_header.id.value != Segment::ID.value {
             return Err(Error::InvalidConfig(format!(
                 "Expected Segment, found ID: {:x}",
@@ -62,8 +58,8 @@ impl FileSource {
         let mut initial_cluster_pos: Option<KeyframePositionCache> = None;
 
         loop {
-            let pos = file.stream_position()?;
-            let header = match Header::read_from(&mut file) {
+            let pos = reader.stream_position()?;
+            let header = match Header::read_from(&mut reader) {
                 Ok(h) => h,
                 Err(e) => {
                     return Err(Error::InvalidFilePos(format!("header could not be loaded during init: {}", e)));
@@ -71,19 +67,19 @@ impl FileSource {
             };
 
             if header.id == Info::ID {
-                let info_elem = Info::read_element(&header, &mut file)?;
+                let info_elem = Info::read_element(&header, &mut reader)?;
                 timecode_scale = info_elem.timestamp_scale.0;
                 info = Some(info_elem);
             } else if header.id == Tracks::ID {
-                tracks = Some(Tracks::read_element(&header, &mut file)?);
+                tracks = Some(Tracks::read_element(&header, &mut reader)?);
             } else if header.id == Chapters::ID {
-                chapters = Some(Chapters::read_element(&header, &mut file)?);
+                chapters = Some(Chapters::read_element(&header, &mut reader)?);
             } else if header.id == Cues::ID {
-                cues = Some(Cues::read_element(&header, &mut file)?);
+                cues = Some(Cues::read_element(&header, &mut reader)?);
             } else if header.id == Cluster::ID {
-                let file_len = file.metadata()?.len();
+                let file_len = reader.stream_length()?;
                 initial_cluster_pos = Some(KeyframePositionCache::new(
-                    file.try_clone()?,
+                    reader.try_clone_reader()?,
                     timecode_scale,
                     0,
                     Some((pos, file_len)),
@@ -92,7 +88,7 @@ impl FileSource {
             } else {
                 let size = header.size.value;
                 if size > 0 && !header.size.is_unknown {
-                    file.seek(SeekFrom::Current(size as i64))?;
+                    reader.seek(SeekFrom::Current(size as i64))?;
                 }
             }
         }
@@ -106,8 +102,8 @@ impl FileSource {
             .and_then(|i| i.duration.map(|d| (d.0 * timecode_scale as f64) as u64));
 
         Ok(Self {
-            file,
-            path: path_str,
+            file: reader,
+            file_name: None,
             timecode_scale,
             output_timecode_scale: timecode_scale,
             tracks: tracks
@@ -125,6 +121,11 @@ impl FileSource {
             end_cluster_pos: None,
             finished: false,
         })
+    }
+
+    pub fn with_file_name(mut self, file_name: String) -> Self {
+        self.file_name = Some(file_name);
+        self
     }
 
     /// Find cluster position range from Cues for a given timestamp
@@ -168,7 +169,7 @@ impl FileSource {
     }
 
     fn find_start_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.file.stream_length()?;
         let range = match self.find_cluster_range_from_cues(target_timestamp_ns) {
             Some((start, end)) => {
                 trace!("Using Cues to narrow start cluster search: start_pos={}, end_pos={:?}", start, end);
@@ -180,7 +181,7 @@ impl FileSource {
             }
         };
         self.initial_cluster_pos = KeyframePositionCache::new(
-            self.file.try_clone()?,
+            self.file.try_clone_reader()?,
             self.timecode_scale,
             target_timestamp_ns,
             Some(range),
@@ -189,7 +190,7 @@ impl FileSource {
     }
     
     fn find_end_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
-        let file_len = self.file.metadata()?.len();
+        let file_len = self.file.stream_length()?;
         let range = match self.find_cluster_range_from_cues(target_timestamp_ns) {
             Some((start, end)) => {
                 trace!("Using Cues to narrow end cluster search: start_pos={}, end_pos={:?}", start, end);
@@ -201,7 +202,7 @@ impl FileSource {
             }
         };
         self.end_cluster_pos = Some(KeyframePositionCache::new(
-            self.file.try_clone()?,
+            self.file.try_clone_reader()?,
             self.timecode_scale,
             target_timestamp_ns,
             Some(range),
@@ -429,13 +430,13 @@ impl FileSource {
     }
 }
 
-impl fmt::Display for FileSource {
+impl<T: MkvReader> fmt::Display for FileSource<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FileSource",)
     }
 }
 
-impl Source for FileSource {
+impl<T: MkvReader> Source for FileSource<T> {
     fn get_tracks(&self) -> Result<Tracks> {
         Ok(self.tracks.clone())
     }
@@ -449,12 +450,8 @@ impl Source for FileSource {
     }
 
     fn get_basic_info(&self) -> Result<MkvBasicInfo> {
-        let file_size = self.file.metadata()?.len();
-        let file_name = std::path::Path::new(&self.path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.clone());
-        Ok(MkvBasicInfo::new(&self.tracks, &self.info, file_size, file_name))
+        let file_size = self.file.stream_length()?;
+        Ok(MkvBasicInfo::new(&self.tracks, &self.info, file_size, self.file_name.clone().unwrap_or("unknown".to_string())))
     }
 
     fn get_output_interval(&mut self) -> Result<CutInterval> {

@@ -94,6 +94,8 @@ impl Write for ChannelWriterWrapper {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use super::*;
     use crate::remux;
     use crate::remuxer::RemuxerCutMode;
@@ -109,7 +111,8 @@ mod tests {
         
         // Create input source from test.webm (uninitialized)
         let input_path = test_file_path();
-        let source = FileSource::new(&input_path)?;
+        let input_file = File::open(&input_path)?;
+        let source = FileSource::new(input_file)?;
         let input_source = InputSource::from(source);
         
         // Create output sink (uninitialized)
@@ -122,7 +125,8 @@ mod tests {
         
         // We need to pre-check for German audio tracks manually
         // Initialize source temporarily to check tracks
-        let temp_source = FileSource::new(&input_path)?;
+        let input_file = File::open(&input_path)?;
+        let temp_source = FileSource::new(input_file)?;
         let temp_input = InputSource::from(temp_source);
         let mut initialized_temp = temp_input.initialize(None)?.into_remuxing()?;
         let tracks = initialized_temp.get_tracks()?;
@@ -255,18 +259,21 @@ mod tests {
         
         // First, get the video tracks
         let video_path = std::path::Path::new("test_av1.webm");
-        let temp_video = FileSource::new(video_path)?;
+        let video_file = File::open(video_path)?;
+        let temp_video = FileSource::new(video_file)?;
         let temp_video_input = InputSource::from(temp_video);
         let mut init_video = temp_video_input.initialize(None)?;
         let video_tracks = init_video.get_tracks()?;
         
         // Create video source from test_av1.webm
-        let video_source = FileSource::new(video_path)?;
+        let video_file = File::open(video_path)?;
+        let video_source = FileSource::new(video_file)?;
         let video_input = InputSource::from(video_source);
         
         // Create WebVTT subtitle source from example.vtt (first 30 seconds only to match video)
         let vtt_path = std::path::Path::new("example.vtt");
-        let vtt_source = WebVttSource::new(vtt_path, "eng")?;
+        let vtt_file = File::open(vtt_path)?;
+        let vtt_source = WebVttSource::new(vtt_file, "eng".to_string(), false)?;
         let vtt_input = InputSource::from(vtt_source);
         
         // Create output sink
@@ -343,10 +350,13 @@ mod tests {
         let av1_path = std::path::Path::new("test_av1.webm");
         let vp9_path = std::path::Path::new("test_vp9.webm");
         let vtt_path = std::path::Path::new("example.vtt");
+        let av1_file = File::open(av1_path)?;
+        let vp9_file = File::open(vp9_path)?;
+        let vtt_file = File::open(vtt_path)?;
 
-        let source0 = InputSource::from(FileSource::new(av1_path)?);
-        let source1 = InputSource::from(FileSource::new(vp9_path)?);
-        let source2 = InputSource::from(WebVttSource::new(vtt_path, "eng")?);
+        let source0 = InputSource::from(FileSource::new(av1_file)?);
+        let source1 = InputSource::from(FileSource::new(vp9_file)?);
+        let source2 = InputSource::from(WebVttSource::new(vtt_file, "eng".to_string(), false)?);
 
         let output = OutputSink::from(FileSink::new(&output_path)?);
 

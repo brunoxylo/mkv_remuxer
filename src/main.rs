@@ -183,14 +183,22 @@ fn main() -> Result<()> {
             Some("vtt") | Some("webvtt") => {
                 // Create WebVTT source with default language "eng"
                 // TODO: Allow language override via CLI flag
-                let vtt_source = WebVttSource::new(input_path, "eng")
-                    .with_context(|| format!("Failed to parse WebVTT file: {}", input_path))?;
+                let file = File::open(input_path)
+                    .with_context(|| format!("Failed to open input file: {}", input_path))?;
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                let vtt_source = WebVttSource::new(file, "eng".to_string(), false)
+                    .with_context(|| format!("Failed to parse WebVTT file: {}", input_path))?
+                    .with_file_name(file_name);
                 InputSource::from(vtt_source)
             }
             _ => {
-                // Default to FileSource for .mkv, .webm, etc.
-                let file_source = FileSource::new(input_path)
+                let file = File::open(input_path)
                     .with_context(|| format!("Failed to open input file: {}", input_path))?;
+                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                // Default to FileSource for .mkv, .webm, etc.
+                let  file_source = FileSource::new(file)
+                    .with_context(|| format!("Failed to open input file: {}", input_path))?
+                    .with_file_name(file_name);
                 InputSource::from(file_source)
             }
         };

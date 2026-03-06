@@ -2,9 +2,9 @@ use crate::{Error, Result};
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use crate::block_ext::{ClusterBlockExt, ClusterExt};
+use super::mkv_reader::MkvReader;
 
 /// Lightweight cache for keyframe positions in the current cluster of interest
 /// to speed up freeze seek operations without fully parsing all blocks in the cluster.
@@ -13,7 +13,7 @@ use crate::block_ext::{ClusterBlockExt, ClusterExt};
 /// then lazily caches keyframe positions when queried.
 pub struct KeyframePositionCache {
     pub position: u64,
-    file: File,
+    file: Box<dyn MkvReader>,
     timecode_scale: u64,
     reference_timestamp_ns: u64,
     keyframe_timestamp_ns: HashMap<(u64, bool), i64>, // (track_num, after or before) -> timestamp_ns of keyframe
@@ -29,7 +29,7 @@ impl KeyframePositionCache {
     /// * `range` — optional `(lo, hi)` byte range to confine the search;
     ///   when `None`, the entire file is searched.
     pub fn new(
-        mut file: File,
+        mut file: Box<dyn MkvReader>,
         timecode_scale: u64,
         timestamp_ns: u64,
         range: Option<(u64, u64)>,
@@ -37,7 +37,7 @@ impl KeyframePositionCache {
         let (lo, hi) = match range {
             Some((start, end)) => (start, end),
             None => {
-                let file_len = file.metadata()?.len();
+                let file_len = file.stream_length()?;
                 (0, file_len)
             }
         };
@@ -128,7 +128,7 @@ impl KeyframePositionCache {
     /// Binary-search the file for the cluster whose timestamp is closest to
     /// (but ≤) `target_timestamp_ns`. Returns the file position of that cluster.
     fn binary_search_cluster(
-        file: &mut File,
+        file: &mut dyn MkvReader,
         timecode_scale: u64,
         target_timestamp_ns: i64,
         mut lo: u64,
@@ -197,7 +197,7 @@ impl KeyframePositionCache {
     /// Assumes `pos` points to a valid Cluster header.
     /// The file seek position is preserved after this operation.
     fn read_cluster_timestamp_at(
-        file: &mut File,
+        file: &mut dyn MkvReader,
         pos: u64,
         timecode_scale: u64,
     ) -> Result<u64> {
@@ -396,10 +396,10 @@ enum Direction {
 /// The position can be in the middle of a cluster and does not have top point to a valid cluster header
 /// IF the pos points to a valid cluster header, this cluster will be skipped and the next/previous one will be returned
 /// The files seek position is preseved after this operation
-fn scan_cluster_in_direction(file: &mut File, pos :u64, direction: Direction) -> Result<Option<(u64)>> {
+fn scan_cluster_in_direction(file: &mut dyn MkvReader, pos :u64, direction: Direction) -> Result<Option<u64>> {
     const BUF_SIZE: usize = 8192;
     let old_file_pos = file.stream_position()?;
-    let file_end_pos = file.metadata()?.len();
+    let file_end_pos = file.stream_length()?;
 
 
     fn read_cluster_headers_pos_from_buffer(buf: &[u8]) -> Vec<usize> {
@@ -407,7 +407,7 @@ fn scan_cluster_in_direction(file: &mut File, pos :u64, direction: Direction) ->
                 buf.windows(4).enumerate().filter_map(|(i, w)| if w == CLUSTER_ID { Some(i) } else { None }).collect()
     }
 
-    fn filter_valid_cluster_pos(file: &mut File, direction :Direction, candidate_pos: Vec<u64>) -> Result<Option<u64>> {
+    fn filter_valid_cluster_pos(file: &mut dyn MkvReader, direction :Direction, candidate_pos: Vec<u64>) -> Result<Option<u64>> {
         // we need to travers backward if the direction is backward to find the nearest cluster header
         let iterator: Box<dyn Iterator<Item = &u64>> = match direction {
             Direction::Forward | Direction::Next => Box::new(candidate_pos.iter()),
@@ -478,7 +478,7 @@ fn scan_cluster_in_direction(file: &mut File, pos :u64, direction: Direction) ->
     }
     file.seek(SeekFrom::Start(old_file_pos))?;
     if let Some(out_pos) = output_position {
-        Ok(Some((out_pos)))
+        Ok(Some(out_pos))
     } else {
         Ok(None)
     }
