@@ -128,6 +128,12 @@ impl<T: MkvReader> FileSource<T> {
         self
     }
 
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<FileSource<File>> {
+        let file = File::open(path.as_ref())?;
+        let file_name = path.as_ref().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        Ok(FileSource::new(file)?.with_file_name(file_name))
+    }
+
     /// Find cluster position range from Cues for a given timestamp
     /// Returns (start_pos, end_pos) or None if Cues don't help narrow the range
     fn find_cluster_range_from_cues(&self, target_timestamp_ns: u64) -> Option<(u64, Option<u64>)> {
