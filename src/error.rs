@@ -25,6 +25,8 @@ pub enum Error {
     /// Invalid or missing required element
     MissingElement(String),
 
+    InternalBug(String),
+
     /// Invalid timestamp or seek position
     InvalidTimestamp(String),
 
@@ -69,6 +71,7 @@ pub enum Error {
     /// General remuxing error
     RemuxError(String),
     ClusterIsFull(String),
+    FileCorrupted(String),
 }
 
 impl fmt::Display for Error {
@@ -100,8 +103,10 @@ impl fmt::Display for Error {
             }
             Error::UnsupportedOperation(msg) => write!(f, "Unsupported operation: {}", msg),
             Error::RemuxError(msg) => write!(f, "Remux error: {}", msg),
+            Error::InternalBug(msg) => write!(f, "Internal bug: {}", msg),
             Error::ClusterIsFull(msg) => write!(f, "Cluster is full: {}", msg),
             Error::Done => write!(f, "Remuxing completed"),
+            Error::FileCorrupted(msg) => write!(f, "File is corrupted: {}", msg),
         }
     }
 }

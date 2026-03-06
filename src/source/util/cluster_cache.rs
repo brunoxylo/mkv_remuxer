@@ -145,8 +145,8 @@ impl KeyframePositionCache {
 
         loop {
             if sanity_check_counter > 100 {
-                return Err(Error::InvalidConfig(
-                    "Binary search failed to converge after 100 iterations - timestamps corrupted?".to_string(),
+                return Err(Error::InternalBug(
+                    "Binary search failed to converge after 100 iterations".to_string(),
                 ));
             }
             sanity_check_counter += 1;
@@ -187,7 +187,7 @@ impl KeyframePositionCache {
             // lo was never set to a cluster — try scanning forward from lo
             match scan_cluster_in_direction(file, lo, Direction::Forward)? {
                 Some(cluster_pos) => Ok(cluster_pos),
-                None => Err(Error::InvalidConfig("No clusters found".to_string())),
+                None => Err(Error::NotFound("No clusters found during binary search".to_string())),
             }
         }
     }
@@ -285,7 +285,7 @@ impl KeyframePositionCache {
             let keyframe_timestamp_ns = cluster
                 .blocks
                 .get(keyframe_idx)
-                .ok_or(Error::InvalidConfig(
+                .ok_or(Error::InternalBug(
                     "Keyframe Index out of bounds".to_string(),
                 ))?
                 .timestamp_ns(cluster.timestamp.0 as i64, self.timecode_scale)?;
@@ -310,11 +310,17 @@ impl KeyframePositionCache {
 
         // No suitable keyframe in current cluster, search neighboring clusters
         // using scan_cluster_in_direction.
-        const MAX_NEIGHBOR_SEARCH: usize = 60;
         let mut direction = if after { Direction::Next } else { Direction::Previous };
         let mut search_pos = self.position;
 
-        for _ in 0..MAX_NEIGHBOR_SEARCH {
+        let mut sanity_check_counter = 0;
+        loop {
+            if sanity_check_counter > 1000 {
+                return Err(Error::FileCorrupted(
+                    "No keyframes found after scanning 1000 clusters".to_string(),
+                ));
+            }         
+            sanity_check_counter += 1;
             let (cluster_pos, neighbor_cluster) = match scan_cluster_in_direction(&mut self.file, search_pos, direction)? {
                 Some(result) =>   {
                     let cluster = Cluster::from_file_pos(&mut self.file, result)?;
@@ -343,7 +349,7 @@ impl KeyframePositionCache {
                 let keyframe_timestamp_ns = neighbor_cluster
                     .blocks
                     .get(keyframe_idx)
-                    .ok_or(Error::InvalidConfig("Keyframe Index out of bounds".to_string()))?
+                    .ok_or(Error::InternalBug("Keyframe Index out of bounds".to_string()))?
                     .timestamp_ns(neighbor_cluster.timestamp.0 as i64, self.timecode_scale)?;
 
                 let meets_criteria = if new_after {
@@ -368,7 +374,7 @@ impl KeyframePositionCache {
             search_pos = cluster_pos;
         }
 
-        Err(Error::InvalidConfig("No keyframes found in any nearby cluster".to_string()))
+        Err(Error::NotFound("No keyframes found in any nearby cluster".to_string()))
     }
 }
 
@@ -433,9 +439,9 @@ fn scan_cluster_in_direction(file: &mut File, pos :u64, direction: Direction) ->
     let mut output_position :Option<u64> = None;
     let mut sanity_check_counter = 0;
     while current_position > 0 && current_position < file_end_pos {
-        if sanity_check_counter > 1000_000 {
-            return Err(Error::InvalidConfig(
-                format!("Cluster {:?} scan at {} reached position {} but failed to converge after 1000000 iterations", direction, pos, current_position),
+        if sanity_check_counter > 200_000 { // approx 1600MB scanned without finding a valid cluster header
+            return Err(Error::FileCorrupted(
+                format!("Could not find a valid Cluster header after scanning {} bytes", sanity_check_counter * BUF_SIZE),
             ));
         }
         sanity_check_counter += 1;
