@@ -245,7 +245,7 @@ impl Remuxer {
             ));
         };
 
-        info!("Container format: {:?}", output_format);
+        debug!("MkvRemuxer: Container format: {:?}", output_format);
 
         debug!("Initializing output sink");
         let output_sink = output_sink.initialize_simple(

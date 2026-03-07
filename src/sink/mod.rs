@@ -43,49 +43,49 @@ pub enum SinkSender {
 }
 pub struct ChannelWriterWrapper {
     pub tx: SinkSender,
-    prefill_buffer: Vec<Bytes>,
-    reading_started: bool,
+    prefill_buffer: Vec::<u8>,
+    previously_flushed: bool,
 }
 impl ChannelWriterWrapper {
     pub fn new(tx: SinkSender) -> Self {
         Self {
             tx,
-            prefill_buffer: Vec::new(),
-            reading_started: false,
+            prefill_buffer: Vec::with_capacity(10_000), // 10k should be enough to buffer the initial EBML header and segment info
+            previously_flushed: false,
         }
     }
     fn send_err(e: &dyn Display) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
     }
+    fn send_in_chunks(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        // Send data in chunks of 100KB to avoid overwhelming the channel
+        const CHUNK_SIZE: usize = 100 * 1024;
+        for chunk in buf.chunks(CHUNK_SIZE) {
+            match &self.tx {
+                SinkSender::Sync(tx) => tx.send(bytes::Bytes::copy_from_slice(chunk)).map_err(|e| Self::send_err(&e))?,
+                SinkSender::Tokio(tx) => tx.blocking_send(bytes::Bytes::copy_from_slice(chunk)).map_err(|e| Self::send_err(&e))?,
+            };
+        }
+        Ok(())
+    }
 }
 impl Write for ChannelWriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.reading_started && self.prefill_buffer.len() < 20 {
+        if !self.previously_flushed && self.prefill_buffer.len() < 1000_000 { // dont buffer more than 1MB to avoid excessive memory usage
             // Buffer the first few writes to allow the sink to initialize
-            self.prefill_buffer.push(bytes::Bytes::copy_from_slice(buf));
-            return Ok(buf.len());
+            self.prefill_buffer.extend_from_slice(&buf);
         } else {
             self.flush()?;
-            match &self.tx {
-                SinkSender::Sync(tx) => {
-                    tx.send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| Self::send_err(&e))?;
-                },
-                SinkSender::Tokio(tx) => {
-                    tx.blocking_send(bytes::Bytes::copy_from_slice(buf)).map_err(|e| Self::send_err(&e))?;
-                },
-            }
-            self.reading_started = true;
+            self.send_in_chunks(buf)?;
         }
-
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        for buffered in self.prefill_buffer.drain(..) {
-            match &self.tx {
-                SinkSender::Sync(tx) => tx.send(buffered).map_err(|e| Self::send_err(&e))?,
-                SinkSender::Tokio(tx) => tx.blocking_send(buffered).map_err(|e| Self::send_err(&e))?,
-            };
+        self.previously_flushed = true;
+        if !self.prefill_buffer.is_empty() {
+            let buffer = std::mem::take(&mut self.prefill_buffer);
+            self.send_in_chunks(&buffer)?;
         }
         Ok(())
     }

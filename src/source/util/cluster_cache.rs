@@ -1,4 +1,5 @@
 use crate::{Error, Result};
+use log::info;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::collections::HashMap;
@@ -41,8 +42,9 @@ impl KeyframePositionCache {
                 (0, file_len)
             }
         };
-
+        let start_time = std::time::Instant::now();
         let position = Self::binary_search_cluster(&mut file, timecode_scale, timestamp_ns as i64, lo, hi)?;
+        info!("MkvRemuxer: Binary search for cluster completed in {} ms", start_time.elapsed().as_millis());
 
         Ok(Self {
             position,

@@ -69,6 +69,7 @@ impl<W: Write + Send> Sink for StreamSink<W> {
         if let Some(chapters) = chapters {
             chapters.write_to(&mut self.writer)?;
         }
+        self.writer.flush()?;
 
         // Store timescale for timestamp calculations
         self.timescale = info.timestamp_scale.0;

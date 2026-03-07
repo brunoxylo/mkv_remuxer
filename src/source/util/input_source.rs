@@ -1,4 +1,5 @@
 use crate::Result;
+use log::{debug, info};
 use mkv_element::prelude::*;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -55,7 +56,9 @@ impl InputSource<Uninitialized> {
     /// Pipes to [`Source::initialize`].  Metadata methods become valid on the
     /// returned source; no cut has been applied yet.
     pub fn initialize(mut self, output_time_scale: Option<u64>) -> Result<InputSource<Cutting>> {
+        let start_time = std::time::Instant::now();
         let _cut_interval = self.inner.initialize(output_time_scale)?;
+        info!("MkvRemuxer: Source initialized in {} ms", start_time.elapsed().as_millis());
         Ok(InputSource { inner: self.inner, _state: PhantomData })
     }
 
@@ -102,7 +105,10 @@ impl InputSource<Cutting> {
         seek_type: SeekType,
         interval: CutInterval,
     ) -> Result<CutInterval> {
-        self.inner.cut(seek_type, interval)
+        let start_time = std::time::Instant::now();
+        let result = self.inner.cut(seek_type, interval);
+        info!("MkvRemuxer: Cut applied in {} ms", start_time.elapsed().as_millis());
+        result
     }
 
     /// **Cutting → Remuxing.**
@@ -139,7 +145,10 @@ impl InputSource<Remuxing> {
     /// Returns the next cluster, or `None` at end-of-stream.
     /// Pipes to [`Source::get_next_cluster`].
     pub fn get_next_cluster(&mut self) -> Result<Option<Cluster>> {
-        self.inner.get_next_cluster()
+        let start_time = std::time::Instant::now();
+        let result = self.inner.get_next_cluster();
+        info!("MkvRemuxer: get_next_cluster() completed in {} ms", start_time.elapsed().as_millis());
+        result
     }
 }
 

@@ -93,6 +93,8 @@ impl<T: MkvReader> FileSource<T> {
             }
         }
 
+        info!("MkvRemuxer: We found {} cues in the file", cues.as_ref().map(|c| c.cue_point.len()).unwrap_or(0));
+
         let initial_cluster_pos = initial_cluster_pos
             .ok_or_else(|| Error::InvalidConfig("No clusters found".to_string()))?;
         
