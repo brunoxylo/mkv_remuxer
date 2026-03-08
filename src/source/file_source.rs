@@ -77,12 +77,11 @@ impl<T: MkvReader> FileSource<T> {
             } else if header.id == Cues::ID {
                 cues = Some(Cues::read_element(&header, &mut reader)?);
             } else if header.id == Cluster::ID {
-                let file_len = reader.stream_length()?;
-                initial_cluster_pos = Some(KeyframePositionCache::new(
+                initial_cluster_pos = Some(KeyframePositionCache::form_file_pos(
                     reader.try_clone_reader()?,
                     timecode_scale,
                     0,
-                    Some((pos, file_len)),
+                    pos,
                 )?);
                 break;
             } else {

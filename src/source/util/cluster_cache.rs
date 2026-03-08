@@ -56,6 +56,17 @@ impl KeyframePositionCache {
         })
     }
 
+    pub fn form_file_pos(file: Box<dyn MkvReader>, timecode_scale: u64, timestamp_ns: u64, position: u64) -> Result<Self> {
+        Ok(Self {
+            position,
+            file,
+            timecode_scale,
+            reference_timestamp_ns: timestamp_ns,
+            keyframe_timestamp_ns: HashMap::new(),
+            keyframe_cluster_position: HashMap::new(),
+        })
+    }
+
     /// Returns the reference timestamp (in nanoseconds) that this cache was
     /// constructed with.
     pub fn get_timestamp_ns(&self) -> i64 {
@@ -274,6 +285,9 @@ impl KeyframePositionCache {
             return Ok(());
         }*/
 
+        let start_time = std::time::Instant::now();
+
+
         // Try to find keyframe in current cluster first
         let cluster = Cluster::from_file_pos(&mut self.file, self.position)?;
         let keyframe_idx_opt = if after {
@@ -333,7 +347,7 @@ impl KeyframePositionCache {
                          // if we cant find something in one direction, we change the direction but include the current cluster
                         Direction::Next => Direction::Backward,
                         Direction::Previous => Direction::Forward,
-                        _ => break, // we have already reversed once, break to avoid infinite loop
+                        _ => return Err(Error::FileCorrupted("No keyframes despite scanning the whole file".to_string())),
                     };
                     continue;
                 }
@@ -369,14 +383,13 @@ impl KeyframePositionCache {
                         (track_num, after),
                         keyframe_timestamp_ns,
                     );
+                    info!("MkvRemuxer: Keyframe cache updated key ({}, {}) after scanning {} clusters in {} ms for timestamp {}", track_num, after, sanity_check_counter, start_time.elapsed().as_millis(), reference_timestamp_ns);
                     return Ok(());
                 }
             }
 
             search_pos = cluster_pos;
         }
-
-        Err(Error::NotFound("No keyframes found in any nearby cluster".to_string()))
     }
 }
 
@@ -399,43 +412,58 @@ enum Direction {
 /// IF the pos points to a valid cluster header, this cluster will be skipped and the next/previous one will be returned
 /// The files seek position is preseved after this operation
 fn scan_cluster_in_direction(file: &mut dyn MkvReader, pos :u64, direction: Direction) -> Result<Option<u64>> {
-    const BUF_SIZE: usize = 8192;
+    const BUF_SIZE: usize = 819200; // 800KB buffer for scanning (should be enough to find a cluster header in most cases, adjust as needed)
+    const BUFFER_OVER_SCAN: usize = 16; // number of bytes to overscan we need to overscan a whole cluster header (max 8 bytes id + 8 bytes length) to avoid missing cluster headers that are at the end of the buffer
     let old_file_pos = file.stream_position()?;
     let file_end_pos = file.stream_length()?;
 
 
     fn read_cluster_headers_pos_from_buffer(buf: &[u8]) -> Vec<usize> {
                 const CLUSTER_ID: [u8; 4] = [0x1F, 0x43, 0xB6, 0x75];
-                buf.windows(4).enumerate().filter_map(|(i, w)| if w == CLUSTER_ID { Some(i) } else { None }).collect()
+                let mut cluster_starts :Vec<usize> =buf.windows(4).enumerate().filter_map(|(i, w)| if w == CLUSTER_ID { Some(i) } else { None }).collect();
+                // after a more rudimentary matching try to parse the header to avoid false positives in the block data, we need to retain only the positions that are actual cluster headers
+                let mut buf_reader = std::io::Cursor::new(buf);
+                cluster_starts.retain(|&pos| {
+                    buf_reader.set_position(pos as u64);
+                    match Header::read_from(&mut buf_reader) {
+                        Ok(h) => h.id == Cluster::ID,
+                        Err(_) => false,
+                    }
+                });
+                cluster_starts
+
     }
 
-    fn filter_valid_cluster_pos(file: &mut dyn MkvReader, direction :Direction, candidate_pos: Vec<u64>) -> Result<Option<u64>> {
+    // require absolute positions of candidate clusters 
+    fn filter_valid_cluster_pos(direction :Direction, mut candidate_pos: Vec<u64> ,initial_position :u64) -> Result<Option<u64>> {
         // we need to travers backward if the direction is backward to find the nearest cluster header
+        candidate_pos.sort();
+        // for back looking scans we invert the iterator
         let iterator: Box<dyn Iterator<Item = &u64>> = match direction {
             Direction::Forward | Direction::Next => Box::new(candidate_pos.iter()),
             Direction::Backward | Direction::Previous => Box::new(candidate_pos.iter().rev()),
         };
+        // we only allow the initial considers for Forward and Backward
+        let my_cmp :fn(u64, u64) -> bool = match direction {
+            Direction::Forward =>   |candidate, initial| candidate >= initial,  // can be initial or greater
+            Direction::Next =>      |candidate, initial| candidate > initial,   // must be greater than initial
+            Direction::Backward  => |candidate, initial| candidate <= initial,  // can be initial or smaller
+             Direction::Previous => |candidate, initial| candidate < initial,   // must be smaller than initial
+        };
         let mut output_position :Option<u64> = None;
-        let orig_file_pos = file.stream_position()?;
         for pos in iterator {
-            file.seek(SeekFrom::Start(*pos as u64))?;
-            // we need to check wherter the cluster header is acually valid or just a false positive in the block data
-            let header = match Header::read_from(file) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            if header.id == Cluster::ID {
-                output_position = Some(*pos as u64);
+            if my_cmp(*pos, initial_position) {
+                output_position = Some(*pos);
                 break;
             }
+           
         }
-        file.seek(SeekFrom::Start(orig_file_pos))?;
         Ok(output_position)
     }
 
     let mut current_position = match direction {
         Direction::Forward | Direction::Next => pos,
-        Direction::Backward | Direction::Previous => pos.saturating_sub(BUF_SIZE as u64),
+        Direction::Backward | Direction::Previous => pos.saturating_sub((BUF_SIZE - BUFFER_OVER_SCAN) as u64),
     };
     let mut buffer = [0u8; BUF_SIZE];
     let mut output_position :Option<u64> = None;
@@ -449,7 +477,7 @@ fn scan_cluster_in_direction(file: &mut dyn MkvReader, pos :u64, direction: Dire
         sanity_check_counter += 1;
         file.seek(SeekFrom::Start(current_position))?;
         let n = file.read(&mut buffer)?;
-        if n < 4 {
+        if n <= BUFFER_OVER_SCAN {
             // not enough data to contain a cluster header, stop searching
             break;
         }
@@ -461,16 +489,15 @@ fn scan_cluster_in_direction(file: &mut dyn MkvReader, pos :u64, direction: Dire
         // convert to absolute positions and exclude the position we want to skip
         let cluster_positions_absolute: Vec<u64> = cluster_positions_n_buffer.iter()
             .map(|offset| current_position + *offset as u64)
-            .filter(|abs_pos| *abs_pos != pos || !skip_input_pos)
             .collect();
-        if let Some(cluster_absolute_pos) = filter_valid_cluster_pos(file, direction, cluster_positions_absolute)? {
+        if let Some(cluster_absolute_pos) = filter_valid_cluster_pos(direction, cluster_positions_absolute, pos)? {
             output_position = Some(cluster_absolute_pos);
             break;
         } else { // no valid cluster header found in this buffer, continue searching
             match direction {
-                // overscan to avoid missing cluster headers that are at the end of the buffer, 4 the cluster id (4 bytes)
-                Direction::Forward | Direction::Next => current_position += (n as u64 - 4), 
-                Direction::Backward | Direction::Previous => current_position = current_position.saturating_sub(BUF_SIZE as u64 - 4)
+                // overscan to avoid missing cluster headers 
+                Direction::Forward | Direction::Next => current_position += (n as u64 - BUFFER_OVER_SCAN as u64), 
+                Direction::Backward | Direction::Previous => current_position = current_position.saturating_sub(BUF_SIZE as u64 - BUFFER_OVER_SCAN as u64)
             }
         }
         if n < BUF_SIZE {
