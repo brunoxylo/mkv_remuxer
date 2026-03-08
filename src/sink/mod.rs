@@ -58,8 +58,8 @@ impl ChannelWriterWrapper {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
     }
     fn send_in_chunks(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        // Send data in chunks of 100KB to avoid overwhelming the channel
-        const CHUNK_SIZE: usize = 100 * 1024;
+        // Send data in chunks of 10KB to avoid overwhelming the channel
+        const CHUNK_SIZE: usize = 10 * 1024;
         for chunk in buf.chunks(CHUNK_SIZE) {
             match &self.tx {
                 SinkSender::Sync(tx) => tx.send(bytes::Bytes::copy_from_slice(chunk)).map_err(|e| Self::send_err(&e))?,
