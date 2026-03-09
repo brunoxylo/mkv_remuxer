@@ -111,7 +111,7 @@ impl ClusterWriteWrapper {
         let cluster_duration = (block_end_ns as i64 - cluster_start_ns as i64).max(0);
 
         // Check if the cluster has reached size or duration limits
-        if self.duration_ns as i64 + cluster_duration > self.cluster_max_duration_ns as i64
+        if cluster_duration > self.cluster_max_duration_ns as i64
             || self.size_bytes as i64 + block_size as i64 > self.cluster_max_size_bytes as i64
         {
             return Err(Error::ClusterIsFull(format!(
@@ -119,7 +119,7 @@ impl ClusterWriteWrapper {
                 self.cluster_max_size_bytes, self.cluster_max_duration_ns, block_size
             )));
         }
-        self.duration_ns += cluster_duration as u64;
+        self.duration_ns = cluster_duration as u64;
         self.size_bytes += block_size as u64;
 
         // Add block to cluster
