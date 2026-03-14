@@ -94,7 +94,7 @@ impl MeltingPot {
             // not yet initialized
             if output_cluster.is_none() && lowest_cluster_index.is_some() {
                 output_cluster = Some(ClusterWriteWrapper::new(
-                    lowest_timestamp_ns as u64,
+                    lowest_timestamp_ns.max(0) as u64,
                     timescale,
                 ));
             }

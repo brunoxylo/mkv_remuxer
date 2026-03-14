@@ -131,8 +131,8 @@ impl ClusterWriteWrapper {
             .last_mut()
             .ok_or_else(|| Error::InvalidBlockData("Failed to get last block".to_string()))?;
         target_block.set_timestamp_ns(
-            absolute_timestamp_ns,
-            self.cluster.timestamp.0 as i64,
+            absolute_timestamp_ns.max(0) as u64,
+            self.cluster.timestamp.0,
             self.timecode_scale,
         )?;
         if let Some(track_number) = track_number {

@@ -70,8 +70,8 @@ pub trait ClusterBlockExt {
     /// Set the timestamp from absolute nanoseconds
     fn set_timestamp_ns(
         &mut self,
-        time_ns: i64,
-        cluster_timestamp: i64,
+        time_ns: u64,
+        cluster_timestamp: u64,
         timecode_scale: u64,
     ) -> Result<(), Error>;
 
@@ -346,12 +346,12 @@ impl ClusterBlockExt for ClusterBlock {
 
     fn set_timestamp_ns(
         &mut self,
-        time_ns: i64,
-        cluster_timestamp: i64,
+        time_ns: u64,
+        cluster_timestamp: u64,
         timecode_scale: u64,
     ) -> Result<(), Error> {
-        let new_ticks = time_ns / timecode_scale as i64;
-        let new_rel_ticks = new_ticks - cluster_timestamp;
+        let new_ticks = time_ns / timecode_scale;
+        let new_rel_ticks = new_ticks as i64 - cluster_timestamp as i64;
         let clamped = new_rel_ticks.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
         self.set_timestamp(clamped)
     }

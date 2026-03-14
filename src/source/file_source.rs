@@ -224,7 +224,7 @@ impl<T: MkvReader> FileSource<T> {
 
         let orig_block_count = cluster.blocks.len();
 
-        let orig_cluster_ticks = cluster.timestamp.0 as i64;
+        let orig_cluster_ticks = cluster.timestamp.0;
         let orig_cluster_ns = cluster.get_timestamp_ns(self.timecode_scale) as i64;
 
         // Shift cluster timestamp
@@ -268,7 +268,7 @@ impl<T: MkvReader> FileSource<T> {
         };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
         cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
-        let shifted_cluster_ticks = cluster.timestamp.0 as i64;
+        let shifted_cluster_ticks = cluster.timestamp.0;
 
         let mut filtered = Vec::with_capacity(orig_block_count);
 
@@ -277,7 +277,7 @@ impl<T: MkvReader> FileSource<T> {
                 // Simple: just shift timestamps, but we still need to respect end_ns
                 let mut filtered = Vec::with_capacity(cluster.blocks.len());
                 for mut block in cluster.blocks {
-                    let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
+                    let abs_ns = block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
                     if let Some(end) = actual_end_pos {
                         if abs_ns > end {
                             //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
@@ -290,8 +290,8 @@ impl<T: MkvReader> FileSource<T> {
                         continue;
                     }
                     block.set_timestamp_ns(
-                        abs_ns - shift_reference,
-                        cluster.timestamp.0 as i64,
+                        (abs_ns - shift_reference).max(0) as u64,
+                        cluster.timestamp.0,
                         self.output_timecode_scale,
                     )?;
                     trace!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", 
@@ -309,7 +309,7 @@ impl<T: MkvReader> FileSource<T> {
             SeekType::DirtyCut => {
                 // Drop frames outside range
                 for mut block in cluster.blocks {
-                    let abs_ns = block.timestamp_ns(orig_cluster_ticks, self.timecode_scale)?;
+                    let abs_ns = block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
                     let start = self.initial_cluster_pos.get_timestamp_ns();
                     if abs_ns  < start {
                         continue;
@@ -322,8 +322,8 @@ impl<T: MkvReader> FileSource<T> {
                     }
                     let offset = abs_ns as i64 - start as i64;
                     block.set_timestamp_ns(
-                        offset,
-                        cluster.timestamp.0 as i64,
+                        offset.max(0) as u64,
+                        cluster.timestamp.0,
                         self.output_timecode_scale,
                     )?;
                     filtered.push(block);
@@ -354,8 +354,8 @@ impl<T: MkvReader> FileSource<T> {
     fn process_squeeze_cluster(
         &mut self,
         mut cluster: Cluster,
-        orig_cluster_ticks: i64,
-        shifted_cluster_ticks: i64,
+        orig_cluster_ticks: u64,
+        shifted_cluster_ticks: u64,
     ) -> Result<Cluster> {
         let mut filtered = Vec::with_capacity(cluster.blocks.len());
         for mut block in cluster.blocks {
@@ -366,7 +366,7 @@ impl<T: MkvReader> FileSource<T> {
                 .ok_or_else(|| Error::TrackNotFound(track_num))?;
 
             let abs_ns = block
-                .timestamp_ns(orig_cluster_ticks, self.timecode_scale)
+                .timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)
                 .unwrap_or(0);
 
             match kind {
@@ -397,7 +397,7 @@ impl<T: MkvReader> FileSource<T> {
                         trace!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
                     } else {
                         // No end: just shift by squeeze window
-                        let offset = abs_ns - start as i64;
+                        let offset = (abs_ns - start).max(0) as u64;
                         block.set_timestamp_ns(
                             offset,
                             shifted_cluster_ticks,
@@ -419,7 +419,7 @@ impl<T: MkvReader> FileSource<T> {
                             continue;
                         }
                         // Shift to start after squeeze window
-                        let offset = abs_ns - start as i64;
+                        let offset = (abs_ns - start).max(0) as u64;
                         block.set_timestamp_ns(
                             offset,
                             shifted_cluster_ticks,
