@@ -99,7 +99,7 @@ impl ClusterWriteWrapper {
 
     /// Add a block to the cluster with its absolute timestamp in nanoseconds
     /// The relative timestamp will be calculated automatically
-    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: i64, track_number: Option<u64>) -> Result<()> {
+    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: u64, track_number: Option<u64>) -> Result<()> {
         // Estimate block size (header + data)
         let block_size = match &block {
             ClusterBlock::Simple(sb) => sb.0.len(),

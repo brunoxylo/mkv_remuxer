@@ -61,7 +61,7 @@ impl MeltingPot {
             }
 
             // find the block with the lowest timestamp among all input clusters
-            let mut lowest_timestamp_ns: i64 = i64::MAX;
+            let mut lowest_timestamp_found: i64 = i64::MAX;
             let mut lowest_cluster_index = None;
             for (index, cluster_wrapper) in self.clusters.iter_mut().enumerate() {
                 if let Some(cluster) = cluster_wrapper {
@@ -73,8 +73,8 @@ impl MeltingPot {
                     }
                     match cluster.get_current_absolute_timestamp_ns(timescale) {
                         Ok(ts) => {
-                            if ts <= lowest_timestamp_ns {
-                                lowest_timestamp_ns = ts;
+                            if ts <= lowest_timestamp_found {
+                                lowest_timestamp_found = ts;
                                 lowest_cluster_index = Some(index);
                             }
                         }
@@ -91,10 +91,11 @@ impl MeltingPot {
                     }
                 }
             }
+            let lowest_timestamp_ns = lowest_timestamp_found.max(0) as u64;
             // not yet initialized
             if output_cluster.is_none() && lowest_cluster_index.is_some() {
                 output_cluster = Some(ClusterWriteWrapper::new(
-                    lowest_timestamp_ns.max(0) as u64,
+                    lowest_timestamp_ns,
                     timescale,
                 ));
             }
