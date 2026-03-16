@@ -21,11 +21,6 @@
     
     <div class="controls">
         <div class="control-group">
-            <label>File:</label>
-            <select id="fileSelect"></select>
-        </div>
-        
-        <div class="control-group">
             <label>Video Track:</label>
             <select id="videoTrackSelect"></select>
         </div>
@@ -59,7 +54,6 @@
             const player = new DidiPlayer(video);
             
             // UI References
-            const fileSelect = document.getElementById('fileSelect');
             const videoSelect = document.getElementById('videoTrackSelect');
             const audioSelect = document.getElementById('audioTrackSelect');
             const subSelect = document.getElementById('subtitleTrackSelect');
@@ -69,80 +63,59 @@
 
             // Load Metadata
             try {
-                await player.loadlibs(); // Wait, method name in didiPlayer.js was loadlibs? Or load?
-                // Checking previous turn... "async loadlibs() {"
-                // Yes, loadlibs.
+                await player.loadlibs();
                 status.textContent = "Loaded " + player.files.length + " files.";
                 
-                // Populate File Select
-                player.files.forEach((f, i) => {
-                    const opt = document.createElement('option');
-                    opt.value = i;
-                    opt.textContent = `[${i}] ${f.file_name} (${(f.file_size/1024/1024).toFixed(1)} MB)`;
-                    fileSelect.appendChild(opt);
-                });
-                
-                // Trigger first selection
-                if (player.files.length > 0) {
-                    fileSelect.value = 0;
-                    handleFileChange(0);
-                }
+                // Populate Video Track Select
+                initTrackUI();
 
             } catch (e) {
                 status.textContent = "Error: " + e.message;
             }
 
-            function handleFileChange(index) {
-                index = parseInt(index);
-                player.setSource(index); // This sets activeFileIndex
-                
-                // Update Tracks UI
-                updateTrackUI(index);
-                
-                status.textContent = "Selected File " + index;
-            }
-
-            function updateTrackUI(fileIndex) {
-                // Video
+            function initTrackUI() {
                 videoSelect.innerHTML = '';
-                const vTracks = player.getVideoTracks(fileIndex);
+                const vTracks = player.getAllVideoTracks();
                 vTracks.forEach(t => {
                     const opt = document.createElement('option');
-                    opt.value = t.track_id;
-                    opt.textContent = `ID ${t.track_id}: ${t.codec} ${t.width}x${t.height}`;
+                    opt.value = JSON.stringify({id: t.track_id, fileIdx: t.fileIndex});
+                    opt.textContent = `[${t.fileName}] ID ${t.track_id}: ${t.codec} ${t.width}x${t.height}`;
                     videoSelect.appendChild(opt);
                 });
-                if (vTracks.length > 0) player.activeVideoTrackId = vTracks[0].track_id;
+                
+                if (vTracks.length > 0) {
+                    const first = vTracks[0];
+                    videoSelect.value = JSON.stringify({id: first.track_id, fileIdx: first.fileIndex});
+                    handleVideoChange(first.track_id, first.fileIndex);
+                }
+            }
 
+            function handleVideoChange(trackId, fileIndex) {
+                 player.setVideoTrack(trackId, fileIndex);
+                 updateSecondaryTracksUI(fileIndex);
+                 status.textContent = "Playing video from file " + fileIndex;
+            }
+
+            function updateSecondaryTracksUI(fileIndex) {
                 // Audio (Smart Filter)
                 audioSelect.innerHTML = '';
                 const aTracks = player.getAudioTracks(fileIndex);
                 aTracks.forEach(t => {
                     const opt = document.createElement('option');
-                    opt.value = JSON.stringify({id: t.track_id, fileIdx: t.fileIndex}); // Store composite value
+                    opt.value = JSON.stringify({id: t.track_id, fileIdx: t.fileIndex});
                     const origin = t.origin === 'external' ? ` [Ext File ${t.fileIndex}]` : '';
                     opt.textContent = `ID ${t.track_id}: ${t.codec} (${t.language || 'und'})${origin}`;
                     audioSelect.appendChild(opt);
                 });
-                // Auto-select first
+
                 if (aTracks.length > 0) {
-                    const first = aTracks[0];
-                    player.activeAudioTrackId = first.track_id;
-                    player.activeAudioFileIndex = first.fileIndex;
+                    // Pre-select what the player decided
+                    audioSelect.value = JSON.stringify({id: player.activeAudioTrackId, fileIdx: player.activeAudioFileIndex});
                 }
 
                 // Subtitle (Smart Selector)
                 subSelect.innerHTML = '<option value="-1">None</option>';
-                // Logic: show available languages, pick smallest file behind scenes?
-                // The prompt says "prefer using the subtile from the file that is the smallest"
-                // This implies duplicate subtitle tracks exist.
-                // We should probably present unique languages/kinds to the user, and use the smallest file internally.
-                
-                // Let's list all "best candidates".
-                const subCandidates = player.getSubtitleTracks(); // Logic was to return smallest per group
-                // But wait, the logic in previous turn in getSubtitleTracks filtered to 1 per group.
-                // But the grouping key was just language+forced.
-                // So if we have 5 languages, we get 5 entries.
+                const subCandidates = player.getSubtitleTracks();
                 
                 subCandidates.forEach(t => {
                     const opt = document.createElement('option');
@@ -155,15 +128,16 @@
             }
 
             // Event Listeners
-            fileSelect.addEventListener('change', (e) => handleFileChange(e.target.value));
-
             videoSelect.addEventListener('change', (e) => {
-                player.activeVideoTrackId = parseInt(e.target.value);
+                const val = JSON.parse(e.target.value);
+                handleVideoChange(val.id, val.fileIdx);
             });
 
             audioSelect.addEventListener('change', (e) => {
                 const val = JSON.parse(e.target.value);
                 player.selectAudio(val.id, val.fileIdx);
+                // Also trigger playback to apply new audio track
+                player.seek(video.currentTime);
             });
 
             subSelect.addEventListener('change', (e) => {
@@ -183,15 +157,9 @@
                 player.seek(sec);
             });
             
-            // Periodically update seek bar if playing?
-            // Since we seek via backend, the video element time starts at 0 (if squeeze).
-            // But we want to show 'absolute' movie time.
             video.addEventListener('timeupdate', () => {
                 const duration = player.getDuration();
                 const currentRel = video.currentTime;
-                // If Safari (direct stream), currentRel = absolute.
-                // If squeeze, absolute = currentRel + offset.
-                
                 const absTime = player.isSafari ? currentRel : (currentRel + (player.currentSeekOffset || 0));
                 
                 if (duration > 0) {
@@ -203,7 +171,7 @@
             function formatTime(s) {
                 const m = Math.floor(s / 60);
                 const sec = Math.floor(s % 60);
-                return `${m}:${sec.toString().padStart(2, '0')}`;
+                return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
             }
         });
     </script>

@@ -110,15 +110,19 @@ impl ClusterWriteWrapper {
         let cluster_start_ns = self.cluster.timestamp.0 * self.timecode_scale;
         let cluster_duration = (block_end_ns as i64 - cluster_start_ns as i64).max(0);
 
-        // Check if the cluster has reached size or duration limits
-        if cluster_duration > self.cluster_max_duration_ns as i64
-            || self.size_bytes as i64 + block_size as i64 > self.cluster_max_size_bytes as i64
-        {
+        let is_keyframe = block.is_keyframe().unwrap_or(false);
+        let current_blocks = self.cluster.blocks.len();
+
+        // New logic: 
+        // - break at every keyframe if we have at least 120 blocks
+        // - strictly limit to 600 blocks
+        if current_blocks >= 600 || (current_blocks >= 120 && is_keyframe) {
             return Err(Error::ClusterIsFull(format!(
-                "limit bytes: {}, duration: {}, block bytes: {}",
-                self.cluster_max_size_bytes, self.cluster_max_duration_ns, block_size
+                "Triggered cluster split. Blocks: {}, Keyframe: {}",
+                current_blocks, is_keyframe
             )));
         }
+
         self.duration_ns = cluster_duration as u64;
         self.size_bytes += block_size as u64;
 

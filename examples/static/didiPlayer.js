@@ -22,9 +22,42 @@ class DidiPlayer {
         console.log("Loaded files:", this.files);
     }
 
-    getVideoTracks(fileIndex) {
-        if (!this.files[fileIndex]) return [];
-        return this.files[fileIndex].video_tracks;
+    getAllVideoTracks() {
+        const allVideo = [];
+        this.files.forEach((file, idx) => {
+            file.video_tracks.forEach(t => {
+                allVideo.push({...t, fileIndex: idx, fileName: file.file_name});
+            });
+        });
+        return allVideo;
+    }
+
+    setVideoTrack(trackId, fileIndex) {
+        this.activeFileIndex = fileIndex;
+        this.activeVideoTrackId = trackId;
+        
+        // Auto-select first audio track (prefer main file)
+        const aTracks = this.getAudioTracks(fileIndex);
+        if (aTracks.length > 0) {
+            // Prefer internal
+            const internal = aTracks.find(t => t.fileIndex === fileIndex);
+            this.activeAudioTrackId = internal ? internal.track_id : aTracks[0].track_id;
+            this.activeAudioFileIndex = internal ? internal.fileIndex : aTracks[0].fileIndex;
+        } else {
+            this.activeAudioTrackId = -1;
+            this.activeAudioFileIndex = -1;
+        }
+
+        // Subtitles off by default
+        this.activeSubtitleTrackId = -1;
+        
+        if (this.isSafari) {
+            // Direct stream for Safari
+            this.video.src = `${this.apiBase}/video/direct/${fileIndex}`;
+        } else {
+             // Init with squeeze seek at 0
+            this.seek(0);
+        }
     }
 
     getAudioTracks(fileIndex) {
@@ -91,35 +124,6 @@ class DidiPlayer {
             result.push(candidates[0]);
         }
         return result;
-    }
-
-    setSource(fileIndex) {
-        this.activeFileIndex = fileIndex;
-        // Auto-select first video track
-        const vTracks = this.getVideoTracks(fileIndex);
-        if (vTracks.length > 0) this.activeVideoTrackId = vTracks[0].track_id;
-        
-        // Auto-select first audio track (prefer main file)
-        const aTracks = this.getAudioTracks(fileIndex);
-        if (aTracks.length > 0) {
-            // Prefer internal
-            const internal = aTracks.find(t => t.fileIndex === fileIndex);
-            this.activeAudioTrackId = internal ? internal.track_id : aTracks[0].track_id; 
-            // If external, we need to track its file index method signature might need change or rely on UI passing it
-        }
-
-        // Subtitles off by default
-        this.activeSubtitleTrackId = -1;
-        
-        if (this.isSafari) {
-            // Direct stream for Safari
-            // "endpoint direct stream that directly streams a file without remuxing but exposing range parameters via http"
-            // "subtiltes are also fetched as a whole ... and are arred to the video as text track same logick here as from chrome and firefox"
-            this.video.src = `${this.apiBase}/video/direct/${fileIndex}`;
-        } else {
-             // Init with squeeze seek at 0
-            this.seek(0);
-        }
     }
 
     selectAudio(trackId, fileIndex) {

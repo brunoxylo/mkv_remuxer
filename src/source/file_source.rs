@@ -386,7 +386,16 @@ impl<T: MkvReader> FileSource<T> {
                         }
                     }
                     
+                    // we are between last keyframe before start and start, aka pre-roll section, 
                     if abs_ns < start as i64 {
+
+                        if block.is_keyframe()? && abs_ns > last_keyframe_before_start_timestamp as i64 {
+                            let m = 1000_000_000.0;
+                            return Err(Error::InternalBug(format!(
+                                "Between last_keyframe_before_start_timestamp {} and start {} should be no more keyframes. found one at {}",
+                                last_keyframe_before_start_timestamp as f64 / m, start as f64 / m, abs_ns as f64 / m
+                            )));
+                        }
                         // Pre-roll: squeeze to time 0 and mark invisible
                         block.set_timestamp_ns(
                             0,
