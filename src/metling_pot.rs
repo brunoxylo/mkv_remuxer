@@ -123,6 +123,9 @@ impl MeltingPot {
                                     Err(e) => return Err(e),
                                 }
                             }
+                            if input_cluster.is_empty() {
+                                self.clusters[lowest_index] = None;
+                            }
                         } else {
                             // No more blocks in this cluster, set to None to fetch next cluster from source in next iteration
                             self.clusters[lowest_index] = None;

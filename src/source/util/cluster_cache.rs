@@ -3,6 +3,7 @@ use log::info;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::collections::HashMap;
+use std::f32::consts::E;
 use std::io::{Read, Seek, SeekFrom};
 use crate::block_ext::{ClusterBlockExt, ClusterExt};
 use super::mkv_reader::MkvReader;
@@ -194,15 +195,36 @@ impl KeyframePositionCache {
             }
         }
 
-        if lo_is_cluster {
-            Ok(lo)
+        // we do a linear scan between lo and mid the check for additional clusters there
+        let linear_scan_limit = old_mid.ok_or(Error::InternalBug("No mid value found".to_string()))?;
+        let mut linear_scan_pos :u64 = if lo_is_cluster {
+            lo
         } else {
-            // lo was never set to a cluster — try scanning forward from lo
-            match scan_cluster_in_direction(file, lo, Direction::Forward)? {
-                Some(cluster_pos) => Ok(cluster_pos),
-                None => Err(Error::NotFound("No clusters found during binary search".to_string())),
+            scan_cluster_in_direction(file, lo, Direction::Forward)?.ok_or(Error::FileCorrupted("No cluster found in linaer scan".to_string()))?
+        };
+        let mut sanity_check_counter_2 = 0;
+        // scan for next cluster that is <= target
+        while linear_scan_pos < linear_scan_limit {
+            match scan_cluster_in_direction(file, linear_scan_pos, Direction::Next)? {
+                Some(cluster_pos) => {
+                    let time_stamp = Self::read_cluster_timestamp_at(file, cluster_pos, timecode_scale)?;
+                    if time_stamp <= target_unsigned {
+                        linear_scan_pos = cluster_pos;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break // end of file
             }
+            if sanity_check_counter_2 > 100 {
+                return Err(Error::InternalBug(
+                    "Linear scan failed to converge after 100 iterations".to_string(),
+                ));
+            }
+            sanity_check_counter_2 += 1;
         }
+
+        return Ok(linear_scan_pos);
     }
 
     /// Read only the Cluster timestamp at a given file position without parsing
@@ -287,9 +309,29 @@ impl KeyframePositionCache {
 
         let start_time = std::time::Instant::now();
 
+        let m = 1_000_000_000.0f64;
+        eprintln!("[DEBUG update_cache] track={}, after={}, reference_ts={:.3}s, cluster_pos={}",
+            track_num, after, reference_timestamp_ns as f64 / m, self.position);
 
         // Try to find keyframe in current cluster first
         let cluster = Cluster::from_file_pos(&mut self.file, self.position)?;
+        let cluster_ts_ns = cluster.timestamp.0 as i64 * self.timecode_scale as i64;
+        eprintln!("[DEBUG update_cache] current cluster timestamp={:.3}s, block_count={}",
+            cluster_ts_ns as f64 / m, cluster.blocks.len());
+        
+        // Log all keyframes in this cluster for the track
+        for (i, block) in cluster.blocks.iter().enumerate() {
+            if let Ok(true) = block.is_keyframe() {
+                if let Ok(tn) = block.track_number() {
+                    if tn == track_num {
+                        if let Ok(ts) = block.timestamp_ns(cluster.timestamp.0 as i64, self.timecode_scale) {
+                            eprintln!("[DEBUG update_cache] cluster keyframe[{}]: track={}, ts={:.3}s", i, tn, ts as f64 / m);
+                        }
+                    }
+                }
+            }
+        }
+
         let keyframe_idx_opt = if after {
             cluster.get_keyframe_after(track_num, reference_timestamp_ns as i64, self.timecode_scale)
         } else {
@@ -313,6 +355,9 @@ impl KeyframePositionCache {
                 keyframe_timestamp_ns <= reference_timestamp_ns as i64
             };
             
+            eprintln!("[DEBUG update_cache] found keyframe in current cluster: idx={}, ts={:.3}s, meets_criteria={}",
+                keyframe_idx, keyframe_timestamp_ns as f64 / m, meets_criteria);
+            
             if meets_criteria {
                 self.keyframe_cluster_position
                     .insert((track_num, after), self.position);
@@ -320,8 +365,11 @@ impl KeyframePositionCache {
                     (track_num, after),
                     keyframe_timestamp_ns,
                 );
+                eprintln!("[DEBUG update_cache] RETURNING EARLY with keyframe at {:.3}s from current cluster", keyframe_timestamp_ns as f64 / m);
                 return Ok(());
             }
+        } else {
+            eprintln!("[DEBUG update_cache] no keyframe found in current cluster for track={}, after={}", track_num, after);
         }
 
         // No suitable keyframe in current cluster, search neighboring clusters
@@ -482,10 +530,6 @@ fn scan_cluster_in_direction(file: &mut dyn MkvReader, pos :u64, direction: Dire
             break;
         }
         let cluster_positions_n_buffer = read_cluster_headers_pos_from_buffer(&buffer[..n]);
-        let skip_input_pos = match direction {
-            Direction::Next | Direction::Previous => true,
-            Direction::Backward | Direction::Forward => false,
-        };
         // convert to absolute positions and exclude the position we want to skip
         let cluster_positions_absolute: Vec<u64> = cluster_positions_n_buffer.iter()
             .map(|offset| current_position + *offset as u64)

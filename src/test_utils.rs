@@ -347,7 +347,7 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                                         if timestamp_diff.abs() as u64 > CLUSTER_MAX_DURATION_NS {
                                             report.timestamps_plausible = false;
                                             report.errors.push(format!(
-                                                "Implausible timestamp jump: {} ns ({:.2}s) between {} and {} in cluster {}",
+                                                "Implausible block timestamp jump: {} ns ({:.2}s) between {} and {} in cluster {}",
                                                 timestamp_diff.abs(),
                                                 timestamp_diff.abs() as f64 / 1_000_000_000.0,
                                                 last_ts,
