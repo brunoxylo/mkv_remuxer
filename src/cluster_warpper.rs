@@ -3,9 +3,10 @@ use crate::{ClusterBlockExt, Error, Result};
 use mkv_element::ClusterBlock;
 use mkv_element::prelude::*;
 
-
+// we limit the clustersize by these bounds
+// within these bounds we brad at every keyframe
 pub const MAX_BLOCKS_PER_CLUSTER: usize = 600;
-pub const MIN_BLOCKS_PER_CLUSTER: usize = 120;
+pub const MIN_BLOCKS_PER_CLUSTER: usize = 100;
 
 /// this wrapper allows for conveniently iterating over the blocks of a cluster
 pub struct ClusterReadWrapper {

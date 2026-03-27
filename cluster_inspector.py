@@ -164,6 +164,8 @@ def analyze_mkv(filepath):
                     # per-track counters: track_num -> {blocks, keyframes}
                     per_track = {}
                     first_timecode = -1
+                    # first block info: (track_num, is_keyframe) or None
+                    first_block = None
                     
                     while f.tell() < cluster_end:
                         c_pos = f.tell()
@@ -195,6 +197,9 @@ def analyze_mkv(filepath):
                                 break
                             flags = flags_data[0]
                             is_keyframe = bool(flags & 0x80)
+
+                            if first_block is None:
+                                first_block = (track_num, is_keyframe)
 
                             if track_num not in per_track:
                                 per_track[track_num] = {'blocks': 0, 'keyframes': 0}
@@ -233,6 +238,8 @@ def analyze_mkv(filepath):
                                     per_track[track_num]['blocks'] += 1
                                     # For BlockGroup, keyframe = no ReferenceBlock child
                                     # We'll mark it as unknown here and handle below
+                                    if first_block is None:
+                                        first_block = (track_num, None)  # keyframe status unknown for BlockGroup
                                     found_block = True
                                     break
                                 else:
@@ -257,6 +264,22 @@ def analyze_mkv(filepath):
                         ttype = track_type_name(ti.get('type', 0)) if ti else f'track{tn}'
                         codec = ti.get('codec', '') if ti else ''
                         print(f"     Track {tn} ({ttype} {codec}): {tc['blocks']} blocks, {tc['keyframes']} keyframes")
+                    # Report whether cluster starts with a video keyframe
+                    if first_block is not None:
+                        fb_track, fb_keyframe = first_block
+                        fb_ti = track_info.get(fb_track, {})
+                        fb_type = fb_ti.get('type', 0) if fb_ti else 0
+                        is_video = fb_type == TRACK_TYPE_VIDEO
+                        if fb_keyframe is None:
+                            kf_str = "keyframe status unknown (BlockGroup)"
+                        else:
+                            kf_str = "KEYFRAME" if fb_keyframe else "non-keyframe"
+                        starts_with_video_kf = is_video and fb_keyframe
+                        flag = "✓" if starts_with_video_kf else "✗"
+                        print(f"  {flag} First block: track {fb_track} ({track_type_name(fb_type)}) [{kf_str}] "
+                              f"-> starts with video keyframe: {starts_with_video_kf}")
+                    else:
+                        print("  (no blocks found in cluster)")
                     
                 else:
                     if is_unknown:
