@@ -1,7 +1,7 @@
 use crate::source::FileSource;
 use crate::source::InputSource;
 use crate::source::Uninitialized;
-use crate::cluster_warpper::{CLUSTER_MAX_DURATION_NS, CLUSTER_MAX_SIZE_BYTES};
+use crate::cluster_warpper::{MAX_BLOCKS_PER_CLUSTER, MIN_BLOCKS_PER_CLUSTER};
 use crate::block_ext::ClusterBlockExt;
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
@@ -88,8 +88,8 @@ pub struct MkvValidationReport {
     pub syntax_valid: bool,
     pub timestamps_plausible: bool,
     pub all_tracks_present: bool,
-    pub cluster_duration_valid: bool,
-    pub cluster_size_valid: bool,
+    /// All non-last clusters have block counts within [MIN_BLOCKS_PER_CLUSTER, MAX_BLOCKS_PER_CLUSTER]
+    pub cluster_block_count_valid: bool,
     pub cues_valid: bool,
     pub duration_valid: bool,
     pub errors: Vec<String>,
@@ -138,8 +138,7 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
         syntax_valid: true,
         timestamps_plausible: true,
         all_tracks_present: false,
-        cluster_duration_valid: true,
-        cluster_size_valid: true,
+        cluster_block_count_valid: true,
         cues_valid: true,
         duration_valid: true,
         errors: Vec::new(),
@@ -272,16 +271,6 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                         let cluster_timestamp = cluster.timestamp.0;
                         cluster_positions.push((cluster_timestamp, cluster_start_pos));
 
-                        // Check cluster size constraint
-                        if check_cluster_limits && cluster_size > CLUSTER_MAX_SIZE_BYTES {
-                            report.cluster_size_valid = false;
-                            report.errors.push(format!(
-                                "Cluster {} exceeds max size: {} > {} bytes",
-                                report.stats.total_clusters,
-                                cluster_size,
-                                CLUSTER_MAX_SIZE_BYTES
-                            ));
-                        }
                         report.stats.max_cluster_size_bytes =
                             report.stats.max_cluster_size_bytes.max(cluster_size);
 
@@ -331,7 +320,7 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                                     }
                                 }
 
-                                // Check timestamp plausibility
+                                // Check timestamp plausibility (no large unexplained jumps)
                                 if let Some(last_ts) = last_timestamp_ns {
                                     if require_strict_monotonic {
                                         // Strict monotonic check
@@ -345,9 +334,9 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                                             ));
                                         }
                                     } else {
-                                        // Plausibility check: timestamps shouldn't jump forward more than CLUSTER_MAX_DURATION_NS
+                                        // Plausibility check: timestamps shouldn't jump forward more than 60 seconds
                                         let timestamp_diff = block_ts_ns - last_ts;
-                                        if timestamp_diff.abs() as u64 > CLUSTER_MAX_DURATION_NS {
+                                        if timestamp_diff.abs() as u64 > 60_000_000_000 {
                                             report.timestamps_plausible = false;
                                             report.errors.push(format!(
                                                 "Implausible block timestamp jump: {} ns ({:.2}s) between {} and {} in cluster {}",
@@ -367,24 +356,15 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                         // Record per-cluster block count
                         report.stats.blocks_per_cluster.push(cluster_block_count);
 
-                        // Check cluster duration constraint
+                        // Track cluster duration stats (informational only)
                         if cluster_max_ts_ns > cluster_min_ts_ns {
                             let cluster_duration_ns = (cluster_max_ts_ns - cluster_min_ts_ns) as u64;
                             report.stats.max_cluster_duration_ns =
                                 report.stats.max_cluster_duration_ns.max(cluster_duration_ns);
-
-                            if check_cluster_limits && cluster_duration_ns > CLUSTER_MAX_DURATION_NS {
-                                report.cluster_duration_valid = false;
-                                report.errors.push(format!(
-                                    "Cluster {} exceeds max duration: {} > {} ns ({:.2}s > {:.2}s)",
-                                    report.stats.total_clusters,
-                                    cluster_duration_ns,
-                                    CLUSTER_MAX_DURATION_NS,
-                                    cluster_duration_ns as f64 / 1_000_000_000.0,
-                                    CLUSTER_MAX_DURATION_NS as f64 / 1_000_000_000.0
-                                ));
-                            }
                         }
+
+                        // Check cluster block count constraint (skip last cluster — it may be smaller)
+                        // We defer this check until after all clusters are parsed (see below).
                     }
                     Err(e) => {
                         report.syntax_valid = false;
@@ -456,20 +436,26 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
         report.errors.push("No blocks found in file".to_string());
     }
 
-    // Check average blocks per cluster (should be > 100)
-    if report.stats.total_clusters > 0 {
-        let avg_blocks_per_cluster = report.stats.total_blocks as f64 / report.stats.total_clusters as f64;
-        if avg_blocks_per_cluster <= 100.0 {
-            let per_cluster_info: Vec<String> = report.stats.blocks_per_cluster
-                .iter()
-                .enumerate()
-                .map(|(i, &count)| format!("  cluster {}: {} blocks", i + 1, count))
-                .collect();
-            report.warnings.push(format!(
-                "Average blocks per cluster ({:.1}) is not more than 100. Per-cluster block counts:\n{}",
-                avg_blocks_per_cluster,
-                per_cluster_info.join("\n")
-            ));
+    // Check block count constraints for all clusters except the last one.
+    // The last cluster may legitimately have fewer than MIN_BLOCKS_PER_CLUSTER blocks.
+    if check_cluster_limits {
+        let total = report.stats.blocks_per_cluster.len();
+        for (i, &count) in report.stats.blocks_per_cluster.iter().enumerate() {
+            let is_last = i + 1 == total;
+            if count > MAX_BLOCKS_PER_CLUSTER {
+                report.cluster_block_count_valid = false;
+                report.errors.push(format!(
+                    "Cluster {} has {} blocks, exceeding MAX_BLOCKS_PER_CLUSTER ({})",
+                    i + 1, count, MAX_BLOCKS_PER_CLUSTER
+                ));
+            }
+            if !is_last && count < MIN_BLOCKS_PER_CLUSTER {
+                report.cluster_block_count_valid = false;
+                report.errors.push(format!(
+                    "Cluster {} has {} blocks, below MIN_BLOCKS_PER_CLUSTER ({})",
+                    i + 1, count, MIN_BLOCKS_PER_CLUSTER
+                ));
+            }
         }
     }
 
@@ -552,8 +538,7 @@ impl MkvValidationReport {
         self.syntax_valid
             && self.timestamps_plausible
             && self.all_tracks_present
-            && self.cluster_duration_valid
-            && self.cluster_size_valid
+            && self.cluster_block_count_valid
             && self.cues_valid
             && self.duration_valid
             && self.stats.total_clusters > 0
@@ -574,8 +559,7 @@ impl MkvValidationReport {
              - Syntax Valid: {}\n\
              - Timestamps Plausible: {}\n\
              - All Tracks Present: {}\n\
-             - Cluster Duration Valid: {}\n\
-             - Cluster Size Valid: {}\n\
+             - Cluster Block Count Valid: {}\n\
              - Cues Valid: {}\n\
              - Duration Valid: {}\n\
              - Total Clusters: {}\n\
@@ -591,8 +575,7 @@ impl MkvValidationReport {
             self.syntax_valid,
             self.timestamps_plausible,
             self.all_tracks_present,
-            self.cluster_duration_valid,
-            self.cluster_size_valid,
+            self.cluster_block_count_valid,
             self.cues_valid,
             self.duration_valid,
             self.stats.total_clusters,

@@ -193,12 +193,10 @@ mod tests {
         assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
         assert!(validation_report.timestamps_plausible, "Timestamps should be plausible");
         assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
-        assert!(validation_report.cluster_duration_valid, 
-            "Cluster durations should not exceed {} ns", 
-            crate::cluster_warpper::CLUSTER_MAX_DURATION_NS);
-        assert!(validation_report.cluster_size_valid, 
-            "Cluster sizes should not exceed {} bytes", 
-            crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES);
+        assert!(validation_report.cluster_block_count_valid,
+            "Cluster block counts should be within [{}, {}]",
+            crate::cluster_warpper::MIN_BLOCKS_PER_CLUSTER,
+            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER);
         
         // Cues validation might be less strict, just warn if invalid
         if !validation_report.cues_valid {
@@ -323,12 +321,10 @@ mod tests {
         assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
         // Skip timestamps_plausible check - video file duration metadata doesn't match actual frame timestamps
         assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
-        assert!(validation_report.cluster_duration_valid, 
-            "Cluster durations should not exceed {} ns", 
-            crate::cluster_warpper::CLUSTER_MAX_DURATION_NS);
-        assert!(validation_report.cluster_size_valid, 
-            "Cluster sizes should not exceed {} bytes", 
-            crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES);
+        assert!(validation_report.cluster_block_count_valid,
+            "Cluster block counts should be within [{}, {}]",
+            crate::cluster_warpper::MIN_BLOCKS_PER_CLUSTER,
+            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER);
         
         // Cleanup is commented out for inspection
         // let _ = std::fs::remove_file(&output_path);
@@ -394,12 +390,10 @@ mod tests {
 
         assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
         assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
-        assert!(validation_report.cluster_duration_valid,
-            "Cluster durations should not exceed {} ns",
-            crate::cluster_warpper::CLUSTER_MAX_DURATION_NS);
-        assert!(validation_report.cluster_size_valid,
-            "Cluster sizes should not exceed {} bytes",
-            crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES);
+        assert!(validation_report.cluster_block_count_valid,
+            "Cluster block counts should be within [{}, {}]",
+            crate::cluster_warpper::MIN_BLOCKS_PER_CLUSTER,
+            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER);
 
         // let _ = std::fs::remove_file(&output_path);
 

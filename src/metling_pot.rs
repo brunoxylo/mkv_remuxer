@@ -113,7 +113,8 @@ impl MeltingPot {
                                 .sources_mappings
                                 .is_track_mapped(lowest_index as u64, input_track_index)
                             {
-                                match o_cluster.add_block(&block, lowest_timestamp_ns, Some(output_trackindex)) {
+                                let track_kind = self.sources_mappings.get_track_kind(lowest_index as u64, input_track_index)?;
+                                match o_cluster.add_block(&block, lowest_timestamp_ns, Some(output_trackindex), Some(track_kind)) {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
                                         // Cluster is full, break the inner loop and start a new cluster
@@ -377,59 +378,38 @@ mod tests {
 
     #[test]
     fn test_melting_pot_cluster_limits() -> Result<()> {
-        use crate::cluster_warpper::CLUSTER_MAX_DURATION_NS;
-        use crate::cluster_warpper::CLUSTER_MAX_SIZE_BYTES;
-
-        let mut num_clusters = 0;
-        let mut block_counter = 0;
+        use crate::cluster_warpper::{MAX_BLOCKS_PER_CLUSTER, MIN_BLOCKS_PER_CLUSTER};
 
         for source in test_utils::sources_implementations() {
-            let (mut mp, timescale) = setup_melting_pot(source)?;
+            let (mut mp, _timescale) = setup_melting_pot(source)?;
+
+            let mut all_clusters: Vec<usize> = Vec::new(); // block counts per cluster
 
             while let Some(cluster) = mp.generate_next_cluster()? {
-                num_clusters += 1;
-                let cluster_ts = cluster.timestamp.0 as i64;
-                let mut min_ts = i64::MAX;
-                let mut max_ts = i64::MIN;
-                let mut bytes_counter = 0;
+                all_clusters.push(cluster.blocks.len());
+            }
 
-                for block in &cluster.blocks {
-                    let ts = block.timestamp_ns(cluster_ts, timescale)?;
-                    min_ts = min_ts.min(ts);
-                    max_ts = max_ts.max(ts);
-                    bytes_counter += block.get_data()?.len() as u64;
-                    block_counter += 1;
-                }
+            assert!(!all_clusters.is_empty(), "No clusters were generated");
 
-                if !cluster.blocks.is_empty() {
-                    let duration = (max_ts - min_ts) as u64;
+            // All clusters except the last must satisfy MIN <= count <= MAX.
+            // The last cluster may have fewer blocks (tail of the stream).
+            let last_idx = all_clusters.len() - 1;
+            for (i, &count) in all_clusters.iter().enumerate() {
+                assert!(
+                    count <= MAX_BLOCKS_PER_CLUSTER,
+                    "Cluster {} has {} blocks, exceeding MAX_BLOCKS_PER_CLUSTER ({})",
+                    i + 1, count, MAX_BLOCKS_PER_CLUSTER
+                );
+                if i < last_idx {
                     assert!(
-                        duration <= CLUSTER_MAX_DURATION_NS,
-                        "Cluster duration {}ns exceeds limit {}ns",
-                        duration,
-                        CLUSTER_MAX_DURATION_NS
+                        count >= MIN_BLOCKS_PER_CLUSTER,
+                        "Non-last cluster {} has {} blocks, below MIN_BLOCKS_PER_CLUSTER ({})",
+                        i + 1, count, MIN_BLOCKS_PER_CLUSTER
                     );
                 }
-
-                // Size check - we can't easily check encoded size without re-encoding,
-                // but we know MeltingPot uses ClusterWriteWrapper which tracks it.
-                // For this test, we'll just check duration as it's the most critical limit.
-                assert!(
-                    bytes_counter <= CLUSTER_MAX_SIZE_BYTES,
-                    "Cluster size {} bytes exceeds limit {} bytes",
-                    bytes_counter,
-                    CLUSTER_MAX_SIZE_BYTES
-                );
             }
-            assert!(block_counter > 0);
-            assert!(num_clusters > 0);
-            assert!(
-                block_counter / num_clusters > 5,
-                "Too few blocks per cluster: {} / {}",
-                block_counter,
-                num_clusters
-            );
         }
         Ok(())
     }
 }
+

@@ -1,9 +1,11 @@
+use crate::block_ext::TrackKind;
 use crate::{ClusterBlockExt, Error, Result};
 use mkv_element::ClusterBlock;
 use mkv_element::prelude::*;
 
-pub const CLUSTER_MAX_DURATION_NS: u64 = 5_000_000_000; // 5 seconds in nanoseconds
-pub const CLUSTER_MAX_SIZE_BYTES: u64 = 10_000_000; // 10 MB
+
+pub const MAX_BLOCKS_PER_CLUSTER: usize = 600;
+pub const MIN_BLOCKS_PER_CLUSTER: usize = 120;
 
 /// this wrapper allows for conveniently iterating over the blocks of a cluster
 pub struct ClusterReadWrapper {
@@ -64,8 +66,6 @@ pub struct ClusterWriteWrapper {
     size_bytes: u64,
     /// Timecode scale for timestamp calculations
     timecode_scale: u64,
-    cluster_max_duration_ns: u64,
-    cluster_max_size_bytes: u64,
 }
 
 impl ClusterWriteWrapper {
@@ -86,20 +86,12 @@ impl ClusterWriteWrapper {
             duration_ns: 0,
             size_bytes: 0,
             timecode_scale,
-            cluster_max_duration_ns: CLUSTER_MAX_DURATION_NS,
-            cluster_max_size_bytes: CLUSTER_MAX_SIZE_BYTES,
         }
-    }
-
-    /// Overwrite the default limits for the cluster
-    pub fn overwrite_limits(&mut self, max_duration_ns: u64, max_size_bytes: u64) {
-        self.cluster_max_duration_ns = max_duration_ns;
-        self.cluster_max_size_bytes = max_size_bytes;
     }
 
     /// Add a block to the cluster with its absolute timestamp in nanoseconds
     /// The relative timestamp will be calculated automatically
-    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: u64, track_number: Option<u64>) -> Result<()> {
+    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: u64, track_number: Option<u64>, track_kind :Option<TrackKind>) -> Result<()> {
         // Estimate block size (header + data)
         let block_size = match &block {
             ClusterBlock::Simple(sb) => sb.0.len(),
@@ -110,16 +102,19 @@ impl ClusterWriteWrapper {
         let cluster_start_ns = self.cluster.timestamp.0 * self.timecode_scale;
         let cluster_duration = (block_end_ns as i64 - cluster_start_ns as i64).max(0);
 
-        let is_keyframe = block.is_keyframe().unwrap_or(false);
+        let is_video_keyframe = match track_kind {
+            Some(TrackKind::Video) => block.is_keyframe().unwrap_or(false),
+            _ => false,
+        };
         let current_blocks = self.cluster.blocks.len();
 
         // New logic: 
         // - break at every keyframe if we have at least 120 blocks
         // - strictly limit to 600 blocks
-        if current_blocks >= 600 || (current_blocks >= 120 && is_keyframe) {
+        if current_blocks >= MAX_BLOCKS_PER_CLUSTER || (current_blocks >= MIN_BLOCKS_PER_CLUSTER && is_video_keyframe) {
             return Err(Error::ClusterIsFull(format!(
                 "Triggered cluster split. Blocks: {}, Keyframe: {}",
-                current_blocks, is_keyframe
+                current_blocks, is_video_keyframe
             )));
         }
 

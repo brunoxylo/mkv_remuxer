@@ -7,7 +7,7 @@ use crate::{Error, Result, block_ext::TrackKind, source::{Remuxing, InputSource}
 /// note the order of added mappings determines the order of tracks in the output file (e.g. if you want to prioritize video tracks from the first source, add those mappings first)
 pub struct SourcesMappings {
     pub sources: Vec<InputSource<Remuxing>>,
-    mappings: Vec<(u64, u64)>, // (input file index, track number)
+    mappings: Vec<(u64, u64, TrackKind)>, // (input file index, track number, track kind)
 }
 
 impl SourcesMappings {
@@ -32,7 +32,7 @@ impl SourcesMappings {
         })
     }
 
-    pub fn get_current_mappings(&self) -> &Vec<(u64, u64)> {
+    pub fn get_current_mappings(&self) -> &Vec<(u64, u64, TrackKind)> {
         &self.mappings
     }
     pub fn delete_current_mappings(&mut self) {
@@ -51,8 +51,21 @@ impl SourcesMappings {
     /// check whether the specified track is actually mapped by the current mappings
     /// if mapped it return the track number in the output file (which is the index in the mappings vector), otherwise returns None
     pub fn is_track_mapped(&self, source_index: u64, track_number: u64) -> Option<u64> {
-        self.mappings.iter().position(|(s_idx, t_num)| *s_idx == source_index && *t_num == track_number).map(|idx| idx as u64 +1 ) // output mkv track numbers are 1-based
+        self.mappings.iter().position(|(s_idx, t_num, _)| *s_idx == source_index && *t_num == track_number).map(|idx| idx as u64 +1 ) // output mkv track numbers are 1-based
     }
+
+    pub fn get_track_kind(&self, source_index: u64, track_number: u64) -> Result<TrackKind> {
+        self.mappings
+            .iter()
+            .find(|(s_idx, t_num, _)| *s_idx == source_index && *t_num == track_number)
+            .map(|(_, _, kind)| *kind)
+            .ok_or_else(|| Error::TrackMappingError(format!(
+                "Track number {} not found in source {}",
+                track_number, source_index
+            )))
+    }
+
+    
     /// Add a specific track from a specific source to the mappings
     /// NOTE: source index starts from zero but track number is 1 based as stored in MKV files
     pub fn add_mapping(&mut self, source_index: u64, track_number: u64) -> Result<()> {
@@ -63,19 +76,18 @@ impl SourcesMappings {
                 source_index
             )));
         }
-        // check if track number exists in the source
+        // check if track number exists in the source and get its kind
         let tracks = self.sources[source_index as usize].get_tracks()?;
-        if !tracks
+        let track_kind = tracks
             .track_entry
             .iter()
-            .any(|t| t.track_number.0 == track_number)
-        {
-            return Err(Error::TrackMappingError(format!(
+            .find(|t| t.track_number.0 == track_number)
+            .map(|t| TrackKind::from_u64(t.track_type.0))
+            .ok_or_else(|| Error::TrackMappingError(format!(
                 "Track number {} not found in source {}",
                 track_number, source_index
-            )));
-        }
-        self.mappings.push((source_index, track_number));
+            )))?;
+        self.mappings.push((source_index, track_number, track_kind));
         Ok(())
     }
     /// Add the first video track found in the the sources to the mappings
@@ -84,7 +96,7 @@ impl SourcesMappings {
             let tracks = source.get_tracks()?;
             for track in tracks.track_entry.iter() {
                 if track.track_type.0 == TrackKind::Video { // Video track type
-                    self.mappings.push((index as u64, track.track_number.0));
+                    self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
                     return Ok(());
                 }
             }
@@ -114,7 +126,7 @@ impl SourcesMappings {
             for track in tracks.track_entry.iter() {
                 if track.track_type.0 == TrackKind::Audio { // Audio track type
                     if track.language.0 == language_code {
-                        self.mappings.push((index as u64, track.track_number.0));
+                        self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
                     }
                 }
             }
@@ -129,10 +141,10 @@ impl SourcesMappings {
             for track in tracks.track_entry.iter() {
                 if let Some(tt) = track_type {
                     if track.track_type.0 == tt {
-                        self.mappings.push((index as u64, track.track_number.0));
+                        self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
                     }
                 } else {
-                    self.mappings.push((index as u64, track.track_number.0));
+                    self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
                 }
             }
         }
@@ -148,7 +160,7 @@ impl SourcesMappings {
 
     pub fn get_output_tracks_metadata(&self) -> Result<Tracks> {
         let mut output_tracks = Vec::new();
-        for (output_index, (source_index, source_track_number)) in self.mappings.iter().enumerate() {
+        for (output_index, (source_index, source_track_number, _)) in self.mappings.iter().enumerate() {
             let source = &self.sources[*source_index as usize];
             let tracks = source.get_tracks()?;
             if let Some(track) = tracks.track_entry.iter().find(|t| t.track_number.0 == *source_track_number) {
