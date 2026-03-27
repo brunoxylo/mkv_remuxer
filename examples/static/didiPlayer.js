@@ -10,6 +10,11 @@ class DidiPlayer {
         this.activeSubtitleFileIndex = -1;
         this.videoDuration = 0;
         
+        // Subtitle cache — raw (unadjusted) VTT text fetched once per track selection.
+        // Avoids re-fetching the full subtitle file on every seek.
+        this._subtitleCache = null;       // { fileIndex, trackId, vttText }
+        this._subtitleBlobUrl = null;     // current blob URL (revoked on next reload)
+
         // Safari check
         this.isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     }
@@ -33,30 +38,52 @@ class DidiPlayer {
     }
 
     setVideoTrack(trackId, fileIndex) {
+        // Capture current absolute playback position before switching tracks
+        const currentAbsTime = this.activeFileIndex === -1
+            ? 0
+            : (this.video.currentTime + (this.currentSeekOffset || 0));
+
+        // Remember the language of the currently selected audio track so we
+        // can try to preserve it when switching to a different video track.
+        let prevAudioLanguage = null;
+        if (this.activeAudioTrackId !== -1 && this.activeAudioFileIndex !== undefined) {
+            const prevFile = this.files[this.activeAudioFileIndex];
+            if (prevFile) {
+                const prevTrack = prevFile.audio_tracks.find(t => t.track_id === this.activeAudioTrackId);
+                if (prevTrack) prevAudioLanguage = prevTrack.language || null;
+            }
+        }
+
         this.activeFileIndex = fileIndex;
         this.activeVideoTrackId = trackId;
         
-        // Auto-select first audio track (prefer main file)
+        // Try to keep the same audio language across video track switches.
+        // Fall back to the first available track only when no language match exists.
         const aTracks = this.getAudioTracks(fileIndex);
         if (aTracks.length > 0) {
-            // Prefer internal
+            // 1. Try to match the previously selected language
+            const langMatch = prevAudioLanguage
+                ? aTracks.find(t => (t.language || null) === prevAudioLanguage)
+                : null;
+            // 2. Otherwise prefer an internal track from the new file
             const internal = aTracks.find(t => t.fileIndex === fileIndex);
-            this.activeAudioTrackId = internal ? internal.track_id : aTracks[0].track_id;
-            this.activeAudioFileIndex = internal ? internal.fileIndex : aTracks[0].fileIndex;
+            const chosen = langMatch || internal || aTracks[0];
+            this.activeAudioTrackId = chosen.track_id;
+            this.activeAudioFileIndex = chosen.fileIndex;
         } else {
             this.activeAudioTrackId = -1;
             this.activeAudioFileIndex = -1;
         }
 
-        // Subtitles off by default
-        this.activeSubtitleTrackId = -1;
-        
+        // Keep subtitle selection intact across video track switches
+        // (caller can reset it explicitly if needed)
+
         if (this.isSafari) {
             // Direct stream for Safari
             this.video.src = `${this.apiBase}/video/direct/${fileIndex}`;
         } else {
-             // Init with squeeze seek at 0
-            this.seek(0);
+            // Seek to the same position in the new track (seamless switch)
+            this.seek(currentAbsTime);
         }
     }
 
@@ -146,6 +173,9 @@ class DidiPlayer {
             return;
         }
 
+        // Remember whether the video was playing so we can resume after src change
+        const wasPlaying = !this.video.paused;
+
         // Remuxer seek (squeeze)
         // Construct mappings
         // Video: activeFileIndex_activeVideoTrackId
@@ -162,61 +192,98 @@ class DidiPlayer {
         // seek=squeeze
         const url = `${this.apiBase}/video/stream?mappings=${mappings}&seek=squeeze&start=${seconds}`;
         
+        // Setting src resets the media element (readyState → 0).
+        // Both auto-resume and subtitle reload must wait until canplay fires
+        // (readyState ≥ 3), otherwise the browser discards the <track> element.
+        const onCanPlay = () => {
+            this.video.removeEventListener('canplay', onCanPlay);
+            if (wasPlaying) {
+                this.video.play().catch(() => {});
+            }
+            // Reload subtitles now that the media element is ready
+            this.reloadSubtitles();
+        };
+        this.video.addEventListener('canplay', onCanPlay);
+
         this.video.src = url;
         // The browser will start playing from receiving the stream.
         // Since we use 'squeeze', the stream starts at timestamp 0.
         // We must update subtitle offset.
         this.currentSeekOffset = seconds;
-        this.reloadSubtitles();
+        // Remove stale <track> elements immediately so there's no flash of old subtitles.
+        // The new track will be added once canplay fires.
+        this.video.querySelectorAll('track').forEach(t => t.remove());
+        if (this._subtitleBlobUrl) {
+            URL.revokeObjectURL(this._subtitleBlobUrl);
+            this._subtitleBlobUrl = null;
+        }
     }
     
     async reloadSubtitles() {
-        // Clear existing tracks
-        const oldTracks = this.video.querySelectorAll('track');
-        oldTracks.forEach(t => t.remove());
+        // Remove existing <track> elements and revoke the old blob URL
+        this.video.querySelectorAll('track').forEach(t => t.remove());
+        if (this._subtitleBlobUrl) {
+            URL.revokeObjectURL(this._subtitleBlobUrl);
+            this._subtitleBlobUrl = null;
+        }
 
         if (this.activeSubtitleTrackId === -1) return;
 
-        // Fetch subtitle track whole
-        // Mapping: activeSubtitleFileIndex_activeSubtitleTrackId
-        const map = `${this.activeSubtitleFileIndex}_${this.activeSubtitleTrackId}`;
-        const url = `${this.apiBase}/video/stream?mappings=${map}`; // No start/end implies full file? Or default cut?
-        // backend defaults start=0 end=None -> full file remux.
-        
-        // Fetch blob to process cues? Or let browser handle it?
-        // Prompt: "download the whole subtile track from the beginning fro the one the user has selected and adapt the cues to the current play position"
-        
         try {
-            const res = await fetch(url);
-            const text = await res.text(); // VTT content
-            
-            // We need to create a Blob URL but potentially modifying cues.
-            // If uses 'squeeze' mode for video, video TS starts at 0.
-            // But we are at `currentSeekOffset` in the movie.
-            // So if play position is 0 (relative to stream), meaningful time is `currentSeekOffset`.
-            // Subtitles have absolute timestamps (0..movie_end).
-            // So we need to shift subtitles by -currentSeekOffset.
-            // e.g. timestamp 100 --> 100 - 50 = 50.
-            
-            // Simple VTT parser/modifier regex
-            // Timestamp format: 00:00:10.000
-            
-            const offset = this.isSafari ? 0 : this.currentSeekOffset; 
-            // For Safari (Direct Stream), timestamps are absolute, so offset should be 0.
-            
-            const adjustedVtt = this.adjustVttTimestamps(text, -offset);
-            
+            // Use cached raw VTT if the same track is still selected; otherwise fetch once.
+            const cacheHit = this._subtitleCache
+                && this._subtitleCache.fileIndex === this.activeSubtitleFileIndex
+                && this._subtitleCache.trackId   === this.activeSubtitleTrackId;
+
+            let rawVtt;
+            if (cacheHit) {
+                rawVtt = this._subtitleCache.vttText;
+            } else {
+                // Fetch the full subtitle track as VTT text.
+                // vtt_output=true tells the server to use VttSink.
+                const map = `${this.activeSubtitleFileIndex}_${this.activeSubtitleTrackId}`;
+                const url = `${this.apiBase}/video/stream?mappings=${map}&vtt_output=true`;
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`Subtitle fetch failed: ${res.status}`);
+                rawVtt = await res.text();
+                // Store in cache keyed by (fileIndex, trackId)
+                this._subtitleCache = {
+                    fileIndex: this.activeSubtitleFileIndex,
+                    trackId:   this.activeSubtitleTrackId,
+                    vttText:   rawVtt,
+                };
+            }
+
+            // The raw VTT has absolute timestamps (0 … movie_end).
+            // The video stream starts at currentSeekOffset (squeeze mode), so
+            // video.currentTime=0 corresponds to absolute time currentSeekOffset.
+            // Shift subtitle cues by -currentSeekOffset so they align with the stream.
+            const offset = this.isSafari ? 0 : (this.currentSeekOffset || 0);
+            const adjustedVtt = this.adjustVttTimestamps(rawVtt, -offset);
+
             const blob = new Blob([adjustedVtt], { type: 'text/vtt' });
-            const trackUrl = URL.createObjectURL(blob);
-            
+            this._subtitleBlobUrl = URL.createObjectURL(blob);
+
+            // Look up the language for the label
+            let lang = 'und';
+            if (this.files[this.activeSubtitleFileIndex]) {
+                const st = this.files[this.activeSubtitleFileIndex].subtitle_tracks
+                    .find(t => t.track_id === this.activeSubtitleTrackId);
+                if (st) lang = st.language || 'und';
+            }
+
             const track = document.createElement('track');
             track.kind = 'subtitles';
-            track.label = 'English'; // TODO: use actual language
-            track.srclang = 'en';
-            track.src = trackUrl;
+            track.label = lang;
+            track.srclang = lang;
+            track.src = this._subtitleBlobUrl;
             track.default = true;
             this.video.appendChild(track);
-            
+            // Force the track to showing mode — track.default only works on initial load
+            track.addEventListener('load', () => {
+                if (track.track) track.track.mode = 'showing';
+            });
+
         } catch (e) {
             console.error("Subtitle load failed", e);
         }

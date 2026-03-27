@@ -169,6 +169,10 @@ async fn handle_stream_request(params: HashMap<String, String>) -> Result<warp::
     let start_sec = params.get("start").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
     let end_sec = params.get("end").and_then(|s| s.parse::<f64>().ok());
     let seek_mode_str = params.get("seek").map(|s| s.as_str()).unwrap_or("squeeze");
+    // vtt_output=true → use VttSink and respond with text/vtt instead of video/webm.
+    // The client must set this explicitly when requesting a subtitle-only track.
+    // Mirrors the CLI behaviour where the output filename extension decides the sink type.
+    let vtt_output = params.get("vtt_output").map(|v| v == "true").unwrap_or(false);
     
     let cut_mode = match seek_mode_str {
         "squeeze" => Some(RemuxerCutMode::Squeeze),
@@ -188,7 +192,7 @@ async fn handle_stream_request(params: HashMap<String, String>) -> Result<warp::
     let (tx, rx) = mpsc::channel::<Bytes>(4); // Increased buffer size a bit
 
     let result = tokio::task::spawn_blocking(move || {
-        initialize_remuxer(all_files, mappings_str, start_sec, end_sec, cut_mode, tx)
+        initialize_remuxer(all_files, mappings_str, start_sec, end_sec, cut_mode, vtt_output, tx)
     }).await.unwrap();
 
     let (remuxer, output_interval) = match result {
@@ -257,6 +261,7 @@ fn initialize_remuxer(
     start_sec: f64,
     end_sec: Option<f64>,
     cut_mode: Option<RemuxerCutMode>,
+    vtt_output: bool,
     tx: mpsc::Sender<Bytes>
 ) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
     
@@ -316,35 +321,13 @@ fn initialize_remuxer(
         (*r_idx as u64, *t_id as u64)
     }).collect();
 
-    // Determine if output is VTT (only one source, and it's VTT, or mapping suggests VTT?)
-    // Remuxer determines output format based on tracks. If single subtitle track -> VTT.
-    // We'll trust Remuxer's logic but need to provide correct OutputSink.
-    // If ANY source is VTT, we might want VttSink? No, VttSink is for text output.
-    // If the RESULT is a single subtitle track, we want VttSink.
-    // But we decide Sink before Remuxer...
-    // Let's assume StreamSink (MKV/WebM) unless the user requested ONLY a text subtitle track.
-    
-    // Check if we are streaming ONLY a text subtitle
-    // We can peek at the sources/tracks.
-    // But Remuxer takes the sink.
-    // Hack: if we have 1 mapping and it corresponds to a text-subtitle track in one of our sources, use VttSink.
-    // Or just use StreamSink. If StreamSink receives subtitle packets, it writes MKV with subtitles.
-    // But browser might expect VTT text for <track>.
-    // The requirement says "subtitles are downloaded as a whole". This implies VTT format.
-    // So if request is for subtitle, we probably want VttSink.
-    
-    let is_vtt_output: bool = if remuxer_mappings.len() == 1 {
-        let (r_idx, _) = remuxer_mappings[0];
-        // Find which user index this remuxer index maps to
-        let user_idx = user_to_remuxer_map.iter().find(|(_, r)| **r == (r_idx as usize)).unwrap().0;
-        let path = std::path::Path::new(&all_files[*user_idx]);
-        path.extension().and_then(std::ffi::OsStr::to_str).unwrap_or("") == "vtt"
-    } else {
-        false
-    };
-
+    // Use VttSink only when the caller explicitly requests it via vtt_output=true.
+    // This mirrors the CLI behaviour where the output filename extension decides the sink type.
+    // If the client sets vtt_output=true but the mapping does not resolve to a single text
+    // subtitle track, Remuxer::new() will return an error (which the caller will receive as
+    // a 400 response).
     let writer = ChannelWriterWrapper::new(SinkSender::Tokio(tx));
-    let output_sink: OutputSink<Uninitialized> = if is_vtt_output {
+    let output_sink: OutputSink<Uninitialized> = if vtt_output {
         let vtt_sink = VttSink::new(writer);
         OutputSink::new(Box::new(vtt_sink) as Box<dyn Sink>)
     } else {

@@ -107,6 +107,7 @@ pub struct ValidationStats {
     pub cue_points_checked: usize,
     pub output_duration_ns: Option<u64>,
     pub expected_duration_ns: Option<u64>,
+    pub blocks_per_cluster: Vec<usize>,
 }
 
 /// Validates an MKV output file for:
@@ -281,15 +282,17 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                                 CLUSTER_MAX_SIZE_BYTES
                             ));
                         }
-                        report.stats.max_cluster_size_bytes = 
+                        report.stats.max_cluster_size_bytes =
                             report.stats.max_cluster_size_bytes.max(cluster_size);
 
                         // Process blocks
                         let mut cluster_min_ts_ns = i64::MAX;
                         let mut cluster_max_ts_ns = i64::MIN;
+                        let mut cluster_block_count = 0usize;
 
                         for block in &cluster.blocks {
                             report.stats.total_blocks += 1;
+                            cluster_block_count += 1;
 
                             // Get track number
                             if let Ok(track_num) = block.track_number() {
@@ -361,10 +364,13 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
                             }
                         }
 
+                        // Record per-cluster block count
+                        report.stats.blocks_per_cluster.push(cluster_block_count);
+
                         // Check cluster duration constraint
                         if cluster_max_ts_ns > cluster_min_ts_ns {
                             let cluster_duration_ns = (cluster_max_ts_ns - cluster_min_ts_ns) as u64;
-                            report.stats.max_cluster_duration_ns = 
+                            report.stats.max_cluster_duration_ns =
                                 report.stats.max_cluster_duration_ns.max(cluster_duration_ns);
 
                             if check_cluster_limits && cluster_duration_ns > CLUSTER_MAX_DURATION_NS {
@@ -450,6 +456,22 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
         report.errors.push("No blocks found in file".to_string());
     }
 
+    // Check average blocks per cluster (should be > 100)
+    if report.stats.total_clusters > 0 {
+        let avg_blocks_per_cluster = report.stats.total_blocks as f64 / report.stats.total_clusters as f64;
+        if avg_blocks_per_cluster <= 100.0 {
+            let per_cluster_info: Vec<String> = report.stats.blocks_per_cluster
+                .iter()
+                .enumerate()
+                .map(|(i, &count)| format!("  cluster {}: {} blocks", i + 1, count))
+                .collect();
+            report.warnings.push(format!(
+                "Average blocks per cluster ({:.1}) is not more than 100. Per-cluster block counts:\n{}",
+                avg_blocks_per_cluster,
+                per_cluster_info.join("\n")
+            ));
+        }
+    }
 
     Ok(report)
 }

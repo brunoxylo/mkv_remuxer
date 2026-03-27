@@ -171,8 +171,9 @@ impl<W: Write + Send> Sink for VttSink<W> {
             };
 
             // Calculate absolute timing
-            let block_timestamp_ns = cluster_timestamp_ns
-                + (relative_timestamp as i64 * self.timecode_scale as i64) as u64;
+            let block_timestamp_ns = (cluster_timestamp_ns as i64
+                + relative_timestamp as i64 * self.timecode_scale as i64)
+                .max(0) as u64;
             let duration_ns = duration_ticks * self.timecode_scale;
             let end_timestamp_ns = block_timestamp_ns + duration_ns;
 
