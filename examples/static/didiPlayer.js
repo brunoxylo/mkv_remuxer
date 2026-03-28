@@ -261,6 +261,11 @@ class DidiPlayer {
             const offset = this.isSafari ? 0 : (this.currentSeekOffset || 0);
             const adjustedVtt = this.adjustVttTimestamps(rawVtt, -offset);
 
+            // Log the shifted subtitles for debugging
+            console.log('=== Adjusted VTT (offset:', offset, ') ===');
+            console.log(adjustedVtt);
+            console.log('========================================');
+
             const blob = new Blob([adjustedVtt], { type: 'text/vtt' });
             this._subtitleBlobUrl = URL.createObjectURL(blob);
 
@@ -279,10 +284,22 @@ class DidiPlayer {
             track.src = this._subtitleBlobUrl;
             track.default = true;
             this.video.appendChild(track);
-            // Force the track to showing mode — track.default only works on initial load
+
+            // Force the track to load and show
+            // track.default only works on initial video load, not when dynamically added
+            if (track.track) {
+                track.track.mode = 'showing';
+            }
             track.addEventListener('load', () => {
-                if (track.track) track.track.mode = 'showing';
+                if (track.track) {
+                    track.track.mode = 'showing';
+                    console.log('Subtitle track loaded, mode set to showing');
+                }
             });
+            // Also try to reload the track to force processing
+            const currentSrc = track.src;
+            track.src = '';
+            track.src = currentSrc;
 
         } catch (e) {
             console.error("Subtitle load failed", e);
@@ -290,30 +307,91 @@ class DidiPlayer {
     }
 
     adjustVttTimestamps(vttText, offsetSeconds) {
-        // Regex for VTT timestamps: 00:00:00.000 or 00:00.000
-        // We parse, add offset, print.
-        // This is crude regex, generic library would be better but keeping it simple.
-        return vttText.replace(/(\d{2}:)?(\d{2}):(\d{2})\.(\d{3})/g, (match, h, m, s, ms) => {
-             let hours = h ? parseInt(h.replace(':', '')) : 0;
-             let mins = parseInt(m);
-             let secs = parseInt(s);
-             let millis = parseInt(ms);
-             
-             let total = hours * 3600 + mins * 60 + secs + millis / 1000;
-             total += offsetSeconds;
-             
-             if (total < 0) return "00:00:00.000"; // Clamp to 0
-             
-             // Convert back
-             let nh = Math.floor(total / 3600);
-             let rem = total % 3600;
-             let nm = Math.floor(rem / 60);
-             let ns = Math.floor(rem % 60);
-             let nms = Math.round((rem - nm * 60 - ns) * 1000);
-             
-             const pad = (n, w=2) => n.toString().padStart(w, '0');
-             return `${pad(nh)}:${pad(nm)}:${pad(ns)}.${pad(nms, 3)}`;
-        });
+        // Parse timestamp string to seconds
+        const parseTimestamp = (ts) => {
+            // Support both HH:MM:SS.mmm and MM:SS.mmm formats
+            const m = ts.match(/^(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})$/);
+            if (!m) return null;
+            const h = m[1] ? parseInt(m[1]) : 0;
+            const mins = parseInt(m[2]);
+            const secs = parseInt(m[3]);
+            const millis = parseInt(m[4]);
+            return h * 3600 + mins * 60 + secs + millis / 1000;
+        };
+
+        // Format seconds back to timestamp
+        const formatTimestamp = (total) => {
+            const pad = (n, w = 2) => n.toString().padStart(w, '0');
+            const nh = Math.floor(total / 3600);
+            const rem = total % 3600;
+            const nm = Math.floor(rem / 60);
+            const ns = Math.floor(rem % 60);
+            const nms = Math.round((rem - nm * 60 - ns) * 1000);
+            return `${pad(nh)}:${pad(nm)}:${pad(ns)}.${pad(nms, 3)}`;
+        };
+
+        const lines = vttText.split('\n');
+        const result = [];
+        let foundFirstValidCue = false;
+        let i = 0;
+
+        // Keep header (WEBVTT and any initial comments/settings)
+        while (i < lines.length) {
+            const line = lines[i];
+            // Cue timing line pattern: "00:00:00.000 --> 00:00:00.000" or "00:00.000 --> 00:00.000"
+            const timingMatch = line.match(/^(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})/);
+            if (timingMatch) {
+                // This is a cue timing line - check if start time is valid after offset
+                // Reconstruct timestamps from match groups: [1]=startH [2]=startM [3]=startS [4]=startMs [5]=endH [6]=endM [7]=endS [8]=endMs
+                const startTs = (timingMatch[1] ? timingMatch[1] + ':' : '') + timingMatch[2] + ':' + timingMatch[3] + '.' + timingMatch[4];
+                const endTs = (timingMatch[5] ? timingMatch[5] + ':' : '') + timingMatch[6] + ':' + timingMatch[7] + '.' + timingMatch[8];
+                const startTime = parseTimestamp(startTs);
+                const endTime = parseTimestamp(endTs);
+                if (startTime !== null) {
+                    const adjustedStart = startTime + offsetSeconds;
+                    if (adjustedStart >= 0) {
+                        // First valid (non-negative) cue found
+                        foundFirstValidCue = true;
+                        // Adjust both timestamps and add the cue
+                        const adjustedEnd = endTime + offsetSeconds;
+                        result.push(`${formatTimestamp(adjustedStart)} --> ${formatTimestamp(adjustedEnd)}`);
+                        i++;
+                        // Add all cue text lines until blank line or next cue
+                        while (i < lines.length && lines[i].trim() !== '' && !lines[i].match(/^(?:\d{2}:)?\d{2}:\d{2}\.\d{3}/)) {
+                            result.push(lines[i]);
+                            i++;
+                        }
+                        // Add blank line if present (separator between cues)
+                        if (i < lines.length && lines[i].trim() === '') {
+                            result.push(lines[i]);
+                            i++;
+                        }
+                    } else {
+                        // Negative timestamp - skip this entire cue
+                        i++;
+                        // Skip cue text lines
+                        while (i < lines.length && lines[i].trim() !== '' && !lines[i].match(/^(?:\d{2}:)?\d{2}:\d{2}\.\d{3}/)) {
+                            i++;
+                        }
+                        // Skip blank line separator
+                        if (i < lines.length && lines[i].trim() === '') {
+                            i++;
+                        }
+                    }
+                } else {
+                    i++;
+                }
+            } else {
+                // Not a cue line - keep it if we haven't found valid cues yet (header section)
+                // or if it's between cues
+                if (!foundFirstValidCue) {
+                    result.push(line);
+                }
+                i++;
+            }
+        }
+
+        return result.join('\n');
     }
 
     getDuration() {
