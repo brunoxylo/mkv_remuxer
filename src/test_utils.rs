@@ -92,6 +92,8 @@ pub struct MkvValidationReport {
     pub cluster_block_count_valid: bool,
     pub cues_valid: bool,
     pub duration_valid: bool,
+    /// Segment size is > 1000 bytes and < file size
+    pub segment_size_valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub stats: ValidationStats,
@@ -108,6 +110,7 @@ pub struct ValidationStats {
     pub output_duration_ns: Option<u64>,
     pub expected_duration_ns: Option<u64>,
     pub blocks_per_cluster: Vec<usize>,
+    pub segment_length: Option<u64>,
 }
 
 /// Validates an MKV output file for:
@@ -141,6 +144,7 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
         cluster_block_count_valid: true,
         cues_valid: true,
         duration_valid: true,
+        segment_size_valid: true,
         errors: Vec::new(),
         warnings: Vec::new(),
         stats: ValidationStats {
@@ -195,6 +199,36 @@ pub fn validate_mkv_output<P: AsRef<Path>>(
             segment_header.id.value
         ));
         return Ok(report);
+    }
+
+    // Validate segment size: should be > 1000 bytes and < file size
+    let file_len = file.metadata()?.len();
+    if segment_header.size.is_unknown {
+        // For file-based output, segment size should always be known
+        report.segment_size_valid = false;
+        report.errors.push("Segment has unknown size - library should set segment length for file output".to_string());
+        report.stats.segment_length = None;
+    } else {
+        let segment_length = segment_header.size.value;
+        report.stats.segment_length = Some(segment_length);
+        
+        // Segment should be greater than 1000 bytes (to detect suspiciously small segments)
+        if segment_length <= 1000 {
+            report.segment_size_valid = false;
+            report.errors.push(format!(
+                "Segment size ({}) is suspiciously small (must be > 1000 bytes)",
+                segment_length
+            ));
+        }
+        
+        // Segment should be smaller than file size (accounting for EBML header)
+        if segment_length > file_len {
+            report.segment_size_valid = false;
+            report.errors.push(format!(
+                "Segment size ({}) exceeds file size ({})",
+                segment_length, file_len
+            ));
+        }
     }
 
     // Track parsing state
@@ -541,6 +575,7 @@ impl MkvValidationReport {
             && self.cluster_block_count_valid
             && self.cues_valid
             && self.duration_valid
+            && self.segment_size_valid
             && self.stats.total_clusters > 0
             && self.stats.total_blocks > 0
     }
@@ -553,6 +588,9 @@ impl MkvValidationReport {
         let expected_dur_str = self.stats.expected_duration_ns
             .map(|d| format!("{:.3}s", d as f64 / 1_000_000_000.0))
             .unwrap_or_else(|| "N/A".to_string());
+        let segment_len_str = self.stats.segment_length
+            .map(|s| format!("{} bytes", s))
+            .unwrap_or_else(|| "Unknown".to_string());
         
         format!(
             "MKV Validation Report:\n\
@@ -562,6 +600,7 @@ impl MkvValidationReport {
              - Cluster Block Count Valid: {}\n\
              - Cues Valid: {}\n\
              - Duration Valid: {}\n\
+             - Segment Size Valid: {} ({})\n\
              - Total Clusters: {}\n\
              - Total Blocks: {}\n\
              - Tracks Found: {:?}\n\
@@ -578,6 +617,8 @@ impl MkvValidationReport {
             self.cluster_block_count_valid,
             self.cues_valid,
             self.duration_valid,
+            self.segment_size_valid,
+            segment_len_str,
             self.stats.total_clusters,
             self.stats.total_blocks,
             self.stats.tracks_found,

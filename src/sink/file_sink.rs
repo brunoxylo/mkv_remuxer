@@ -90,11 +90,12 @@ impl Sink for FileSink {
         // Write Segment start with unknown size for streaming
         // Segment ID is 0x18538067
         self.writer.write_all(&[0x18, 0x53, 0x80, 0x67])?;
-        self.segment_start_offset = self.writer.stream_position()?;
 
         // Unknown size marker (all 1s in VINT encoding)
         self.writer
             .write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?;
+
+        self.segment_start_offset = self.writer.stream_position()?;
 
         // Write Info element inside the segment
         info.write_to(&mut self.writer)?;
@@ -158,9 +159,10 @@ impl Sink for FileSink {
     }
 
     fn finalize(&mut self) -> Result<()> {
+        let end_pos = self.writer.stream_position()?;
         // Generate and write cues from collected cue points
         if !self.cue_points.is_empty() && self.cues_offset > 0 {
-            let segment_data_start = self.segment_start_offset + 8;
+            let segment_data_start = self.segment_start_offset;
             
             let mut cues = Cues {
                 crc32: None,
@@ -285,8 +287,13 @@ impl Sink for FileSink {
             self.writer.flush()?;
             self.writer.seek(SeekFrom::Start(current_pos))?;
         }
-        
+        // seek to segment start pos
+        self.writer.seek(SeekFrom::Start(self.segment_start_offset - 8))?; // we seek from begin of the elements data section back to the element size
+        let segment_length = (end_pos - self.segment_start_offset); 
+        let vint_8byte = encode_vint_8_bytes(segment_length)?;
+        self.writer.write_all(&vint_8byte)?;
         self.writer.flush()?;
+        self.writer.seek(SeekFrom::Start(end_pos))?;
         Ok(())
     }
 
@@ -376,4 +383,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         Ok(())
     }
+}
+
+
+
+fn encode_vint_8_bytes( value: u64) -> Result<[u8;8]> {
+    // VInt64::new creates the minimal encoding; for fixed 8-byte we encode manually
+    if value > 0x00FF_FFFF_FFFF_FFFF {
+        return Err(Error::InvalidConfig("Value too large for 8-byte VINT".into()));
+    }
+    
+    let bytes = [
+        0x01,
+        (value >> 48) as u8,
+        (value >> 40) as u8,
+        (value >> 32) as u8,
+        (value >> 24) as u8,
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        value as u8,
+    ];
+    
+    Ok(bytes)
 }
