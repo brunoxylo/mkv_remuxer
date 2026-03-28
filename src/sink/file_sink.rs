@@ -14,7 +14,6 @@ const CUE_INTERVAL_NS: u64 = 15_000_000_000; // 15 seconds
 pub struct FileSink {
     writer: BufWriter<File>,
     container_format: ContainerFormat,
-    segment_started: bool,
     segment_start_offset: u64,
     cues_offset: u64,
     reserved_cues_size: u64,
@@ -49,7 +48,6 @@ impl FileSink {
         Ok(Self {
             writer,
             container_format: format,
-            segment_started: false,
             segment_start_offset: 0,
             cues_offset: 0,
             reserved_cues_size: 0,
@@ -135,16 +133,10 @@ impl Sink for FileSink {
 
         // Store timescale for timestamp calculations
         self.timescale = info.timestamp_scale.0;
-        self.segment_started = true;
         Ok(())
     }
 
     fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {
-        if !self.segment_started {
-            return Err(crate::Error::InvalidConfig(
-                "Cannot write cluster before initialize() is called".to_string(),
-            ));
-        }
 
         // Get cluster position before writing
         let cluster_position = self.writer.stream_position()?;

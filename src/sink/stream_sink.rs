@@ -14,7 +14,6 @@ use mkv_element::prelude::*;
 /// since seekable streams allow the consumer to navigate the file.
 pub struct StreamSink<W: Write + Send> {
     writer: W,
-    segment_started: bool,
     timescale: u64,
 }
 
@@ -24,7 +23,6 @@ impl<W: Write + Send> StreamSink<W> {
     pub fn new(writer: W) -> Result<Self> {
         Ok(Self {
             writer,
-            segment_started: false,
             timescale: 1_000_000,
         })
     }
@@ -73,16 +71,10 @@ impl<W: Write + Send> Sink for StreamSink<W> {
 
         // Store timescale for timestamp calculations
         self.timescale = info.timestamp_scale.0;
-        self.segment_started = true;
         Ok(())
     }
 
     fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {
-        if !self.segment_started {
-            return Err(crate::Error::InvalidConfig(
-                "Cannot write cluster before initialize() is called".to_string(),
-            ));
-        }
         
         // Calculate cluster timestamp in nanoseconds
         let cluster_timestamp_ticks = cluster.timestamp.0;
@@ -168,7 +160,6 @@ mod tests {
         };
 
         sink.initialize(&tracks, &info, &make_ebml_header("matroska"), None)?;
-        assert!(sink.segment_started);
 
         let cluster = Cluster {
             timestamp: Timestamp(0),
