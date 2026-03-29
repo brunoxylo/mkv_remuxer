@@ -123,21 +123,28 @@ impl std::error::Error for Error {
     }
 }
 
+fn filter_ioi_err(err: io::Error) -> Error {
+    if err.kind() == io::ErrorKind::BrokenPipe {
+        Error::ChannelClosed(err.to_string())
+    } else {
+        Error::Io(err)
+    }
+}
+
 // Conversion from std::io::Error
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
-        if err.kind() == io::ErrorKind::BrokenPipe {
-            Error::ChannelClosed(err.to_string())
-        } else {
-            Error::Io(err)
-        }
+        filter_ioi_err(err)
     }
 }
 
 // Conversion from mkv_element::Error
 impl From<mkv_element::Error> for Error {
     fn from(err: mkv_element::Error) -> Self {
-        Error::MkvElement(err)
+        match err {
+            mkv_element::Error::Io(err) => filter_ioi_err(err),
+            _ => Error::MkvElement(err),
+        }
     }
 }
 
