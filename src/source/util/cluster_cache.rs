@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use log::info;
+use log::trace;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 use std::collections::HashMap;
