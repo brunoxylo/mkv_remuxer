@@ -72,6 +72,7 @@ pub enum Error {
     RemuxError(String),
     ClusterIsFull(String),
     FileCorrupted(String),
+    ChannelClosed(String)
 }
 
 impl fmt::Display for Error {
@@ -107,6 +108,7 @@ impl fmt::Display for Error {
             Error::ClusterIsFull(msg) => write!(f, "Cluster is full: {}", msg),
             Error::Done => write!(f, "Remuxing completed"),
             Error::FileCorrupted(msg) => write!(f, "File is corrupted: {}", msg),
+            Error::ChannelClosed(msg) => write!(f, "Channel closed: {}", msg),
         }
     }
 }
@@ -124,7 +126,11 @@ impl std::error::Error for Error {
 // Conversion from std::io::Error
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
-        Error::Io(err)
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            Error::ChannelClosed(err.to_string())
+        } else {
+            Error::Io(err)
+        }
     }
 }
 
