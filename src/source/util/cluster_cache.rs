@@ -45,7 +45,7 @@ impl KeyframePositionCache {
         };
         let start_time = std::time::Instant::now();
         let position = Self::binary_search_cluster(&mut file, timecode_scale, timestamp_ns as i64, lo, hi)?;
-        info!("MkvRemuxer: Binary search for cluster completed in {} ms", start_time.elapsed().as_millis());
+        trace!("MkvRemuxer: Binary search for cluster completed in {} ms", start_time.elapsed().as_millis());
 
         Ok(Self {
             position,
@@ -431,7 +431,7 @@ impl KeyframePositionCache {
                         (track_num, after),
                         keyframe_timestamp_ns,
                     );
-                    info!("MkvRemuxer: Keyframe cache updated key ({}, {}) after scanning {} clusters in {} ms for timestamp {}", track_num, after, sanity_check_counter, start_time.elapsed().as_millis(), reference_timestamp_ns);
+                    trace!("MkvRemuxer: Keyframe cache updated key ({}, {}) after scanning {} clusters in {} ms for timestamp {}", track_num, after, sanity_check_counter, start_time.elapsed().as_millis(), reference_timestamp_ns);
                     return Ok(());
                 }
             }
