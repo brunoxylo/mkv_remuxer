@@ -167,7 +167,7 @@ class DidiPlayer {
         this.reloadSubtitles();
     }
 
-    seek(seconds) {
+    async seek(seconds) {
         if (this.isSafari) {
             this.video.currentTime = seconds;
             return;
@@ -176,46 +176,53 @@ class DidiPlayer {
         // Remember whether the video was playing so we can resume after src change
         const wasPlaying = !this.video.paused;
 
-        // Remuxer seek (squeeze)
+        let currentAbsTime = this.video.currentTime + (this.currentSeekOffset || 0);
+        let diff = Math.abs(seconds - currentAbsTime);
+        let seekMode = (diff > 60) ? 'snap' : 'squeeze'; 
+
         // Construct mappings
-        // Video: activeFileIndex_activeVideoTrackId
-        // Audio: activeAudioFileIndex_activeAudioTrackId
-        
         let mappings = `${this.activeFileIndex}_${this.activeVideoTrackId}`;
-        
-        // Need to handle missing track selection robustly
         if (this.activeAudioFileIndex === undefined) this.activeAudioFileIndex = this.activeFileIndex;
-        
         mappings += `,${this.activeAudioFileIndex}_${this.activeAudioTrackId}`;
         
-        // URL
-        // seek=squeeze
-        const url = `${this.apiBase}/video/stream?mappings=${mappings}&seek=squeeze&start=${seconds}`;
+        const url = `${this.apiBase}/video/stream?mappings=${mappings}&seek=${seekMode}&start=${seconds}`;
         
-        // Setting src resets the media element (readyState → 0).
-        // Both auto-resume and subtitle reload must wait until canplay fires
-        // (readyState ≥ 3), otherwise the browser discards the <track> element.
-        const onCanPlay = () => {
-            this.video.removeEventListener('canplay', onCanPlay);
-            if (wasPlaying) {
-                this.video.play().catch(() => {});
+        try {
+            // Use fetch just to read the headers/errors without MSE overhead
+            const controller = new AbortController();
+            const res = await fetch(url, { signal: controller.signal });
+            
+            if (!res.ok) {
+                const errText = await res.text();
+                this.video.dispatchEvent(new CustomEvent('didiError', { detail: errText }));
+                return;
             }
-            // Reload subtitles now that the media element is ready
-            this.reloadSubtitles();
-        };
-        this.video.addEventListener('canplay', onCanPlay);
 
-        this.video.src = url;
-        // The browser will start playing from receiving the stream.
-        // Since we use 'squeeze', the stream starts at timestamp 0.
-        // We must update subtitle offset.
-        this.currentSeekOffset = seconds;
-        // Remove stale <track> elements immediately so there's no flash of old subtitles.
-        // The new track will be added once canplay fires.
-        this.video.querySelectorAll('track').forEach(t => t.remove());
-        if (this._subtitleBlobUrl) {
-            URL.revokeObjectURL(this._subtitleBlobUrl);
-            this._subtitleBlobUrl = null;
+            const headerStart = parseFloat(res.headers.get('x-media-start-sec'));
+            this.currentSeekOffset = !isNaN(headerStart) ? headerStart : seconds;
+            
+            // Abort the fetch so the browser doesn't download the body in JS space
+            controller.abort();
+
+            const onCanPlay = () => {
+                this.video.removeEventListener('canplay', onCanPlay);
+                if (wasPlaying) {
+                    this.video.play().catch(() => {});
+                }
+                this.reloadSubtitles();
+            };
+            this.video.addEventListener('canplay', onCanPlay);
+
+            this.video.src = url;
+            this.video.querySelectorAll('track').forEach(t => t.remove());
+            if (this._subtitleBlobUrl) {
+                URL.revokeObjectURL(this._subtitleBlobUrl);
+                this._subtitleBlobUrl = null;
+            }
+        } catch(e) {
+            if (e.name !== 'AbortError') {
+                this.video.dispatchEvent(new CustomEvent('didiError', { detail: e.message || 'Unknown error' }));
+            }
         }
     }
     
@@ -261,11 +268,6 @@ class DidiPlayer {
             const offset = this.isSafari ? 0 : (this.currentSeekOffset || 0);
             const adjustedVtt = this.adjustVttTimestamps(rawVtt, -offset);
 
-            // Log the shifted subtitles for debugging
-            console.log('=== Adjusted VTT (offset:', offset, ') ===');
-            console.log(adjustedVtt);
-            console.log('========================================');
-
             const blob = new Blob([adjustedVtt], { type: 'text/vtt' });
             this._subtitleBlobUrl = URL.createObjectURL(blob);
 
@@ -293,7 +295,6 @@ class DidiPlayer {
             track.addEventListener('load', () => {
                 if (track.track) {
                     track.track.mode = 'showing';
-                    console.log('Subtitle track loaded, mode set to showing');
                 }
             });
             // Also try to reload the track to force processing

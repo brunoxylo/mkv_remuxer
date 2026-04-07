@@ -1,17 +1,50 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Advanced MKV Remuxer Demo</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .controls { margin-top: 10px; border: 1px solid #ccc; padding: 10px; background: #f9f9f9; }
-        .control-group { margin-bottom: 10px; }
-        label { display: inline-block; width: 100px; font-weight: bold; }
-        select { width: 300px; }
-        video { width: 100%; background: #000; }
-        #statusBar { margin-top: 10px; font-size: 0.9em; color: #555; }
+        body {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .controls {
+            margin-top: 10px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            background: #f9f9f9;
+        }
+
+        .control-group {
+            margin-bottom: 10px;
+        }
+
+        label {
+            display: inline-block;
+            width: 100px;
+            font-weight: bold;
+        }
+
+        select {
+            width: 300px;
+        }
+
+        video {
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #000;
+        }
+
+        #statusBar {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #555;
+        }
 
         /* ── Timeline ── */
         .timeline-row {
@@ -20,12 +53,27 @@
             gap: 8px;
             margin-bottom: 10px;
         }
+
         #timeDisplay {
             white-space: nowrap;
             font-size: 0.85em;
             color: #333;
             min-width: 110px;
         }
+
+        #playPauseBtn {
+            padding: 4px 12px;
+            cursor: pointer;
+            border: 1px solid #ccc;
+            background: #eee;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+
+        #playPauseBtn:hover {
+            background: #ddd;
+        }
+
         /* Wrapper gives us a hit-area and the progress fill */
         #timelineWrapper {
             position: relative;
@@ -35,15 +83,18 @@
             display: flex;
             align-items: center;
         }
+
         /* Track (grey background) */
         #timelineTrack {
             position: absolute;
-            left: 0; right: 0;
+            left: 0;
+            right: 0;
             height: 5px;
             background: #ccc;
             border-radius: 3px;
             pointer-events: none;
         }
+
         /* Filled portion (blue) */
         #timelineFill {
             position: absolute;
@@ -55,6 +106,7 @@
             pointer-events: none;
             transition: width 0.1s linear;
         }
+
         /* Thumb (circle) */
         #timelineThumb {
             position: absolute;
@@ -65,31 +117,33 @@
             transform: translateX(-50%);
             left: 0%;
             pointer-events: none;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
             transition: left 0.1s linear;
         }
+
         #timelineWrapper:hover #timelineThumb {
             width: 18px;
             height: 18px;
         }
     </style>
 </head>
+
 <body>
     <h1>MKV Remuxer Advanced Player</h1>
-    
-    <video id="videoPlayer" controls playsinline></video>
-    
+
+    <video id="videoPlayer" playsinline></video>
+
     <div class="controls">
         <div class="control-group">
             <label>Video Track:</label>
             <select id="videoTrackSelect"></select>
         </div>
-        
+
         <div class="control-group">
             <label>Audio Track:</label>
             <select id="audioTrackSelect"></select>
         </div>
-        
+
         <div class="control-group">
             <label>Subtitle:</label>
             <select id="subtitleTrackSelect">
@@ -99,6 +153,7 @@
 
         <!-- Seamless timeline -->
         <div class="timeline-row">
+            <button id="playPauseBtn">Play</button>
             <span id="timeDisplay">00:00 / 00:00</span>
             <div id="timelineWrapper">
                 <div id="timelineTrack"></div>
@@ -110,13 +165,16 @@
 
     <div id="statusBar">Loading...</div>
 
+    <div id="errorToast" style="position: fixed; bottom: 20px; right: 20px; background: #f44336; color: white; padding: 15px; border-radius: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); display: none; z-index: 1000; max-width: 400px; font-weight: bold;"></div>
+
     <script src="didiPlayer.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', async () => {
             const video = document.getElementById('videoPlayer');
             const player = new DidiPlayer(video);
-            
+
             // UI References
+            const playPauseBtn = document.getElementById('playPauseBtn');
             const videoSelect = document.getElementById('videoTrackSelect');
             const audioSelect = document.getElementById('audioTrackSelect');
             const subSelect = document.getElementById('subtitleTrackSelect');
@@ -125,8 +183,18 @@
 
             // Timeline elements
             const timelineWrapper = document.getElementById('timelineWrapper');
-            const timelineFill   = document.getElementById('timelineFill');
-            const timelineThumb  = document.getElementById('timelineThumb');
+            const timelineFill = document.getElementById('timelineFill');
+            const timelineThumb = document.getElementById('timelineThumb');
+            const errorToast = document.getElementById('errorToast');
+
+            // ── DidiPlayer Errors ───────────────────────────────────────────
+            video.addEventListener('didiError', (e) => {
+                errorToast.textContent = `Error: ${e.detail}`;
+                errorToast.style.display = 'block';
+                setTimeout(() => {
+                    errorToast.style.display = 'none';
+                }, 5000);
+            });
 
             // ── Timeline state ──────────────────────────────────────────────
             let userIsDragging = false;
@@ -196,6 +264,23 @@
                 seekToFraction(frac);
             });
 
+            // ── Play/Pause Button Logic ──────────────────────────────────────
+            playPauseBtn.addEventListener('click', () => {
+                if (video.paused) {
+                    video.play();
+                } else {
+                    video.pause();
+                }
+            });
+
+            video.addEventListener('play', () => {
+                playPauseBtn.textContent = 'Pause';
+            });
+
+            video.addEventListener('pause', () => {
+                playPauseBtn.textContent = 'Play';
+            });
+
             // ── Playback time → timeline sync ──────────────────────────────
             video.addEventListener('timeupdate', () => {
                 if (userIsDragging) return; // don't fight the user's drag
@@ -226,22 +311,22 @@
                 const vTracks = player.getAllVideoTracks();
                 vTracks.forEach(t => {
                     const opt = document.createElement('option');
-                    opt.value = JSON.stringify({id: t.track_id, fileIdx: t.fileIndex});
+                    opt.value = JSON.stringify({ id: t.track_id, fileIdx: t.fileIndex });
                     opt.textContent = `[${t.fileName}] ID ${t.track_id}: ${t.codec} ${t.width}x${t.height}`;
                     videoSelect.appendChild(opt);
                 });
-                
+
                 if (vTracks.length > 0) {
                     const first = vTracks[0];
-                    videoSelect.value = JSON.stringify({id: first.track_id, fileIdx: first.fileIndex});
+                    videoSelect.value = JSON.stringify({ id: first.track_id, fileIdx: first.fileIndex });
                     handleVideoChange(first.track_id, first.fileIndex);
                 }
             }
 
             function handleVideoChange(trackId, fileIndex) {
-                 player.setVideoTrack(trackId, fileIndex);
-                 updateSecondaryTracksUI(fileIndex);
-                 status.textContent = "Playing video from file " + fileIndex;
+                player.setVideoTrack(trackId, fileIndex);
+                updateSecondaryTracksUI(fileIndex);
+                status.textContent = "Playing video from file " + fileIndex;
             }
 
             function updateSecondaryTracksUI(fileIndex) {
@@ -250,26 +335,26 @@
                 const aTracks = player.getAudioTracks(fileIndex);
                 aTracks.forEach(t => {
                     const opt = document.createElement('option');
-                    opt.value = JSON.stringify({id: t.track_id, fileIdx: t.fileIndex});
+                    opt.value = JSON.stringify({ id: t.track_id, fileIdx: t.fileIndex });
                     const origin = t.origin === 'external' ? ` [Ext File ${t.fileIndex}]` : '';
                     opt.textContent = `ID ${t.track_id}: ${t.codec} (${t.language || 'und'})${origin}`;
                     audioSelect.appendChild(opt);
                 });
 
                 if (aTracks.length > 0) {
-                    audioSelect.value = JSON.stringify({id: player.activeAudioTrackId, fileIdx: player.activeAudioFileIndex});
+                    audioSelect.value = JSON.stringify({ id: player.activeAudioTrackId, fileIdx: player.activeAudioFileIndex });
                 }
 
                 // Subtitle (Smart Selector) — preserve current selection across video track switches
                 const prevSubValue = subSelect.value; // remember before rebuilding
                 subSelect.innerHTML = '<option value="-1">None</option>';
                 const subCandidates = player.getSubtitleTracks();
-                
+
                 subCandidates.forEach(t => {
                     const opt = document.createElement('option');
-                    opt.value = JSON.stringify({id: t.track_id, fileIdx: t.fileIndex});
+                    opt.value = JSON.stringify({ id: t.track_id, fileIdx: t.fileIndex });
                     const forced = t.forced ? ' [Forced]' : '';
-                    const size = `(${(t.fileSize/1024).toFixed(0)}KB)`;
+                    const size = `(${(t.fileSize / 1024).toFixed(0)}KB)`;
                     opt.textContent = `${t.language || 'und'}${forced} ${size}`;
                     subSelect.appendChild(opt);
                 });
@@ -312,4 +397,5 @@
         });
     </script>
 </body>
+
 </html>

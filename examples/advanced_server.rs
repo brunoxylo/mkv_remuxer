@@ -238,8 +238,7 @@ async fn handle_stream_request(params: HashMap<String, String>) -> Result<warp::
     };
 
     let start_sec_out = output_interval.start_ns.map(|ns| ns as f64 / 1e9).unwrap_or(0.0);
-    // If end_sec is None, we don't know the duration until processed, so we omit header or send 0?
-    // RemuxerCutMode might have adjusted it.
+    let end_sec_out = output_interval.end_ns.map(|ns| ns as f64 / 1e9).unwrap_or(0.0);
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let mapped = tokio_stream::StreamExt::map(stream, |c| Ok::<_, Infallible>(c));
@@ -248,7 +247,9 @@ async fn handle_stream_request(params: HashMap<String, String>) -> Result<warp::
     let response = warp::http::Response::builder()
         .status(200)
         .header("Content-Type", content_type)
-        .header("X-Media-Start", format!("{:.3}", start_sec_out))
+        .header("X-Media-Start-Sec", format!("{:.3}", start_sec_out))
+        .header("X-Media-End-Sec", format!("{:.3}", end_sec_out))
+        .header("Access-Control-Expose-Headers", "X-Media-Start-Sec, X-Media-End-Sec")
         .body(body)
         .unwrap();
 
