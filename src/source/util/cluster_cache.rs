@@ -296,16 +296,8 @@ impl KeyframePositionCache {
 
     // ── Keyframe caching (instance methods, existing logic preserved) ───
 
-    fn update_cache(&mut self, track_num: u64, after: bool) -> Result<()> {
+    fn update_cache(&mut self, track_num: u64, mut after: bool) -> Result<()> {
         let reference_timestamp_ns = self.reference_timestamp_ns;
-
-        /*
-        // If reference timestamp is 0, we can just use the current cluster position as the keyframe cluster
-        if reference_timestamp_ns == 0 {
-            self.keyframe_cluster_position.insert((track_num, after), self.position);
-            self.keyframe_timestamp_ns.insert((track_num, after), reference_timestamp_ns as i64);
-            return Ok(());
-        }*/
 
         let start_time = std::time::Instant::now();
 
@@ -319,21 +311,21 @@ impl KeyframePositionCache {
         );
 
         // Try to find keyframe in current cluster first
-        let cluster = Cluster::from_file_pos(&mut self.file, self.position)?;
-        let cluster_ts_ns = cluster.timestamp.0 as i64 * self.timecode_scale as i64;
+        let initial_cluster = Cluster::from_file_pos(&mut self.file, self.position)?;
+        let initial_cluster_ts_ns = initial_cluster.timestamp.0 as i64 * self.timecode_scale as i64;
         eprintln!(
             "[DEBUG update_cache] current cluster timestamp={:.3}s, block_count={}",
-            cluster_ts_ns as f64 / m,
-            cluster.blocks.len()
+            initial_cluster_ts_ns as f64 / m,
+            initial_cluster.blocks.len()
         );
 
         // Log all keyframes in this cluster for the track
-        for (i, block) in cluster.blocks.iter().enumerate() {
+        for (i, block) in initial_cluster.blocks.iter().enumerate() {
             if let Ok(true) = block.is_keyframe() {
                 if let Ok(tn) = block.track_number() {
                     if tn == track_num {
-                        if let Ok(ts) =
-                            block.timestamp_ns(cluster.timestamp.0 as i64, self.timecode_scale)
+                        if let Ok(ts) = block
+                            .timestamp_ns(initial_cluster.timestamp.0 as i64, self.timecode_scale)
                         {
                             eprintln!(
                                 "[DEBUG update_cache] cluster keyframe[{}]: track={}, ts={:.3}s",
@@ -346,72 +338,10 @@ impl KeyframePositionCache {
                 }
             }
         }
-
-        let keyframe_idx_opt = if after {
-            cluster.get_keyframe_after(
-                track_num,
-                reference_timestamp_ns as i64,
-                self.timecode_scale,
-            )
-        } else {
-            cluster.get_keyframe_before(
-                track_num,
-                reference_timestamp_ns as i64,
-                self.timecode_scale,
-            )
-        };
-
-        // If found a suitable keyframe in current cluster, use it
-        if let Some(keyframe_idx) = keyframe_idx_opt {
-            let keyframe_timestamp_ns = cluster
-                .blocks
-                .get(keyframe_idx)
-                .ok_or(Error::InternalBug(
-                    "Keyframe Index out of bounds".to_string(),
-                ))?
-                .timestamp_ns(cluster.timestamp.0 as i64, self.timecode_scale)?;
-
-            // Verify it actually meets the criteria
-            let meets_criteria = if after {
-                keyframe_timestamp_ns >= reference_timestamp_ns as i64
-            } else {
-                keyframe_timestamp_ns <= reference_timestamp_ns as i64
-            };
-
-            eprintln!(
-                "[DEBUG update_cache] found keyframe in current cluster: idx={}, ts={:.3}s, meets_criteria={}",
-                keyframe_idx,
-                keyframe_timestamp_ns as f64 / m,
-                meets_criteria
-            );
-
-            if meets_criteria {
-                self.keyframe_cluster_position
-                    .insert((track_num, after), self.position);
-                self.keyframe_timestamp_ns
-                    .insert((track_num, after), keyframe_timestamp_ns);
-                eprintln!(
-                    "[DEBUG update_cache] RETURNING EARLY with keyframe at {:.3}s from current cluster",
-                    keyframe_timestamp_ns as f64 / m
-                );
-                return Ok(());
-            }
-        } else {
-            eprintln!(
-                "[DEBUG update_cache] no keyframe found in current cluster for track={}, after={}",
-                track_num, after
-            );
-        }
-
-        // No suitable keyframe in current cluster, search neighboring clusters
-        // using scan_cluster_in_direction.
-        let mut direction = if after {
-            Direction::Next
-        } else {
-            Direction::Previous
-        };
-        let mut search_pos = self.position;
-
+        let mut current_after = after;
+        let mut current_search_pos = self.position;
+        let mut current_cluster = initial_cluster.clone();
+        let mut direction_changed = false;
         let mut sanity_check_counter = 0;
         loop {
             if sanity_check_counter > 1000 {
@@ -423,77 +353,94 @@ impl KeyframePositionCache {
                 )));
             }
             sanity_check_counter += 1;
-            let (cluster_pos, neighbor_cluster) =
-                match scan_cluster_in_direction(&mut self.file, search_pos, direction)? {
-                    Some(result) => {
-                        let cluster = Cluster::from_file_pos(&mut self.file, result)?;
-                        (result, cluster)
-                    }
-                    None => {
-                        // we have reached a file end so reverse and search to get at least a keyframe that is close to the reference timestamp
-                        direction = match direction {
-                            // if we cant find something in one direction, we change the direction but include the current cluster
-                            Direction::Next => Direction::Backward,
-                            Direction::Previous => Direction::Forward,
-                            _ => {
-                                return Err(Error::FileCorrupted(
-                                    "No keyframes despite scanning the whole file".to_string(),
-                                ));
-                            }
-                        };
-                        continue;
-                    }
-                };
-
-            let new_after: bool = direction == Direction::Next || direction == Direction::Forward;
-
-            let keyframe_idx_opt = if new_after {
-                neighbor_cluster.get_keyframe_after(
+            let keyframe_idx_opt = if current_after {
+                current_cluster.get_keyframe_after(
                     track_num,
                     reference_timestamp_ns as i64,
                     self.timecode_scale,
                 )
             } else {
-                neighbor_cluster.get_keyframe_before(
+                current_cluster.get_keyframe_before(
                     track_num,
                     reference_timestamp_ns as i64,
                     self.timecode_scale,
                 )
             };
 
+            // If found a suitable keyframe in current cluster, use it
             if let Some(keyframe_idx) = keyframe_idx_opt {
-                let keyframe_timestamp_ns = neighbor_cluster
+                let keyframe_timestamp_ns = current_cluster
                     .blocks
                     .get(keyframe_idx)
                     .ok_or(Error::InternalBug(
                         "Keyframe Index out of bounds".to_string(),
                     ))?
-                    .timestamp_ns(neighbor_cluster.timestamp.0 as i64, self.timecode_scale)?;
+                    .timestamp_ns(current_cluster.timestamp.0 as i64, self.timecode_scale)?;
 
-                let meets_criteria = if new_after {
+                // Verify it actually meets the criteria
+                let meets_criteria = if current_after {
                     keyframe_timestamp_ns >= reference_timestamp_ns as i64
                 } else {
                     keyframe_timestamp_ns <= reference_timestamp_ns as i64
                 };
 
+                eprintln!(
+                    "[DEBUG update_cache] found keyframe in current cluster: idx={}, ts={:.3}s, meets_criteria={}",
+                    keyframe_idx,
+                    keyframe_timestamp_ns as f64 / m,
+                    meets_criteria
+                );
+
                 if meets_criteria {
                     self.keyframe_cluster_position
-                        .insert((track_num, after), cluster_pos);
+                        .insert((track_num, after), current_search_pos);
                     self.keyframe_timestamp_ns
                         .insert((track_num, after), keyframe_timestamp_ns);
-                    trace!(
-                        "MkvRemuxer: Keyframe cache updated key ({}, {}) after scanning {} clusters in {} ms for timestamp {}",
-                        track_num,
-                        after,
-                        sanity_check_counter,
-                        start_time.elapsed().as_millis(),
-                        reference_timestamp_ns
+                    eprintln!(
+                        "[DEBUG update_cache] RETURNING with keyframe at {:.3}s from cluster_pos={}",
+                        keyframe_timestamp_ns as f64 / m,
+                        current_search_pos
                     );
                     return Ok(());
                 }
+            } else {
+                eprintln!(
+                    "[DEBUG update_cache] no keyframe found in current cluster for track={}, after={}",
+                    track_num, after
+                );
             }
 
-            search_pos = cluster_pos;
+            // No suitable keyframe in current cluster, search neighboring clusters
+            // using scan_cluster_in_direction.
+            let direction = if current_after {
+                Direction::Next
+            } else {
+                Direction::Previous
+            };
+            let (cluster_pos, neighbor_cluster) =
+                match scan_cluster_in_direction(&mut self.file, current_search_pos, direction)? {
+                    Some(result) => {
+                        let cluster = Cluster::from_file_pos(&mut self.file, result)?;
+                        (result, cluster)
+                    }
+                    None => {
+                        // we have reached a file end so reverse and search to get at least a keyframe that is close to the reference timestamp
+                        // we dont want to ""ping pong" indefinitely
+                        if direction_changed {
+                            return Err(Error::FileCorrupted(
+                                "No keyframes found after scanning all clusters".to_string(),
+                            ));
+                        } else {
+                            current_after = !current_after;
+                            current_search_pos = self.position;
+                            current_cluster = initial_cluster.clone();
+                            direction_changed = true;
+                            continue;
+                        }
+                    }
+                };
+            current_cluster = neighbor_cluster;
+            current_search_pos = cluster_pos;
         }
     }
 }
