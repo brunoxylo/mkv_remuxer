@@ -223,7 +223,12 @@ class DidiPlayer {
                 this.video.addEventListener('canplay', onCanPlay);
 
                 // Swap src *before* sourceopen so the browser starts decoding immediately
-                this.video.querySelectorAll('track').forEach(t => t.remove());
+                this.video.querySelectorAll('track').forEach(t => {
+                    if (t.track && t.track.mode !== 'hidden') {
+                        t.track.mode = 'hidden';
+                    }
+                    t.remove();
+                });
                 if (this._subtitleBlobUrl) {
                     URL.revokeObjectURL(this._subtitleBlobUrl);
                     this._subtitleBlobUrl = null;
@@ -298,7 +303,12 @@ class DidiPlayer {
                 this.video.addEventListener('canplay', onCanPlay);
 
                 this.video.src = url;
-                this.video.querySelectorAll('track').forEach(t => t.remove());
+                this.video.querySelectorAll('track').forEach(t => {
+                    if (t.track && t.track.mode !== 'hidden') {
+                        t.track.mode = 'hidden';
+                    }
+                    t.remove();
+                });
                 if (this._subtitleBlobUrl) {
                     URL.revokeObjectURL(this._subtitleBlobUrl);
                     this._subtitleBlobUrl = null;
@@ -312,8 +322,14 @@ class DidiPlayer {
     }
 
     async reloadSubtitles() {
-        // Remove existing <track> elements and revoke the old blob URL
-        this.video.querySelectorAll('track').forEach(t => t.remove());
+        // Remove existing <track> elements and revoke the old blob URL.
+        // IMPORTANT: Set mode to 'hidden' first to force Chrome to clear displayed cues.
+        this.video.querySelectorAll('track').forEach(t => {
+            if (t.track && t.track.mode !== 'hidden') {
+                t.track.mode = 'hidden';
+            }
+            t.remove();
+        });
         if (this._subtitleBlobUrl) {
             URL.revokeObjectURL(this._subtitleBlobUrl);
             this._subtitleBlobUrl = null;
