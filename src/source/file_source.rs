@@ -12,8 +12,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-
-pub struct FileSource<T : MkvReader> {
+pub struct FileSource<T: MkvReader> {
     file: T,
     file_name: Option<String>,
     timecode_scale: u64,
@@ -34,11 +33,9 @@ pub struct FileSource<T : MkvReader> {
 
 impl<T: MkvReader> FileSource<T> {
     pub fn new(mut reader: T) -> Result<Self> {
-
         // Read EBML header
         let ebml_header = Header::read_from(&mut reader)?;
         let _ebml = Ebml::read_element(&ebml_header, &mut reader)?;
-
 
         // Read Segment header
         let segment_header = Header::read_from(&mut reader)?;
@@ -62,7 +59,10 @@ impl<T: MkvReader> FileSource<T> {
             let header = match Header::read_from(&mut reader) {
                 Ok(h) => h,
                 Err(e) => {
-                    return Err(Error::InvalidFilePos(format!("header could not be loaded during init: {}", e)));
+                    return Err(Error::InvalidFilePos(format!(
+                        "header could not be loaded during init: {}",
+                        e
+                    )));
                 }
             };
 
@@ -92,11 +92,13 @@ impl<T: MkvReader> FileSource<T> {
             }
         }
 
-        debug!("MkvRemuxer: We found {} cues in the file", cues.as_ref().map(|c| c.cue_point.len()).unwrap_or(0));
+        debug!(
+            "MkvRemuxer: We found {} cues in the file",
+            cues.as_ref().map(|c| c.cue_point.len()).unwrap_or(0)
+        );
 
         let initial_cluster_pos = initial_cluster_pos
             .ok_or_else(|| Error::InvalidConfig("No clusters found".to_string()))?;
-        
 
         let original_duration_ns = info
             .as_ref()
@@ -131,7 +133,12 @@ impl<T: MkvReader> FileSource<T> {
 
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<FileSource<File>> {
         let file = File::open(path.as_ref())?;
-        let file_name = path.as_ref().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+        let file_name = path
+            .as_ref()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         Ok(FileSource::new(file)?.with_file_name(file_name))
     }
 
@@ -139,17 +146,17 @@ impl<T: MkvReader> FileSource<T> {
     /// Returns (start_pos, end_pos) or None if Cues don't help narrow the range
     fn find_cluster_range_from_cues(&self, target_timestamp_ns: u64) -> Option<(u64, Option<u64>)> {
         let cues = self.cues.as_ref()?;
-        
+
         // Convert target to timecode ticks
         let target_ticks = target_timestamp_ns / self.timecode_scale;
-        
+
         // Find the cue point closest to but before the target
         let mut best_before: Option<&CuePoint> = None;
         let mut best_after: Option<&CuePoint> = None;
-        
+
         for cue_point in &cues.cue_point {
             let cue_ticks = cue_point.cue_time.0;
-            
+
             if cue_ticks <= target_ticks {
                 if best_before.is_none() || cue_ticks > best_before.unwrap().cue_time.0 {
                     best_before = Some(cue_point);
@@ -160,18 +167,18 @@ impl<T: MkvReader> FileSource<T> {
                 }
             }
         }
-        
+
         // Get file positions from cue track positions
         let start_pos = best_before?
             .cue_track_positions
             .first()?
             .cue_cluster_position
             .0;
-        
+
         let end_pos = best_after
             .and_then(|cp| cp.cue_track_positions.first())
             .map(|ctp| ctp.cue_cluster_position.0);
-        
+
         Some((start_pos, end_pos))
     }
 
@@ -179,7 +186,10 @@ impl<T: MkvReader> FileSource<T> {
         let file_len = self.file.stream_length()?;
         let range = match self.find_cluster_range_from_cues(target_timestamp_ns) {
             Some((start, end)) => {
-                trace!("Using Cues to narrow start cluster search: start_pos={}, end_pos={:?}", start, end);
+                trace!(
+                    "Using Cues to narrow start cluster search: start_pos={}, end_pos={:?}",
+                    start, end
+                );
                 (start, end.unwrap_or(file_len))
             }
             None => {
@@ -195,12 +205,15 @@ impl<T: MkvReader> FileSource<T> {
         )?;
         Ok(())
     }
-    
+
     fn find_end_cluster(&mut self, target_timestamp_ns: u64) -> Result<()> {
         let file_len = self.file.stream_length()?;
         let range = match self.find_cluster_range_from_cues(target_timestamp_ns) {
             Some((start, end)) => {
-                trace!("Using Cues to narrow end cluster search: start_pos={}, end_pos={:?}", start, end);
+                trace!(
+                    "Using Cues to narrow end cluster search: start_pos={}, end_pos={:?}",
+                    start, end
+                );
                 (start, end.unwrap_or(file_len))
             }
             None => {
@@ -229,38 +242,27 @@ impl<T: MkvReader> FileSource<T> {
 
         // Shift cluster timestamp
         let shift_reference = match self.seek_type {
-            SeekType::SnapNearestKeyframe(video_track_num) => {
-                    self.initial_cluster_pos
-                        .get_closest_keyframe_timestamp_ns(video_track_num)?
-            }
-            SeekType::SnapPreviousKeyframe(video_track_num) => {
-                self.initial_cluster_pos
-                    .get_keyframe_timestamp_ns(video_track_num, false)?
-            }
-            SeekType::SnapNextKeyframe(video_track_num) => {
-                self.initial_cluster_pos
-                    .get_keyframe_timestamp_ns(video_track_num, true)?
-            }
-            _ => {
-                self.initial_cluster_pos.get_timestamp_ns()
-            }
+            SeekType::SnapNearestKeyframe(video_track_num) => self
+                .initial_cluster_pos
+                .get_closest_keyframe_timestamp_ns(video_track_num)?,
+            SeekType::SnapPreviousKeyframe(video_track_num) => self
+                .initial_cluster_pos
+                .get_keyframe_timestamp_ns(video_track_num, false)?,
+            SeekType::SnapNextKeyframe(video_track_num) => self
+                .initial_cluster_pos
+                .get_keyframe_timestamp_ns(video_track_num, true)?,
+            _ => self.initial_cluster_pos.get_timestamp_ns(),
         };
         let actual_end_pos = match &mut self.end_cluster_pos {
             Some(end_pos) => match self.seek_type {
                 SeekType::SnapNearestKeyframe(video_track_num) => {
-                    Some(end_pos
-                        .get_closest_keyframe_timestamp_ns(video_track_num)?
-                    )
+                    Some(end_pos.get_closest_keyframe_timestamp_ns(video_track_num)?)
                 }
                 SeekType::SnapPreviousKeyframe(video_track_num) => {
-                    Some(end_pos
-                        .get_keyframe_timestamp_ns(video_track_num, false)?
-                    )
+                    Some(end_pos.get_keyframe_timestamp_ns(video_track_num, false)?)
                 }
                 SeekType::SnapNextKeyframe(video_track_num) => {
-                    Some(end_pos
-                        .get_keyframe_timestamp_ns(video_track_num, true)?
-                    )
+                    Some(end_pos.get_keyframe_timestamp_ns(video_track_num, true)?)
                 }
                 _ => Some(end_pos.get_timestamp_ns()),
             },
@@ -273,18 +275,21 @@ impl<T: MkvReader> FileSource<T> {
         let mut filtered = Vec::with_capacity(orig_block_count);
 
         let result = match self.seek_type {
-            SeekType::SnapNearestKeyframe(_) | SeekType::SnapPreviousKeyframe(_) | SeekType::SnapNextKeyframe(_) => {
+            SeekType::SnapNearestKeyframe(_)
+            | SeekType::SnapPreviousKeyframe(_)
+            | SeekType::SnapNextKeyframe(_) => {
                 // Simple: just shift timestamps, but we still need to respect end_ns
                 let mut filtered = Vec::with_capacity(cluster.blocks.len());
                 for mut block in cluster.blocks {
-                    let abs_ns = block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
+                    let abs_ns =
+                        block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
                     if let Some(end) = actual_end_pos {
                         if abs_ns > end {
                             //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
                             continue;
                         }
-                    } 
-                    
+                    }
+
                     // only output after desired keyframe
                     if abs_ns < shift_reference {
                         continue;
@@ -294,11 +299,12 @@ impl<T: MkvReader> FileSource<T> {
                         cluster.timestamp.0,
                         self.output_timecode_scale,
                     )?;
-                    trace!("pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}", 
-                        block.timestamp_ns(cluster.timestamp.0 as i64, 
-                        self.output_timecode_scale,)?, 
-                        abs_ns, 
-                        self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns()), 
+                    trace!(
+                        "pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}",
+                        block
+                            .timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?,
+                        abs_ns,
+                        self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns()),
                         shift_reference
                     );
                     filtered.push(block);
@@ -309,9 +315,10 @@ impl<T: MkvReader> FileSource<T> {
             SeekType::DirtyCut => {
                 // Drop frames outside range
                 for mut block in cluster.blocks {
-                    let abs_ns = block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
+                    let abs_ns =
+                        block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
                     let start = self.initial_cluster_pos.get_timestamp_ns();
-                    if abs_ns  < start {
+                    if abs_ns < start {
                         continue;
                     }
                     if let Some(end) = &self.end_cluster_pos {
@@ -372,7 +379,9 @@ impl<T: MkvReader> FileSource<T> {
             match kind {
                 TrackKind::Video => {
                     let start = self.initial_cluster_pos.get_timestamp_ns();
-                    let last_keyframe_before_start_timestamp =  self.initial_cluster_pos.get_keyframe_timestamp_ns(track_num, false)?;
+                    let last_keyframe_before_start_timestamp = self
+                        .initial_cluster_pos
+                        .get_keyframe_timestamp_ns(track_num, false)?;
 
                     // drop before last keyframe before start (before pre-roll is video-only)
                     if abs_ns < last_keyframe_before_start_timestamp as i64 {
@@ -385,15 +394,18 @@ impl<T: MkvReader> FileSource<T> {
                             continue;
                         }
                     }
-                    
-                    // we are between last keyframe before start and start, aka pre-roll section, 
-                    if abs_ns < start as i64 {
 
-                        if block.is_keyframe()? && abs_ns > last_keyframe_before_start_timestamp as i64 {
+                    // we are between last keyframe before start and start, aka pre-roll section,
+                    if abs_ns < start as i64 {
+                        if block.is_keyframe()?
+                            && abs_ns > last_keyframe_before_start_timestamp as i64
+                        {
                             let m = 1000_000_000.0;
                             return Err(Error::InternalBug(format!(
                                 "Between last_keyframe_before_start_timestamp {} and start {} should be no more keyframes. found one at {}",
-                                last_keyframe_before_start_timestamp as f64 / m, start as f64 / m, abs_ns as f64 / m
+                                last_keyframe_before_start_timestamp as f64 / m,
+                                start as f64 / m,
+                                abs_ns as f64 / m
                             )));
                         }
                         // Pre-roll: squeeze to time 0 and mark invisible
@@ -403,7 +415,10 @@ impl<T: MkvReader> FileSource<T> {
                             self.output_timecode_scale,
                         )?;
                         block.set_invisible(true)?;
-                        trace!("Set block duration to 0 for pre-roll block at {} ns", abs_ns);
+                        trace!(
+                            "Set block duration to 0 for pre-roll block at {} ns",
+                            abs_ns
+                        );
                     } else {
                         // No end: just shift by squeeze window
                         let offset = (abs_ns - start).max(0) as u64;
@@ -422,7 +437,8 @@ impl<T: MkvReader> FileSource<T> {
                             continue;
                         }
                     }
-                    let start = self.initial_cluster_pos.get_timestamp_ns(); {
+                    let start = self.initial_cluster_pos.get_timestamp_ns();
+                    {
                         // Drop  before start (pre-roll is video-only)
                         if abs_ns < start as i64 {
                             continue;
@@ -467,7 +483,12 @@ impl<T: MkvReader> Source for FileSource<T> {
 
     fn get_basic_info(&self) -> Result<MkvBasicInfo> {
         let file_size = self.file.stream_length()?;
-        Ok(MkvBasicInfo::new(&self.tracks, &self.info, file_size, self.file_name.clone().unwrap_or("unknown".to_string())))
+        Ok(MkvBasicInfo::new(
+            &self.tracks,
+            &self.info,
+            file_size,
+            self.file_name.clone().unwrap_or("unknown".to_string()),
+        ))
     }
 
     fn get_output_interval(&mut self) -> Result<CutInterval> {
@@ -499,8 +520,14 @@ impl<T: MkvReader> Source for FileSource<T> {
 
                 // Check if we should stop based on end time
                 if let Some(end_pos) = &self.end_cluster_pos {
-                    if cluster.get_timestamp_ns(self.timecode_scale) as i64 > end_pos.get_timestamp_ns() {
-                        trace!("Cluster at {} ns exceeds cut end {} ns, stopping", cluster.get_timestamp_ns(self.timecode_scale), end_pos.get_timestamp_ns());
+                    if cluster.get_timestamp_ns(self.timecode_scale) as i64
+                        > end_pos.get_timestamp_ns()
+                    {
+                        trace!(
+                            "Cluster at {} ns exceeds cut end {} ns, stopping",
+                            cluster.get_timestamp_ns(self.timecode_scale),
+                            end_pos.get_timestamp_ns()
+                        );
                         self.finished = true;
                         return Ok(None);
                     }
@@ -541,19 +568,17 @@ impl<T: MkvReader> Source for FileSource<T> {
 
         self.file
             .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
-        let duration = self.info.duration.map(|d| (d.0 * self.timecode_scale as f64) as u64);
+        let duration = self
+            .info
+            .duration
+            .map(|d| (d.0 * self.timecode_scale as f64) as u64);
         Ok(CutInterval {
             start_ns: Some(0),
             end_ns: duration,
         })
     }
 
-    fn cut(
-        &mut self,
-        seek_type: SeekType,
-        cut_interval: CutInterval,
-    ) -> Result<CutInterval> {
-
+    fn cut(&mut self, seek_type: SeekType, cut_interval: CutInterval) -> Result<CutInterval> {
         if let Some(start) = cut_interval.start_ns {
             self.find_start_cluster(start)?;
         }
@@ -567,24 +592,26 @@ impl<T: MkvReader> Source for FileSource<T> {
 
         // resolve the original cut position by filling in the duration and setting the start
         let cut_resolved = CutInterval {
-                    start_ns: Some(self.initial_cluster_pos.get_timestamp_ns().max(0) as u64),
-                    end_ns: self.end_cluster_pos.as_ref().map(|end_pos| end_pos.get_timestamp_ns().max(0) as u64).or_else(|| self.original_duration_ns),
-                };
+            start_ns: Some(self.initial_cluster_pos.get_timestamp_ns().max(0) as u64),
+            end_ns: self
+                .end_cluster_pos
+                .as_ref()
+                .map(|end_pos| end_pos.get_timestamp_ns().max(0) as u64)
+                .or_else(|| self.original_duration_ns),
+        };
 
         let output_interval: CutInterval = match self.seek_type {
             SeekType::SnapNearestKeyframe(video_track_num) => {
-                let actual_start_ns = self.initial_cluster_pos.get_closest_keyframe_timestamp_ns(
-                    video_track_num,
-                )?;
+                let actual_start_ns = self
+                    .initial_cluster_pos
+                    .get_closest_keyframe_timestamp_ns(video_track_num)?;
                 // seek to cluster of the last keyframe to preserve all frames
-                let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(video_track_num, false)?;
+                let keyframe_cluster_pos = self
+                    .initial_cluster_pos
+                    .get_keyframe_cluster_position(video_track_num, false)?;
                 self.file.seek(SeekFrom::Start(keyframe_cluster_pos))?;
-                let actual_end_ns = if let Some(end_pos) = & mut self.end_cluster_pos {
-                    Some(
-                        end_pos.get_closest_keyframe_timestamp_ns(
-                            video_track_num,
-                        )? as u64
-                    )
+                let actual_end_ns = if let Some(end_pos) = &mut self.end_cluster_pos {
+                    Some(end_pos.get_closest_keyframe_timestamp_ns(video_track_num)? as u64)
                 } else {
                     self.original_duration_ns
                 };
@@ -594,20 +621,16 @@ impl<T: MkvReader> Source for FileSource<T> {
                 }
             }
             SeekType::SnapPreviousKeyframe(video_track_num) => {
-                let actual_start_ns = self.initial_cluster_pos.get_keyframe_timestamp_ns(
-                    video_track_num,
-                    false,
-                )?;
+                let actual_start_ns = self
+                    .initial_cluster_pos
+                    .get_keyframe_timestamp_ns(video_track_num, false)?;
                 // seek to cluster of the last keyframe to preserve all frames
-                let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(video_track_num, false)?;
+                let keyframe_cluster_pos = self
+                    .initial_cluster_pos
+                    .get_keyframe_cluster_position(video_track_num, false)?;
                 self.file.seek(SeekFrom::Start(keyframe_cluster_pos))?;
                 let actual_end_ns = if let Some(end_pos) = &mut self.end_cluster_pos {
-                    Some(
-                        end_pos.get_keyframe_timestamp_ns(
-                            video_track_num,
-                            false,
-                        )? as u64
-                    )
+                    Some(end_pos.get_keyframe_timestamp_ns(video_track_num, false)? as u64)
                 } else {
                     self.original_duration_ns
                 };
@@ -617,17 +640,11 @@ impl<T: MkvReader> Source for FileSource<T> {
                 }
             }
             SeekType::SnapNextKeyframe(video_track_num) => {
-                let actual_start_ns = self.initial_cluster_pos.get_keyframe_timestamp_ns(
-                    video_track_num,
-                    true,
-                )?;
-                let actual_end_ns = if let Some(end_pos) = & mut self.end_cluster_pos {
-                    Some(
-                        end_pos.get_keyframe_timestamp_ns(
-                            video_track_num,
-                            true,
-                        )? as u64
-                    )
+                let actual_start_ns = self
+                    .initial_cluster_pos
+                    .get_keyframe_timestamp_ns(video_track_num, true)?;
+                let actual_end_ns = if let Some(end_pos) = &mut self.end_cluster_pos {
+                    Some(end_pos.get_keyframe_timestamp_ns(video_track_num, true)? as u64)
                 } else {
                     self.original_duration_ns
                 };
@@ -638,22 +655,23 @@ impl<T: MkvReader> Source for FileSource<T> {
             }
             SeekType::Squeeze => {
                 let video_track_nums = self.tracks.get_all_video_tracks();
-                println!("Video track numbers: {:?}", video_track_nums);
+                trace!("Video track numbers: {:?}", video_track_nums);
                 let mut earliest_keyframe_cluster_pos = self.initial_cluster_pos.position;
                 for track_num in video_track_nums {
-                    let keyframe_cluster_pos = self.initial_cluster_pos.get_keyframe_cluster_position(track_num, false)?;
+                    let keyframe_cluster_pos = self
+                        .initial_cluster_pos
+                        .get_keyframe_cluster_position(track_num, false)?;
                     //println!("Track {}, keyframe cluster position: {} original position: {}", track_num, keyframe_cluster_pos, self.initial_cluster_pos.position);
                     if keyframe_cluster_pos < earliest_keyframe_cluster_pos {
                         earliest_keyframe_cluster_pos = keyframe_cluster_pos;
                     }
                 }
                 // seek to the earliest keyframe cluster to preserve all frames, bc we dont know which track are picked we use the earliest cluster among all video tracks
-                self.file.seek(SeekFrom::Start(earliest_keyframe_cluster_pos))?;
+                self.file
+                    .seek(SeekFrom::Start(earliest_keyframe_cluster_pos))?;
                 cut_resolved
             }
-            SeekType::DirtyCut => {
-                cut_resolved
-            }
+            SeekType::DirtyCut => cut_resolved,
         };
         self.output_interval = output_interval.clone();
 
@@ -664,5 +682,4 @@ impl<T: MkvReader> Source for FileSource<T> {
         // dont seek here bc we already seeked to the correct position in initialize() or cut()
         Ok(())
     }
-    
 }

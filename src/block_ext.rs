@@ -1,5 +1,6 @@
 use crate::Error;
 use bytes::{Bytes, BytesMut};
+use log::trace;
 use mkv_element::ClusterBlock;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
@@ -95,10 +96,10 @@ pub trait ClusterBlockExt {
     fn get_block_duration(&self) -> Option<u64>;
 
     /// Set the block duration in Track Ticks
-    /// 
+    ///
     /// # Arguments
     /// * `duration` - Duration in Track Ticks, or None to remove the duration field
-    /// 
+    ///
     /// # Returns
     /// * `Err` if this is a SimpleBlock (which doesn't support BlockDuration)
     /// * `Ok(())` if this is a BlockGroup (even if duration is None)
@@ -170,7 +171,10 @@ impl ClusterExt for Cluster {
                             if let Ok(block_ts_ns) =
                                 block.timestamp_ns(self.timestamp.0 as i64, timecode_scale)
                             {
-                                println!("Block {}: timestamp {} ns, reference {}", i, block_ts_ns, timestamp_ns);
+                                trace!(
+                                    "Block {}: timestamp {} ns, reference {}",
+                                    i, block_ts_ns, timestamp_ns
+                                );
                                 if block_ts_ns <= timestamp_ns {
                                     return Some((i, block_ts_ns));
                                 }
@@ -212,7 +216,12 @@ impl ClusterExt for Cluster {
         file.seek(SeekFrom::Start(file_pos))?;
         let header = match Header::read_from(file) {
             Ok(h) => h,
-            Err(e) => return Err(Error::InvalidFilePos(format!("Cluster header could not be read - wrong position? {}", e))),
+            Err(e) => {
+                return Err(Error::InvalidFilePos(format!(
+                    "Cluster header could not be read - wrong position? {}",
+                    e
+                )));
+            }
         };
 
         if header.id == Cluster::ID {
@@ -220,7 +229,12 @@ impl ClusterExt for Cluster {
             file.seek(SeekFrom::Start(old_pos))?;
             match cluster {
                 Ok(c) => return Ok(c),
-                Err(e) => return Err(Error::InvalidFilePos(format!("Cluster element could not be read - wrong position? {}", e)))
+                Err(e) => {
+                    return Err(Error::InvalidFilePos(format!(
+                        "Cluster element could not be read - wrong position? {}",
+                        e
+                    )));
+                }
             };
         } else {
             file.seek(SeekFrom::Start(old_pos))?;
@@ -430,11 +444,9 @@ impl ClusterBlockExt for ClusterBlock {
 
     fn set_block_duration(&mut self, duration: Option<u64>) -> Result<(), Error> {
         match self {
-            ClusterBlock::Simple(_) => {
-                Err(Error::InvalidBlockData(
-                    "Cannot set BlockDuration on SimpleBlock".to_string(),
-                ))
-            }
+            ClusterBlock::Simple(_) => Err(Error::InvalidBlockData(
+                "Cannot set BlockDuration on SimpleBlock".to_string(),
+            )),
             ClusterBlock::Group(bg) => {
                 bg.block_duration = duration.map(BlockDuration);
                 Ok(())

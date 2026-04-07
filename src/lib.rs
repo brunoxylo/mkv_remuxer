@@ -7,6 +7,7 @@ pub mod sink;
 pub mod source;
 mod source_mappings;
 pub mod test_utils;
+pub mod folder_streamer;
 
 // Re-exports
 pub use block_ext::ClusterBlockExt;

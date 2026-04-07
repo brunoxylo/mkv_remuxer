@@ -1,7 +1,7 @@
 class DidiPlayer {
-    constructor(videoElement) {
+    constructor(videoElement, endpointPath) {
         this.video = videoElement;
-        this.apiBase = window.location.origin; // or specific backend URL
+        this.apiBase = endpointPath;
         this.files = [];
         this.activeFileIndex = -1;
         this.activeVideoTrackId = -1;
@@ -9,7 +9,7 @@ class DidiPlayer {
         this.activeSubtitleTrackId = -1;
         this.activeSubtitleFileIndex = -1;
         this.videoDuration = 0;
-        
+
         // Subtitle cache — raw (unadjusted) VTT text fetched once per track selection.
         // Avoids re-fetching the full subtitle file on every seek.
         this._subtitleCache = null;       // { fileIndex, trackId, vttText }
@@ -21,7 +21,7 @@ class DidiPlayer {
 
     async loadlibs() {
         // fetch list of files
-        const res = await fetch(`${this.apiBase}/video/list`);
+        const res = await fetch(`${this.apiBase}`);
         if (!res.ok) throw new Error("Failed to load video list");
         this.files = await res.json();
         console.log("Loaded files:", this.files);
@@ -31,7 +31,7 @@ class DidiPlayer {
         const allVideo = [];
         this.files.forEach((file, idx) => {
             file.video_tracks.forEach(t => {
-                allVideo.push({...t, fileIndex: idx, fileName: file.file_name});
+                allVideo.push({ ...t, fileIndex: idx, fileName: file.file_name });
             });
         });
         return allVideo;
@@ -56,7 +56,7 @@ class DidiPlayer {
 
         this.activeFileIndex = fileIndex;
         this.activeVideoTrackId = trackId;
-        
+
         // Try to keep the same audio language across video track switches.
         // Fall back to the first available track only when no language match exists.
         const aTracks = this.getAudioTracks(fileIndex);
@@ -80,7 +80,7 @@ class DidiPlayer {
 
         if (this.isSafari) {
             // Direct stream for Safari
-            this.video.src = `${this.apiBase}/video/direct/${fileIndex}`;
+            this.video.src = `${this.apiBase}/direct/${fileIndex}`;
         } else {
             // Seek to the same position in the new track (seamless switch)
             this.seek(currentAbsTime);
@@ -90,37 +90,37 @@ class DidiPlayer {
     getAudioTracks(fileIndex) {
         // "we only use audio track from the file wehere we also stream the video from if the same (language, froced) is present in another file  to avoid reading from two files"
         // "we dont show these 'duplicate' audio track to the user"
-        
+
         if (!this.files[fileIndex]) return [];
-        
+
         const mainFile = this.files[fileIndex];
-        const mainAudioTracks = mainFile.audio_tracks.map(t => ({...t, fileIndex: fileIndex, origin: 'main'}));
-        
+        const mainAudioTracks = mainFile.audio_tracks.map(t => ({ ...t, fileIndex: fileIndex, origin: 'main' }));
+
         const allAudio = [...mainAudioTracks];
-        
+
         // Iterate other files
         this.files.forEach((file, idx) => {
             if (idx === fileIndex) return;
-            
+
             file.audio_tracks.forEach(track => {
                 // Check for duplicate in main file
-                const isDuplicate = mainFile.audio_tracks.some(mainTrack => 
-                    (mainTrack.language === track.language) && 
+                const isDuplicate = mainFile.audio_tracks.some(mainTrack =>
+                    (mainTrack.language === track.language) &&
                     // (mainTrack.forced === track.forced) // AudioTrack doesn't have forced in MkvBasicInfo struct shown earlier, checking struct...
                     // The MkvBasicInfo AudioTrack struct has: track_id, codec, channels, sample_rate, language. 
                     // It does NOT have forced flag in the struct I saw.
                     // Assuming language and codec/channels matching constitutes duplicate or just language?
                     // "same (language, froced)" - The prompt implies forced exists. Maybe it is missing in my MkvBasicInfo view or implied.
                     // I will check language.
-                   (mainTrack.language === track.language)
+                    (mainTrack.language === track.language)
                 );
-                
+
                 if (!isDuplicate) {
-                    allAudio.push({...track, fileIndex: idx, origin: 'external'});
+                    allAudio.push({ ...track, fileIndex: idx, origin: 'external' });
                 }
             });
         });
-        
+
         return allAudio;
     }
 
@@ -129,19 +129,19 @@ class DidiPlayer {
         // Group by language/forced/codec? Or identical track?
         // Let's group by (language, forced).
         // Find best candidate for each group.
-        
+
         const groups = {};
-        
+
         this.files.forEach((file, fIdx) => {
             file.subtitle_tracks.forEach(track => {
                 const key = `${track.language || 'und'}_${track.forced}`;
                 if (!groups[key]) {
                     groups[key] = [];
                 }
-                groups[key].push({...track, fileIndex: fIdx, fileSize: file.file_size});
+                groups[key].push({ ...track, fileIndex: fIdx, fileSize: file.file_size });
             });
         });
-        
+
         const result = [];
         for (const key in groups) {
             const candidates = groups[key];
@@ -178,54 +178,139 @@ class DidiPlayer {
 
         let currentAbsTime = this.video.currentTime + (this.currentSeekOffset || 0);
         let diff = Math.abs(seconds - currentAbsTime);
-        let seekMode = (diff > 60) ? 'snap' : 'squeeze'; 
+        let seekMode = (diff > 60) ? 'snap' : 'squeeze';
 
         // Construct mappings
         let mappings = `${this.activeFileIndex}_${this.activeVideoTrackId}`;
         if (this.activeAudioFileIndex === undefined) this.activeAudioFileIndex = this.activeFileIndex;
         mappings += `,${this.activeAudioFileIndex}_${this.activeAudioTrackId}`;
-        
-        const url = `${this.apiBase}/video/stream?mappings=${mappings}&seek=${seekMode}&start=${seconds}`;
-        
+
+        const url = `${this.apiBase}/remux?mappings=${mappings}&seek=${seekMode}&start=${seconds}`;
+
+        // Cancel any in-flight seek pump
+        if (this._seekAbort) this._seekAbort.abort();
+        const controller = new AbortController();
+        this._seekAbort = controller;
+
         try {
-            // Use fetch just to read the headers/errors without MSE overhead
-            const controller = new AbortController();
             const res = await fetch(url, { signal: controller.signal });
-            
+
             if (!res.ok) {
                 const errText = await res.text();
                 this.video.dispatchEvent(new CustomEvent('didiError', { detail: errText }));
                 return;
             }
 
+            // Read the actual media start from the response header (single fetch).
             const headerStart = parseFloat(res.headers.get('x-media-start-sec'));
             this.currentSeekOffset = !isNaN(headerStart) ? headerStart : seconds;
-            
-            // Abort the fetch so the browser doesn't download the body in JS space
-            controller.abort();
 
-            const onCanPlay = () => {
-                this.video.removeEventListener('canplay', onCanPlay);
-                if (wasPlaying) {
-                    this.video.play().catch(() => {});
+            const mimeType = res.headers.get('content-type') || 'video/webm';
+
+            // ── MediaSource path: pipe the single response body into a SourceBuffer ──
+            if ('MediaSource' in window && MediaSource.isTypeSupported(mimeType)) {
+                const ms = new MediaSource();
+                // Keep a ref so we can abort the pump if seek() is called again
+                this._activeMediaSource = ms;
+
+                const objectUrl = URL.createObjectURL(ms);
+
+                const onCanPlay = () => {
+                    this.video.removeEventListener('canplay', onCanPlay);
+                    if (wasPlaying) this.video.play().catch(() => { });
+                    this.reloadSubtitles();
+                };
+                this.video.addEventListener('canplay', onCanPlay);
+
+                // Swap src *before* sourceopen so the browser starts decoding immediately
+                this.video.querySelectorAll('track').forEach(t => t.remove());
+                if (this._subtitleBlobUrl) {
+                    URL.revokeObjectURL(this._subtitleBlobUrl);
+                    this._subtitleBlobUrl = null;
                 }
-                this.reloadSubtitles();
-            };
-            this.video.addEventListener('canplay', onCanPlay);
+                this.video.src = objectUrl;
 
-            this.video.src = url;
-            this.video.querySelectorAll('track').forEach(t => t.remove());
-            if (this._subtitleBlobUrl) {
-                URL.revokeObjectURL(this._subtitleBlobUrl);
-                this._subtitleBlobUrl = null;
+                ms.addEventListener('sourceopen', async () => {
+                    URL.revokeObjectURL(objectUrl); // no longer needed once open
+
+                    let sb;
+                    try {
+                        sb = ms.addSourceBuffer(mimeType);
+                    } catch (e) {
+                        console.error('addSourceBuffer failed:', e);
+                        ms.endOfStream('decode');
+                        return;
+                    }
+
+                    const reader = res.body.getReader();
+
+                    // Pump chunks respecting SourceBuffer's updateend event
+                    const pump = async () => {
+                        try {
+                            while (true) {
+                                // A newer seek() aborted this controller — exit silently
+                                if (controller.signal.aborted) {
+                                    reader.cancel().catch(() => { });
+                                    break;
+                                }
+
+                                const { done, value } = await reader.read();
+                                if (done) {
+                                    if (ms.readyState === 'open') {
+                                        try { ms.endOfStream(); } catch (e) { }
+                                    }
+                                    break;
+                                }
+                                // Wait until the SourceBuffer is ready for the next append
+                                if (sb.updating) {
+                                    await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                                }
+                                // After the await the MediaSource may have been torn down
+                                // by a concurrent seek() — guard before touching it
+                                if (controller.signal.aborted || ms.readyState !== 'open') {
+                                    reader.cancel().catch(() => { });
+                                    break;
+                                }
+                                sb.appendBuffer(value);
+                            }
+                        } catch (e) {
+                            if (e.name !== 'AbortError' && !controller.signal.aborted) {
+                                console.error('MSE pump error:', e);
+                                if (ms.readyState === 'open') {
+                                    try { ms.endOfStream('decode'); } catch (err) { }
+                                }
+                            }
+                        }
+                    };
+
+                    pump();
+                }, { once: true });
+
+            } else {
+                // ── Fallback: abort body and use video.src directly (double-seek) ──
+                controller.abort();
+
+                const onCanPlay = () => {
+                    this.video.removeEventListener('canplay', onCanPlay);
+                    if (wasPlaying) this.video.play().catch(() => { });
+                    this.reloadSubtitles();
+                };
+                this.video.addEventListener('canplay', onCanPlay);
+
+                this.video.src = url;
+                this.video.querySelectorAll('track').forEach(t => t.remove());
+                if (this._subtitleBlobUrl) {
+                    URL.revokeObjectURL(this._subtitleBlobUrl);
+                    this._subtitleBlobUrl = null;
+                }
             }
-        } catch(e) {
+        } catch (e) {
             if (e.name !== 'AbortError') {
                 this.video.dispatchEvent(new CustomEvent('didiError', { detail: e.message || 'Unknown error' }));
             }
         }
     }
-    
+
     async reloadSubtitles() {
         // Remove existing <track> elements and revoke the old blob URL
         this.video.querySelectorAll('track').forEach(t => t.remove());
@@ -240,7 +325,7 @@ class DidiPlayer {
             // Use cached raw VTT if the same track is still selected; otherwise fetch once.
             const cacheHit = this._subtitleCache
                 && this._subtitleCache.fileIndex === this.activeSubtitleFileIndex
-                && this._subtitleCache.trackId   === this.activeSubtitleTrackId;
+                && this._subtitleCache.trackId === this.activeSubtitleTrackId;
 
             let rawVtt;
             if (cacheHit) {
@@ -249,15 +334,15 @@ class DidiPlayer {
                 // Fetch the full subtitle track as VTT text.
                 // vtt_output=true tells the server to use VttSink.
                 const map = `${this.activeSubtitleFileIndex}_${this.activeSubtitleTrackId}`;
-                const url = `${this.apiBase}/video/stream?mappings=${map}&vtt_output=true`;
+                const url = `${this.apiBase}/remux?mappings=${map}&vtt_output=true`;
                 const res = await fetch(url);
                 if (!res.ok) throw new Error(`Subtitle fetch failed: ${res.status}`);
                 rawVtt = await res.text();
                 // Store in cache keyed by (fileIndex, trackId)
                 this._subtitleCache = {
                     fileIndex: this.activeSubtitleFileIndex,
-                    trackId:   this.activeSubtitleTrackId,
-                    vttText:   rawVtt,
+                    trackId: this.activeSubtitleTrackId,
+                    vttText: rawVtt,
                 };
             }
 

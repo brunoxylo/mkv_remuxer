@@ -165,13 +165,15 @@
 
     <div id="statusBar">Loading...</div>
 
-    <div id="errorToast" style="position: fixed; bottom: 20px; right: 20px; background: #f44336; color: white; padding: 15px; border-radius: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); display: none; z-index: 1000; max-width: 400px; font-weight: bold;"></div>
+    <div id="errorToast"
+        style="position: fixed; bottom: 20px; right: 20px; background: #f44336; color: white; padding: 15px; border-radius: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); display: none; z-index: 1000; max-width: 400px; font-weight: bold;">
+    </div>
 
     <script src="didiPlayer.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', async () => {
             const video = document.getElementById('videoPlayer');
-            const player = new DidiPlayer(video);
+            const player = new DidiPlayer(video, window.location.origin + '/my_video');
 
             // UI References
             const playPauseBtn = document.getElementById('playPauseBtn');

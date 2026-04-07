@@ -299,11 +299,9 @@ impl KeyframePositionCache {
     fn update_cache(&mut self, track_num: u64, mut after: bool) -> Result<()> {
         let reference_timestamp_ns = self.reference_timestamp_ns;
 
-        let start_time = std::time::Instant::now();
-
         let m = 1_000_000_000.0f64;
-        eprintln!(
-            "[DEBUG update_cache] track={}, after={}, reference_ts={:.3}s, cluster_pos={}",
+        trace!(
+            "MkvRemuxer: update_cache track={}, after={}, reference_ts={:.3}s, cluster_pos={}",
             track_num,
             after,
             reference_timestamp_ns as f64 / m,
@@ -313,8 +311,8 @@ impl KeyframePositionCache {
         // Try to find keyframe in current cluster first
         let initial_cluster = Cluster::from_file_pos(&mut self.file, self.position)?;
         let initial_cluster_ts_ns = initial_cluster.timestamp.0 as i64 * self.timecode_scale as i64;
-        eprintln!(
-            "[DEBUG update_cache] current cluster timestamp={:.3}s, block_count={}",
+        trace!(
+            "MkvRemuxer: update_cache current cluster timestamp={:.3}s, block_count={}",
             initial_cluster_ts_ns as f64 / m,
             initial_cluster.blocks.len()
         );
@@ -327,8 +325,8 @@ impl KeyframePositionCache {
                         if let Ok(ts) = block
                             .timestamp_ns(initial_cluster.timestamp.0 as i64, self.timecode_scale)
                         {
-                            eprintln!(
-                                "[DEBUG update_cache] cluster keyframe[{}]: track={}, ts={:.3}s",
+                            trace!(
+                                "MkvRemuxer: update_cache cluster keyframe[{}]: track={}, ts={:.3}s",
                                 i,
                                 tn,
                                 ts as f64 / m
@@ -384,8 +382,8 @@ impl KeyframePositionCache {
                     keyframe_timestamp_ns <= reference_timestamp_ns as i64
                 };
 
-                eprintln!(
-                    "[DEBUG update_cache] found keyframe in current cluster: idx={}, ts={:.3}s, meets_criteria={}",
+                trace!(
+                    "MkvRemuxer: update_cache keyframe candidate: idx={}, ts={:.3}s, meets_criteria={}",
                     keyframe_idx,
                     keyframe_timestamp_ns as f64 / m,
                     meets_criteria
@@ -396,16 +394,16 @@ impl KeyframePositionCache {
                         .insert((track_num, after), current_search_pos);
                     self.keyframe_timestamp_ns
                         .insert((track_num, after), keyframe_timestamp_ns);
-                    eprintln!(
-                        "[DEBUG update_cache] RETURNING with keyframe at {:.3}s from cluster_pos={}",
+                    trace!(
+                        "MkvRemuxer: update_cache found keyframe at {:.3}s from cluster_pos={}",
                         keyframe_timestamp_ns as f64 / m,
                         current_search_pos
                     );
                     return Ok(());
                 }
             } else {
-                eprintln!(
-                    "[DEBUG update_cache] no keyframe found in current cluster for track={}, after={}",
+                trace!(
+                    "MkvRemuxer: update_cache no keyframe found in cluster for track={}, after={}",
                     track_num, after
                 );
             }
