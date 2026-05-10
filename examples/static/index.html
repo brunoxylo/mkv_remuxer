@@ -163,17 +163,29 @@
         </div>
     </div>
 
-    <div id="statusBar">Loading...</div>
+    <div style="display:flex; align-items:center; gap:10px;">
+        <div id="statusBar" style="flex:1;">Loading...</div>
+        <button id="togglePlayerBtn" style="padding:4px 12px; font-size:12px; cursor:pointer;">Switch to Safari</button>
+    </div>
 
     <div id="errorToast"
         style="position: fixed; bottom: 20px; right: 20px; background: #f44336; color: white; padding: 15px; border-radius: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.3); display: none; z-index: 1000; max-width: 400px; font-weight: bold;">
     </div>
 
     <script src="didiPlayer.js"></script>
+    <script src="didiLegacy.js"></script>
+    <script src="didiMse.js"></script>
     <script>
         document.addEventListener('DOMContentLoaded', async () => {
             const video = document.getElementById('videoPlayer');
-            const player = new DidiPlayer(video, window.location.origin + '/my_video');
+            let player = DidiPlayer.load(video, window.location.origin + '/my_video');
+
+            const toggleBtn = document.getElementById('togglePlayerBtn');
+            const updateToggleLabel = () => {
+                toggleBtn.textContent = (player instanceof DidiLegacy)
+                    ? 'Switch to MSE' : 'Switch to Legacy';
+            };
+            updateToggleLabel();
 
             // UI References
             const playPauseBtn = document.getElementById('playPauseBtn');
@@ -289,9 +301,7 @@
 
                 const duration = player.getDuration();
                 const currentRel = video.currentTime;
-                const absTime = player.isSafari
-                    ? currentRel
-                    : (currentRel + (player.currentSeekOffset || 0));
+                const absTime = player.getAbsoluteTime();
 
                 if (duration > 0) {
                     setTimelineVisual(absTime / duration);
@@ -307,6 +317,25 @@
             } catch (e) {
                 status.textContent = "Error: " + e.message;
             }
+
+            // ── Player toggle (debug) ──────────────────────────────────────
+            toggleBtn.addEventListener('click', async () => {
+                const wasPlaying = !video.paused;
+                const absTime = player.getAbsoluteTime();
+                if (player.destroy) player.destroy();
+
+                const newClass = (player instanceof DidiLegacy) ? DidiMse : DidiLegacy;
+                player = DidiPlayer.load(video, window.location.origin + '/my_video', newClass);
+                updateToggleLabel();
+
+                try {
+                    await player.loadlibs();
+                    initTrackUI();
+                    status.textContent = `Switched to ${newClass.name}`;
+                } catch (e) {
+                    status.textContent = "Error: " + e.message;
+                }
+            });
 
             function initTrackUI() {
                 videoSelect.innerHTML = '';
@@ -382,8 +411,7 @@
 
             subSelect.addEventListener('change', (e) => {
                 if (e.target.value === "-1") {
-                    player.activeSubtitleTrackId = -1;
-                    player.reloadSubtitles();
+                    player.selectSubtitle(-1, -1);
                     return;
                 }
                 const val = JSON.parse(e.target.value);
