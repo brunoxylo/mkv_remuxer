@@ -1,8 +1,36 @@
 /**
+ * DidiErrorType — Error category enum for structured error reporting.
+ */
+const DidiErrorType = Object.freeze({
+    NETWORK:   'network',
+    DECODE:    'decode',
+    SUBTITLE:  'subtitle',
+    PLAYBACK:  'playback',
+});
+
+/**
+ * DidiError — Lightweight error data structure emitted on the error channel.
+ */
+class DidiError {
+    constructor(type, message) {
+        this.type = type;
+        this.message = message;
+        this.timestamp = Date.now();
+    }
+
+    toString() {
+        return `[${this.type}] ${this.message}`;
+    }
+}
+
+/**
  * DidiPlayer — Base class with shared state & track management.
  * Platform-specific playback lives in DidiMse / DidiLegacy.
  */
 class DidiPlayer {
+    /** Subtitle codecs that can be rendered by the player (WebVTT only). */
+    static SUPPORTED_SUBTITLE_CODECS = ['webvtt', 's_text/webvtt'];
+
     constructor(videoElement, endpointPath) {
         this.video = videoElement;
         this.apiBase = endpointPath;
@@ -16,16 +44,37 @@ class DidiPlayer {
         this.videoDuration = 0;
         this.currentSeekOffset = 0;
 
-        // Subtitle cache — raw (unadjusted) VTT text fetched once per track selection.
+        // Subtitle cache — raw VTT text fetched once per track selection.
         this._subtitleCache = null;       // { fileIndex, trackId, vttText }
         this._subtitleBlobUrl = null;     // current blob URL (revoked on next reload)
+
+        /** @type {EventTarget} — subscribe with player.errors.addEventListener('error', …) */
+        this._errorChannel = new EventTarget();
+    }
+
+    /** Returns the error channel EventTarget. Listen for 'error' events whose detail is a DidiError. */
+    get errors() {
+        return this._errorChannel;
+    }
+
+    /**
+     * Emit a structured error to the error channel.
+     * @param {string} type  - One of DidiErrorType values.
+     * @param {string} message - Human-readable description.
+     */
+    _emitError(type, message) {
+        const error = new DidiError(type, message);
+        this._errorChannel.dispatchEvent(new CustomEvent('error', { detail: error }));
     }
 
     async loadlibs() {
         const res = await fetch(`${this.apiBase}`);
-        if (!res.ok) throw new Error("Failed to load video list");
+        if (!res.ok) {
+            this._emitError(DidiErrorType.NETWORK, 'Failed to load video list');
+            throw new Error('Failed to load video list');
+        }
         this.files = await res.json();
-        console.log("Loaded files:", this.files);
+        console.log('Loaded files:', this.files);
     }
 
     getAllVideoTracks() {
@@ -99,9 +148,13 @@ class DidiPlayer {
     }
 
     getSubtitleTracks() {
+        const supported = DidiPlayer.SUPPORTED_SUBTITLE_CODECS;
         const groups = {};
         this.files.forEach((file, fIdx) => {
             file.subtitle_tracks.forEach(track => {
+                const codec = (track.codec || '').toLowerCase();
+                if (!supported.some(c => codec.includes(c))) return;
+
                 const key = `${track.language || 'und'}_${track.forced}`;
                 if (!groups[key]) groups[key] = [];
                 groups[key].push({ ...track, fileIndex: fIdx, fileSize: file.file_size });
@@ -163,10 +216,7 @@ class DidiPlayer {
                 };
             }
 
-            const offset = this._getSubtitleOffset();
-            const adjustedVtt = this.adjustVttTimestamps(rawVtt, -offset);
-
-            const blob = new Blob([adjustedVtt], { type: 'text/vtt' });
+            const blob = new Blob([rawVtt], { type: 'text/vtt' });
             this._subtitleBlobUrl = URL.createObjectURL(blob);
 
             let lang = 'und';
@@ -192,76 +242,11 @@ class DidiPlayer {
             track.src = '';
             track.src = currentSrc;
         } catch (e) {
-            console.error("Subtitle load failed", e);
+            this._emitError(DidiErrorType.SUBTITLE, e.message || 'Subtitle load failed');
         }
     }
 
-    /** Override in subclass — provides the time offset for subtitle adjustment */
-    _getSubtitleOffset() {
-        throw new Error('_getSubtitleOffset() must be implemented by subclass');
-    }
 
-    adjustVttTimestamps(vttText, offsetSeconds) {
-        const parseTimestamp = (ts) => {
-            const m = ts.match(/^(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})$/);
-            if (!m) return null;
-            const h = m[1] ? parseInt(m[1]) : 0;
-            return h * 3600 + parseInt(m[2]) * 60 + parseInt(m[3]) + parseInt(m[4]) / 1000;
-        };
-
-        const formatTimestamp = (total) => {
-            const pad = (n, w = 2) => n.toString().padStart(w, '0');
-            const nh = Math.floor(total / 3600);
-            const rem = total % 3600;
-            const nm = Math.floor(rem / 60);
-            const ns = Math.floor(rem % 60);
-            const nms = Math.round((rem - nm * 60 - ns) * 1000);
-            return `${pad(nh)}:${pad(nm)}:${pad(ns)}.${pad(nms, 3)}`;
-        };
-
-        const lines = vttText.split('\n');
-        const result = [];
-        let foundFirstValidCue = false;
-        let i = 0;
-
-        while (i < lines.length) {
-            const line = lines[i];
-            const timingMatch = line.match(/^(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})/);
-            if (timingMatch) {
-                const startTs = (timingMatch[1] ? timingMatch[1] + ':' : '') + timingMatch[2] + ':' + timingMatch[3] + '.' + timingMatch[4];
-                const endTs = (timingMatch[5] ? timingMatch[5] + ':' : '') + timingMatch[6] + ':' + timingMatch[7] + '.' + timingMatch[8];
-                const startTime = parseTimestamp(startTs);
-                const endTime = parseTimestamp(endTs);
-                if (startTime !== null) {
-                    const adjustedStart = startTime + offsetSeconds;
-                    if (adjustedStart >= 0) {
-                        foundFirstValidCue = true;
-                        const adjustedEnd = endTime + offsetSeconds;
-                        result.push(`${formatTimestamp(adjustedStart)} --> ${formatTimestamp(adjustedEnd)}`);
-                        i++;
-                        while (i < lines.length && lines[i].trim() !== '' && !lines[i].match(/^(?:\d{2}:)?\d{2}:\d{2}\.\d{3}/)) {
-                            result.push(lines[i]);
-                            i++;
-                        }
-                        if (i < lines.length && lines[i].trim() === '') {
-                            result.push(lines[i]);
-                            i++;
-                        }
-                    } else {
-                        i++;
-                        while (i < lines.length && lines[i].trim() !== '' && !lines[i].match(/^(?:\d{2}:)?\d{2}:\d{2}\.\d{3}/)) i++;
-                        if (i < lines.length && lines[i].trim() === '') i++;
-                    }
-                } else {
-                    i++;
-                }
-            } else {
-                if (!foundFirstValidCue) result.push(line);
-                i++;
-            }
-        }
-        return result.join('\n');
-    }
 
     getDuration() {
         if (this.activeFileIndex === -1) return 0;
@@ -270,7 +255,7 @@ class DidiPlayer {
 
     /** Get the absolute playback time in seconds (accounts for seek offsets in MSE mode). */
     getAbsoluteTime() {
-        return this.video.currentTime + (this._getSubtitleOffset());
+        return this.video.currentTime + (this.currentSeekOffset || 0);
     }
 
     /**
@@ -301,3 +286,5 @@ class DidiPlayer {
 }
 
 window.DidiPlayer = DidiPlayer;
+window.DidiErrorType = DidiErrorType;
+window.DidiError = DidiError;

@@ -15,10 +15,12 @@ class DidiLegacy extends DidiPlayer {
         this._syncListenersAttached = false;
 
         // Catch media errors (e.g., WebM codec issues on non-Safari browsers)
-        this.video.addEventListener('error', (e) => {
+        this.video.addEventListener('error', () => {
             const err = this.video.error;
-            console.error('[DidiLegacy] Video error (expected on non-Safari):',
-                err ? `code=${err.code} message="${err.message}"` : e);
+            if (err) {
+                this._emitError(DidiErrorType.DECODE,
+                    `Video decode error: code=${err.code} ${err.message || ''}`);
+            }
         });
     }
 
@@ -40,7 +42,7 @@ class DidiLegacy extends DidiPlayer {
 
             this.reloadSubtitles();
         } catch (e) {
-            console.error('[DidiLegacy] _onVideoTrackSet error (expected on non-Safari):', e);
+            this._emitError(DidiErrorType.PLAYBACK, 'Video track setup failed: ' + e.message);
         }
     }
 
@@ -53,7 +55,7 @@ class DidiLegacy extends DidiPlayer {
                 this._externalAudio.currentTime = seconds;
             }
         } catch (e) {
-            console.error('[DidiLegacy] seek error (expected on non-Safari):', e);
+            this._emitError(DidiErrorType.PLAYBACK, 'Seek failed: ' + e.message);
         }
     }
 
@@ -99,8 +101,8 @@ class DidiLegacy extends DidiPlayer {
             if (!this._externalAudio) {
                 this._externalAudio = document.createElement('audio');
                 this._externalAudio.style.display = 'none';
-                this._externalAudio.addEventListener('error', (e) => {
-                    console.error('[DidiLegacy] External audio error (expected on non-Safari):', e);
+                this._externalAudio.addEventListener('error', () => {
+                    this._emitError(DidiErrorType.DECODE, 'External audio decode error');
                 });
                 document.body.appendChild(this._externalAudio);
             }
@@ -109,7 +111,7 @@ class DidiLegacy extends DidiPlayer {
             this._externalAudio.currentTime = this.video.currentTime;
             this._attachSyncListeners();
         } catch (e) {
-            console.error('[DidiLegacy] _createExternalAudio error (expected on non-Safari):', e);
+            this._emitError(DidiErrorType.PLAYBACK, 'External audio setup failed: ' + e.message);
         }
     }
 
@@ -177,13 +179,7 @@ class DidiLegacy extends DidiPlayer {
         }
     }
 
-    // ── Subtitle selection ─────────────────────────────────────────────
-    // Uses the base class reloadSubtitles (server-side VTT conversion).
-    // No subtitle offset needed since Safari plays from real file timestamps.
 
-    _getSubtitleOffset() {
-        return 0;
-    }
 
     // ── Cleanup ────────────────────────────────────────────────────────
 

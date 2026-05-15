@@ -202,13 +202,17 @@
             const errorToast = document.getElementById('errorToast');
 
             // ── DidiPlayer Errors ───────────────────────────────────────────
-            video.addEventListener('didiError', (e) => {
-                errorToast.textContent = `Error: ${e.detail}`;
-                errorToast.style.display = 'block';
-                setTimeout(() => {
-                    errorToast.style.display = 'none';
-                }, 5000);
-            });
+            const connectErrorChannel = (p) => {
+                p.errors.addEventListener('error', (e) => {
+                    const err = e.detail;
+                    errorToast.textContent = `[${err.type}] ${err.message}`;
+                    errorToast.style.display = 'block';
+                    setTimeout(() => {
+                        errorToast.style.display = 'none';
+                    }, 5000);
+                });
+            };
+            connectErrorChannel(player);
 
             // ── Timeline state ──────────────────────────────────────────────
             let userIsDragging = false;
@@ -326,6 +330,7 @@
 
                 const newClass = (player instanceof DidiLegacy) ? DidiMse : DidiLegacy;
                 player = DidiPlayer.load(video, window.location.origin + '/my_video', newClass);
+                connectErrorChannel(player);
                 updateToggleLabel();
 
                 try {

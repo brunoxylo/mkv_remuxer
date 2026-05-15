@@ -57,7 +57,7 @@ class DidiMse extends DidiPlayer {
             const res = await fetch(url, { signal: controller.signal });
             if (!res.ok) {
                 const errText = await res.text();
-                this.video.dispatchEvent(new CustomEvent('didiError', { detail: errText }));
+                this._emitError(DidiErrorType.NETWORK, errText);
                 return;
             }
 
@@ -107,7 +107,7 @@ class DidiMse extends DidiPlayer {
                     try {
                         sb = ms.addSourceBuffer(mimeType);
                     } catch (e) {
-                        console.error('addSourceBuffer failed:', e);
+                        this._emitError(DidiErrorType.DECODE, 'addSourceBuffer failed: ' + e.message);
                         ms.endOfStream('decode');
                         return;
                     }
@@ -200,6 +200,7 @@ class DidiMse extends DidiPlayer {
                         if (result === 'done' && ms.readyState === 'open') {
                             try { ms.endOfStream(); } catch (e) {}
                         } else if (result === 'error' && ms.readyState === 'open') {
+                            this._emitError(DidiErrorType.NETWORK, 'Stream failed after all reconnection attempts');
                             try { ms.endOfStream('network'); } catch (e) {}
                         }
                     };
@@ -226,7 +227,7 @@ class DidiMse extends DidiPlayer {
             }
         } catch (e) {
             if (e.name !== 'AbortError') {
-                this.video.dispatchEvent(new CustomEvent('didiError', { detail: e.message || 'Unknown error' }));
+                this._emitError(DidiErrorType.NETWORK, e.message || 'Unknown playback error');
             }
         }
     }
@@ -254,10 +255,6 @@ class DidiMse extends DidiPlayer {
             this.setInlineSubtitleTrack(-1);
             this.reloadSubtitles();
         }
-    }
-
-    _getSubtitleOffset() {
-        return this.currentSeekOffset || 0;
     }
 
     async _runEbmlSubtitleScanner(reader, abortSignal, outputTrackNum) {
