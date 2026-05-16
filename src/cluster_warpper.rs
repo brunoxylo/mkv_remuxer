@@ -5,7 +5,7 @@ use mkv_element::prelude::*;
 
 // we limit the cluster size by these bounds
 // within these bounds we break at every keyframe
-pub const MAX_BLOCKS_PER_CLUSTER: usize = 4000;
+pub const MAX_BLOCKS_PER_CLUSTER: usize = 5000;
 pub const MIN_BLOCKS_PER_CLUSTER: usize = 50;
 
 /// this wrapper allows for conveniently iterating over the blocks of a cluster
