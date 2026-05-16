@@ -113,6 +113,36 @@ impl fmt::Display for Error {
     }
 }
 
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Error::Io(err) => Error::InternalBug(format!("IO error: {}", err)),
+            Error::MkvElement(err) => Error::InternalBug(format!("MKV element error: {}", err)),
+            Error::InvalidFilePos(msg) => Error::InvalidFilePos(msg.clone()),
+            Error::TrackNotFound(num) => Error::TrackNotFound(*num),
+            Error::NoTracksOfType(s) => Error::NoTracksOfType(s.clone()),
+            Error::MissingElement(s) => Error::MissingElement(s.clone()),
+            Error::InternalBug(s) => Error::InternalBug(s.clone()),
+            Error::InvalidTimestamp(s) => Error::InvalidTimestamp(s.clone()),
+            Error::SeekFailed { target_ns, reason } => Error::SeekFailed { target_ns: *target_ns, reason: reason.clone() },
+            Error::NotFound(s) => Error::NotFound(s.clone()),
+            Error::InvalidConfig(s) => Error::InvalidConfig(s.clone()),
+            Error::TrackMappingError(s) => Error::TrackMappingError(s.clone()),
+            Error::UnsupportedCodec { codec_id, reason } => Error::UnsupportedCodec { codec_id: codec_id.clone(), reason: reason.clone() },
+            Error::TimecodeScaleError(s) => Error::TimecodeScaleError(s.clone()),
+            Error::InvalidBlockData(s) => Error::InvalidBlockData(s.clone()),
+            Error::UnexpectedEof => Error::UnexpectedEof,
+            Error::Done => Error::Done,
+            Error::UnknownElementSize(s) => Error::UnknownElementSize(s.clone()),
+            Error::UnsupportedOperation(s) => Error::UnsupportedOperation(s.clone()),
+            Error::RemuxError(s) => Error::RemuxError(s.clone()),
+            Error::ClusterIsFull(s) => Error::ClusterIsFull(s.clone()),
+            Error::FileCorrupted(s) => Error::FileCorrupted(s.clone()),
+            Error::ChannelClosed(s) => Error::ChannelClosed(s.clone()),
+        }
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

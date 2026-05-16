@@ -74,6 +74,11 @@ class DidiPlayer {
             throw new Error('Failed to load video list');
         }
         this.files = await res.json();
+        // Exclude thumbnail-only files from track selection
+        this.files = this.files.filter(f => {
+            const name = (f.file_name || '').toLowerCase();
+            return name !== 'thumbnails.mkv' && name !== 'thumbnails.webm';
+        });
         console.log('Loaded files:', this.files);
     }
 
