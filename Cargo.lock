@@ -930,8 +930,7 @@ dependencies = [
 [[package]]
 name = "mkv-element"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84a52dea4690ac0a778e7d0e86d1aa65f0c2d19453edd3f5b3e464bf385d5fe3"
+source = "git+ssh://git@github.com/b01o/mkv-element.git#60f6703a931f46ae9cf93c3666fad9aa0a34c15f"
 dependencies = [
  "askama",
  "bytes",
@@ -940,7 +939,6 @@ dependencies = [
  "paste",
  "roxmltree",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
