@@ -5,8 +5,8 @@ use mkv_element::prelude::*;
 
 // we limit the clustersize by these bounds
 // within these bounds we brad at every keyframe
-pub const MAX_BLOCKS_PER_CLUSTER: usize = 600;
-pub const MIN_BLOCKS_PER_CLUSTER: usize = 100;
+pub const MAX_BLOCKS_PER_CLUSTER: usize = 5000;
+pub const MIN_BLOCKS_PER_CLUSTER: usize = 50;
 
 /// this wrapper allows for conveniently iterating over the blocks of a cluster
 pub struct ClusterReadWrapper {
@@ -92,7 +92,13 @@ impl ClusterWriteWrapper {
 
     /// Add a block to the cluster with its absolute timestamp in nanoseconds
     /// The relative timestamp will be calculated automatically
-    pub fn add_block(&mut self, block: &ClusterBlock, absolute_timestamp_ns: u64, track_number: Option<u64>, track_kind :Option<TrackKind>) -> Result<()> {
+    pub fn add_block(
+        &mut self,
+        block: &ClusterBlock,
+        absolute_timestamp_ns: u64,
+        track_number: Option<u64>,
+        track_kind: Option<TrackKind>,
+    ) -> Result<()> {
         // Estimate block size (header + data)
         let block_size = match &block {
             ClusterBlock::Simple(sb) => sb.0.len(),
@@ -109,10 +115,12 @@ impl ClusterWriteWrapper {
         };
         let current_blocks = self.cluster.blocks.len();
 
-        // New logic: 
+        // New logic:
         // - break at every keyframe if we have at least 120 blocks
         // - strictly limit to 600 blocks
-        if current_blocks >= MAX_BLOCKS_PER_CLUSTER || (current_blocks >= MIN_BLOCKS_PER_CLUSTER && is_video_keyframe) {
+        if current_blocks >= MAX_BLOCKS_PER_CLUSTER
+            || (current_blocks >= MIN_BLOCKS_PER_CLUSTER && is_video_keyframe)
+        {
             return Err(Error::ClusterIsFull(format!(
                 "Triggered cluster split. Blocks: {}, Keyframe: {}",
                 current_blocks, is_video_keyframe
