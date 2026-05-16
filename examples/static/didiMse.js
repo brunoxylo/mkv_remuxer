@@ -124,87 +124,100 @@ class DidiMse extends DidiPlayer {
                         mseReader = res.body.getReader();
                     }
 
-                    // Pump data from a reader into the SourceBuffer.
-                    // On network errors, automatically reconnect from the last buffered position.
-                    const MAX_RECONNECTS = 3;
-                    let reconnectsLeft = MAX_RECONNECTS;
-
-                    const pumpReader = async (reader) => {
+                    // ── Simple MSE pump ──
+                    // No manual sb.remove() — Firefox's internal eviction handles cleanup.
+                    // Manual remove() causes mBufferFull to get stuck (RangeRemoval doesn't clear it).
+                    const pumpStream = async (reader) => {
                         try {
                             while (true) {
-                                if (controller.signal.aborted) { reader.cancel().catch(() => {}); return 'aborted'; }
+                                if (controller.signal.aborted || ms.readyState !== 'open') return 'aborted';
+
                                 const { done, value } = await reader.read();
                                 if (done) return 'done';
+
+                                // Wait for any pending operation
                                 if (sb.updating) {
                                     await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
                                 }
-                                if (controller.signal.aborted || ms.readyState !== 'open') { reader.cancel().catch(() => {}); return 'aborted'; }
-                                sb.appendBuffer(value);
+                                if (controller.signal.aborted || ms.readyState !== 'open') return 'aborted';
+
+                                // Split large chunks (localhost can deliver 256MB+ at once)
+                                const MAX_APPEND = 1024 * 1024; // 1MB per append
+                                for (let offset = 0; offset < value.byteLength; offset += MAX_APPEND) {
+                                    if (controller.signal.aborted || ms.readyState !== 'open') return 'aborted';
+
+                                    const slice = value.subarray(offset, Math.min(offset + MAX_APPEND, value.byteLength));
+
+                                    if (sb.updating) {
+                                        await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                                    }
+
+                                    sb.appendBuffer(slice);
+                                    await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+
+                                    // Throttle: if buffer is >30s ahead of playhead, wait
+                                    if (sb.buffered.length > 0) {
+                                        let ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                                        while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
+                                            await new Promise(r => setTimeout(r, 1000));
+                                            if (sb.buffered.length === 0) break;
+                                            ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                                        }
+                                    }
+                                }
                             }
                         } catch (e) {
                             if (e.name === 'AbortError' || controller.signal.aborted) return 'aborted';
-                            console.error('MSE pump error:', e);
+                            console.error('[DidiMse] Pump error:', e);
                             return 'error';
                         }
                     };
 
-                    const pump = async () => {
-                        let result = await pumpReader(mseReader);
+                    // Run with reconnection on network errors
+                    (async () => {
+                        let result = await pumpStream(mseReader);
+                        let backoff = 1000;
 
-                        // Reconnection loop: on error, resume from last buffered position
-                        while (result === 'error' && reconnectsLeft > 0 && ms.readyState === 'open' && !controller.signal.aborted) {
-                            reconnectsLeft--;
-
-                            // Determine the last successfully buffered absolute time
-                            let resumeAbsTime = seconds;
+                        while (result === 'error' && ms.readyState === 'open' && !controller.signal.aborted) {
+                            let resumeAt = seconds;
                             if (sb.buffered.length > 0) {
-                                const lastBufferedEnd = sb.buffered.end(sb.buffered.length - 1);
-                                resumeAbsTime = lastBufferedEnd + this.currentSeekOffset;
+                                resumeAt = sb.buffered.end(sb.buffered.length - 1) + this.currentSeekOffset;
                             }
-
-                            console.log(`[DidiMse] Stream broke. Reconnecting from ${resumeAbsTime.toFixed(1)}s (${reconnectsLeft} retries left)...`);
-
-                            // Brief delay before reconnecting
-                            await new Promise(r => setTimeout(r, 1000));
-                            if (controller.signal.aborted) break;
+                            console.log(`[DidiMse] Reconnecting from ${resumeAt.toFixed(1)}s in ${(backoff/1000).toFixed(0)}s...`);
+                            await new Promise(r => setTimeout(r, backoff));
+                            backoff = Math.min(backoff * 2, 10000);
+                            if (controller.signal.aborted || ms.readyState !== 'open') break;
 
                             try {
-                                const reconnUrl = `${this.apiBase}/remux?mappings=${mappings}&seek=snap&start=${resumeAbsTime}`;
-                                const reconnRes = await fetch(reconnUrl, { signal: controller.signal });
-                                if (!reconnRes.ok) {
-                                    console.error('[DidiMse] Reconnect request failed:', reconnRes.status);
-                                    break;
-                                }
+                                const res2 = await fetch(
+                                    `${this.apiBase}/remux?mappings=${mappings}&seek=snap&start=${resumeAt}`,
+                                    { signal: controller.signal }
+                                );
+                                if (controller.signal.aborted || ms.readyState !== 'open') break;
+                                if (!res2.ok) { continue; }
 
-                                // Set timestampOffset so the new stream's timestamps (relative to its own start)
-                                // align correctly with the existing buffer timeline.
-                                const newStart = parseFloat(reconnRes.headers.get('x-media-start-sec'));
-                                if (!isNaN(newStart)) {
-                                    const offset = newStart - this.currentSeekOffset;
-                                    if (sb.updating) {
-                                        await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-                                    }
-                                    sb.timestampOffset = offset;
+                                const s = parseFloat(res2.headers.get('x-media-start-sec'));
+                                if (!isNaN(s)) {
+                                    if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                                    if (controller.signal.aborted || ms.readyState !== 'open') break;
+                                    sb.timestampOffset = s - this.currentSeekOffset;
                                 }
-
-                                const newReader = reconnRes.body.getReader();
-                                result = await pumpReader(newReader);
-                            } catch (reconnErr) {
-                                if (reconnErr.name === 'AbortError' || controller.signal.aborted) break;
-                                console.error('[DidiMse] Reconnection failed:', reconnErr);
+                                backoff = 1000;
+                                result = await pumpStream(res2.body.getReader());
+                            } catch (err) {
+                                if (err.name === 'AbortError' || err.name === 'InvalidStateError' || controller.signal.aborted || ms.readyState !== 'open') break;
+                                console.error('[DidiMse] Reconnect failed:', err);
                                 result = 'error';
                             }
                         }
 
-                        // Finalize
                         if (result === 'done' && ms.readyState === 'open') {
                             try { ms.endOfStream(); } catch (e) {}
                         } else if (result === 'error' && ms.readyState === 'open') {
-                            this._emitError(DidiErrorType.NETWORK, 'Stream failed after all reconnection attempts');
+                            this._emitError(DidiErrorType.NETWORK, 'Stream failed');
                             try { ms.endOfStream('network'); } catch (e) {}
                         }
-                    };
-                    pump();
+                    })();
                 }, { once: true });
 
             } else {
