@@ -33,7 +33,7 @@ class DidiMse extends DidiPlayer {
 
         let currentAbsTime = this.video.currentTime + (this.currentSeekOffset || 0);
         let diff = Math.abs(seconds - currentAbsTime);
-        let seekMode = (diff > 60) ? 'snap' : 'squeeze';
+        let seekMode = (diff > 60) ? 'snap' : 'snap_prev';
 
         let mappings = `${this.activeFileIndex}_${this.activeVideoTrackId}`;
         if (this.activeAudioFileIndex === undefined) this.activeAudioFileIndex = this.activeFileIndex;
@@ -81,8 +81,17 @@ class DidiMse extends DidiPlayer {
                 this._activeMediaSource = ms;
                 const objectUrl = URL.createObjectURL(ms);
 
+                // With snap_prev the stream starts at the previous keyframe,
+                // so we need to seek the video forward to the actual requested time.
+                const seekOffsetInStream = (seekMode === 'snap_prev' && !isNaN(headerStart))
+                    ? Math.max(0, seconds - headerStart)
+                    : 0;
+
                 const onCanPlay = () => {
                     this.video.removeEventListener('canplay', onCanPlay);
+                    if (seekOffsetInStream > 0.1) {
+                        this.video.currentTime = seekOffsetInStream;
+                    }
                     if (wasPlaying) this.video.play().catch(() => {});
                     if (this._inlineSubTrackId <= 0) {
                         this.reloadSubtitles();
