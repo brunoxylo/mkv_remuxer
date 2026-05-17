@@ -115,9 +115,8 @@ impl ClusterWriteWrapper {
         };
         let current_blocks = self.cluster.blocks.len();
 
-        // New logic:
-        // - break at every keyframe if we have at least 120 blocks
-        // - strictly limit to 600 blocks
+        // - break at every keyframe if we have at least MIN_BLOCKS_PER_CLUSTER blocks
+        // - strictly limit to MAX_BLOCKS_PER_CLUSTER blocks
         if current_blocks >= MAX_BLOCKS_PER_CLUSTER
             || (current_blocks >= MIN_BLOCKS_PER_CLUSTER && is_video_keyframe)
         {
@@ -130,22 +129,38 @@ impl ClusterWriteWrapper {
         self.duration_ns = cluster_duration as u64;
         self.size_bytes += block_size as u64;
 
-        // Add block to cluster
-        self.cluster.blocks.push(block.clone());
-        // get last one as mutable reference
-        let target_block = self
-            .cluster
-            .blocks
-            .last_mut()
-            .ok_or_else(|| Error::InvalidBlockData("Failed to get last block".to_string()))?;
-        target_block.set_timestamp_ns(
+        // set timestamp of the block
+        let mut new_block = block.clone();
+        new_block.set_timestamp_ns(
             absolute_timestamp_ns.max(0) as u64,
             self.cluster.timestamp.0,
             self.timecode_scale,
         )?;
         if let Some(track_number) = track_number {
-            target_block.set_track_number(track_number)?;
+            new_block.set_track_number(track_number)?;
         }
+        let mut insert_index = self.cluster.blocks.len();
+
+        // if we have a video keyframe and there are blocks before from other tracks
+        // with the same timestamp we want to insert this video block before them
+        // this will ensure that every cluster starts with a video keyframe
+        // even if audio tracks occur before with the same timestamp
+        // (Firefox MSE requires that)
+        if is_video_keyframe {
+            let new_raw_ts = new_block.timestamp()?;
+            for (i, block) in self.cluster.blocks.iter().enumerate().rev() {
+                // walk back until we see a block with a differnt timestamp
+                // or with the same track number (we never want to change the block order within tracks)
+                if block.timestamp()? == new_raw_ts
+                    && block.track_number()? != new_block.track_number()?
+                {
+                    insert_index = i;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.cluster.blocks.insert(insert_index, new_block);
 
         Ok(())
     }
