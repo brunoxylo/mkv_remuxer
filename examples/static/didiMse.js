@@ -66,11 +66,16 @@ class DidiMse extends DidiPlayer {
             const mimeType = res.headers.get('content-type') || 'video/webm';
 
             this._inlineSubCues = [];
-            // Immediately remove old subtitle track so stale cues don't linger
+            // Remove only static blob-URL tracks; preserve the dynamic track element.
             this.video.querySelectorAll('track').forEach(t => {
+                if (t === this._dynamicTrackEl) return; // keep it
                 if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
                 t.remove();
             });
+            // Clear cues from the dynamic track so stale subtitles don't linger
+            if (this._dynamicTrack && this._dynamicTrack.cues) {
+                Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
+            }
             if (this._subtitleBlobUrl) {
                 URL.revokeObjectURL(this._subtitleBlobUrl);
                 this._subtitleBlobUrl = null;
@@ -92,7 +97,7 @@ class DidiMse extends DidiPlayer {
                     if (seekOffsetInStream > 0.1) {
                         this.video.currentTime = seekOffsetInStream;
                     }
-                    if (wasPlaying) this.video.play().catch(() => {});
+                    if (wasPlaying) this.video.play().catch(() => { });
                     if (this._inlineSubTrackId <= 0) {
                         this.reloadSubtitles();
                     }
@@ -100,9 +105,13 @@ class DidiMse extends DidiPlayer {
                 this.video.addEventListener('canplay', onCanPlay);
 
                 this.video.querySelectorAll('track').forEach(t => {
+                    if (t === this._dynamicTrackEl) return;
                     if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
                     t.remove();
                 });
+                if (this._dynamicTrack && this._dynamicTrack.cues) {
+                    Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
+                }
                 if (this._subtitleBlobUrl) {
                     URL.revokeObjectURL(this._subtitleBlobUrl);
                     this._subtitleBlobUrl = null;
@@ -122,27 +131,59 @@ class DidiMse extends DidiPlayer {
                     }
 
                     const useInlineSubs = this._inlineSubTrackId > 0;
-                    let mseReader, ebmlReader;
 
+                    // Set up the dynamic subtitle track element once if needed
                     if (useInlineSubs) {
-                        const [s1, s2] = res.body.tee();
-                        mseReader = s1.getReader();
-                        ebmlReader = s2.getReader();
-                        this._runEbmlSubtitleScanner(ebmlReader, controller.signal, this._inlineSubOutputTrack);
-                    } else {
-                        mseReader = res.body.getReader();
+                        if (!this._dynamicTrackEl || !this.video.contains(this._dynamicTrackEl)) {
+                            this._dynamicTrackEl = document.createElement('track');
+                            this._dynamicTrackEl.kind = 'subtitles';
+                            this._dynamicTrackEl.label = 'Inline Subtitles';
+                            this._dynamicTrackEl.srclang = 'und';
+                            this._dynamicTrackEl.default = true;
+                            this.video.appendChild(this._dynamicTrackEl);
+                            this._dynamicTrack = this._dynamicTrackEl.track;
+                            console.log('[DidiMse Subs] Created <track> element. track:', this._dynamicTrack);
+                        }
+                        if (this._dynamicTrack) this._dynamicTrack.mode = 'showing';
+                        // Clear stale cues from previous seek
+                        if (this._dynamicTrack && this._dynamicTrack.cues) {
+                            Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
+                        }
                     }
 
                     // ── Simple MSE pump ──
                     // No manual sb.remove() — Firefox's internal eviction handles cleanup.
                     // Manual remove() causes mBufferFull to get stuck (RangeRemoval doesn't clear it).
-                    const pumpStream = async (reader) => {
+                    // scanner: optional EbmlSubtitleScanner — fed inline so it's throttled by the pump
+                    const pumpStream = async (reader, scanner, startProcessedCues = 0) => {
+                        let processedCuesCount = startProcessedCues;
                         try {
                             while (true) {
                                 if (controller.signal.aborted || ms.readyState !== 'open') return 'aborted';
 
                                 const { done, value } = await reader.read();
                                 if (done) return 'done';
+
+                                // Feed chunk to subtitle scanner inline (naturally throttled with pump)
+                                if (scanner) {
+                                    scanner.feed(value);
+                                    const cues = scanner.getCues();
+                                    if (cues.length > processedCuesCount) {
+                                        for (let i = processedCuesCount; i < cues.length; i++) {
+                                            const cue = cues[i];
+                                            const delaySec = (this.subtitleDelayMs || 0) / 1000;
+                                            const startSec = (cue.startMs / 1000) + delaySec;
+                                            const endSec = startSec + (cue.durationMs / 1000);
+                                            if (endSec > 0) {
+                                                try {
+                                                    const vttCue = new VTTCue(Math.max(0, startSec), endSec, cue.text);
+                                                    if (this._dynamicTrack) this._dynamicTrack.addCue(vttCue);
+                                                } catch (e) { /* ignore invalid cue */ }
+                                            }
+                                        }
+                                        processedCuesCount = cues.length;
+                                    }
+                                }
 
                                 // Wait for any pending operation
                                 if (sb.updating) {
@@ -182,9 +223,14 @@ class DidiMse extends DidiPlayer {
                         }
                     };
 
+                    // Create initial subtitle scanner (one per stream segment)
+                    let activeScanner = useInlineSubs
+                        ? new EbmlSubtitleScanner(this._inlineSubOutputTrack)
+                        : null;
+
                     // Run with reconnection on network errors
                     (async () => {
-                        let result = await pumpStream(mseReader);
+                        let result = await pumpStream(res.body.getReader(), activeScanner);
                         let backoff = 1000;
 
                         while (result === 'error' && ms.readyState === 'open' && !controller.signal.aborted) {
@@ -192,7 +238,7 @@ class DidiMse extends DidiPlayer {
                             if (sb.buffered.length > 0) {
                                 resumeAt = sb.buffered.end(sb.buffered.length - 1) + this.currentSeekOffset;
                             }
-                            console.log(`[DidiMse] Reconnecting from ${resumeAt.toFixed(1)}s in ${(backoff/1000).toFixed(0)}s...`);
+                            console.log(`[DidiMse] Reconnecting from ${resumeAt.toFixed(1)}s in ${(backoff / 1000).toFixed(0)}s...`);
                             await new Promise(r => setTimeout(r, backoff));
                             backoff = Math.min(backoff * 2, 10000);
                             if (controller.signal.aborted || ms.readyState !== 'open') break;
@@ -212,7 +258,11 @@ class DidiMse extends DidiPlayer {
                                     sb.timestampOffset = s - this.currentSeekOffset;
                                 }
                                 backoff = 1000;
-                                result = await pumpStream(res2.body.getReader());
+                                // Fresh scanner for the new segment; cues from previous segment remain in the track
+                                if (useInlineSubs) {
+                                    activeScanner = new EbmlSubtitleScanner(this._inlineSubOutputTrack);
+                                }
+                                result = await pumpStream(res2.body.getReader(), activeScanner);
                             } catch (err) {
                                 if (err.name === 'AbortError' || err.name === 'InvalidStateError' || controller.signal.aborted || ms.readyState !== 'open') break;
                                 console.error('[DidiMse] Reconnect failed:', err);
@@ -221,27 +271,32 @@ class DidiMse extends DidiPlayer {
                         }
 
                         if (result === 'done' && ms.readyState === 'open') {
-                            try { ms.endOfStream(); } catch (e) {}
+                            try { ms.endOfStream(); } catch (e) { }
                         } else if (result === 'error' && ms.readyState === 'open') {
                             this._emitError(DidiErrorType.NETWORK, 'Stream failed');
-                            try { ms.endOfStream('network'); } catch (e) {}
+                            try { ms.endOfStream('network'); } catch (e) { }
                         }
                     })();
                 }, { once: true });
+
 
             } else {
                 controller.abort();
                 const onCanPlay = () => {
                     this.video.removeEventListener('canplay', onCanPlay);
-                    if (wasPlaying) this.video.play().catch(() => {});
+                    if (wasPlaying) this.video.play().catch(() => { });
                     this.reloadSubtitles();
                 };
                 this.video.addEventListener('canplay', onCanPlay);
                 this.video.src = url;
                 this.video.querySelectorAll('track').forEach(t => {
+                    if (t === this._dynamicTrackEl) return;
                     if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
                     t.remove();
                 });
+                if (this._dynamicTrack && this._dynamicTrack.cues) {
+                    Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
+                }
                 if (this._subtitleBlobUrl) {
                     URL.revokeObjectURL(this._subtitleBlobUrl);
                     this._subtitleBlobUrl = null;
@@ -254,9 +309,10 @@ class DidiMse extends DidiPlayer {
         }
     }
 
-    selectSubtitle(trackId, fileIndex) {
+    selectSubtitle(trackId, fileIndex, delayMs = 0) {
         this.activeSubtitleTrackId = trackId;
         this.activeSubtitleFileIndex = fileIndex;
+        this.subtitleDelayMs = delayMs;
 
         if (trackId === -1) {
             this.setInlineSubtitleTrack(-1);
@@ -279,84 +335,8 @@ class DidiMse extends DidiPlayer {
         }
     }
 
-    async _runEbmlSubtitleScanner(reader, abortSignal, outputTrackNum) {
-        const scanner = new EbmlSubtitleScanner(outputTrackNum);
-
-        try {
-            while (true) {
-                if (abortSignal.aborted) break;
-                const { done, value } = await reader.read();
-                if (done) break;
-                scanner.feed(value);
-            }
-        } catch (e) {
-            if (e.name !== 'AbortError') {
-            }
-        }
-
-        this._inlineSubCues = scanner.getCues();
-        if (this._inlineSubCues.length > 0) {
-            this._applyInlineSubtitles();
-        }
-    }
-
-    _applyInlineSubtitles() {
-        this.video.querySelectorAll('track').forEach(t => {
-            if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
-            t.remove();
-        });
-        if (this._subtitleBlobUrl) {
-            URL.revokeObjectURL(this._subtitleBlobUrl);
-            this._subtitleBlobUrl = null;
-        }
-
-        const offset = this.currentSeekOffset || 0;
-
-        let vtt = 'WEBVTT\n\n';
-        for (const cue of this._inlineSubCues) {
-            const startSec = (cue.startMs / 1000) - offset;
-            const endSec = startSec + (cue.durationMs / 1000);
-            if (endSec <= 0) continue;
-            const clampedStart = Math.max(0, startSec);
-            vtt += `${this._formatVttTime(clampedStart)} --> ${this._formatVttTime(endSec)}\n`;
-            vtt += `${cue.text}\n\n`;
-        }
 
 
-        const blob = new Blob([vtt], { type: 'text/vtt' });
-        this._subtitleBlobUrl = URL.createObjectURL(blob);
-
-        let lang = 'und';
-        if (this.files[this.activeSubtitleFileIndex]) {
-            const st = this.files[this.activeSubtitleFileIndex].subtitle_tracks
-                .find(t => t.track_id === this.activeSubtitleTrackId);
-            if (st) lang = st.language || 'und';
-        }
-
-        const track = document.createElement('track');
-        track.kind = 'subtitles';
-        track.label = lang;
-        track.srclang = lang;
-        track.src = this._subtitleBlobUrl;
-        track.default = true;
-        this.video.appendChild(track);
-
-        if (track.track) track.track.mode = 'showing';
-        track.addEventListener('load', () => {
-            if (track.track) track.track.mode = 'showing';
-        });
-        const currentSrc = track.src;
-        track.src = '';
-        track.src = currentSrc;
-    }
-
-    _formatVttTime(seconds) {
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor((seconds % 3600) / 60);
-        const s = Math.floor(seconds % 60);
-        const ms = Math.round((seconds - Math.floor(seconds)) * 1000);
-        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
-    }
 }
 
 

@@ -180,7 +180,7 @@ class DidiPlayer {
     }
 
     /** Override in subclass */
-    selectSubtitle(_trackId, _fileIndex) {
+    selectSubtitle(_trackId, _fileIndex, _delayMs = 0) {
         throw new Error('selectSubtitle() must be implemented by subclass');
     }
 

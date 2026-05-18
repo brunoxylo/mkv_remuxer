@@ -70,9 +70,10 @@ class DidiLegacy extends DidiPlayer {
     // ── Subtitle selection ─────────────────────────────────────────────
     // Uses server-side VTT conversion via the inherited reloadSubtitles().
 
-    selectSubtitle(trackId, fileIndex) {
+    selectSubtitle(trackId, fileIndex, delayMs = 0) {
         this.activeSubtitleTrackId = trackId;
         this.activeSubtitleFileIndex = fileIndex;
+        this.subtitleDelayMs = delayMs;
         this.reloadSubtitles();
     }
 
