@@ -117,7 +117,7 @@ impl Codecs {
         if mime_codecs.is_empty() {
             prefix.to_string()
         } else {
-            format!("{}; codecs=\"{}\"", prefix, mime_codecs.join(", "))
+            format!("{}; codecs=\"{}\"", prefix, mime_codecs.join(","))
         }
     }
 
@@ -209,8 +209,14 @@ mod tests {
     #[test]
     fn test_mkv_codec_id_to_mime_strips_suffix() {
         // Only the major codec ID should be kept
-        assert_eq!(mkv_codec_id_to_mime("V_MPEG4/ISO/ASP"), Some("mpeg4".into()));
-        assert_eq!(mkv_codec_id_to_mime("A_AAC/MPEG2/LC/SBR"), Some("aac".into()));
+        assert_eq!(
+            mkv_codec_id_to_mime("V_MPEG4/ISO/ASP"),
+            Some("mpeg4".into())
+        );
+        assert_eq!(
+            mkv_codec_id_to_mime("A_AAC/MPEG2/LC/SBR"),
+            Some("aac".into())
+        );
     }
 
     #[test]
@@ -273,7 +279,10 @@ mod tests {
         let codecs = codecs_from_file("test_av1.webm");
 
         // test_av1.webm has: AV1 video, Opus audio, and a WebVTT subtitle track
-        assert_eq!(codecs.get_mkv_codec_ids(), vec!["V_AV1", "A_OPUS", "D_WEBVTT/SUBTITLES"]);
+        assert_eq!(
+            codecs.get_mkv_codec_ids(),
+            vec!["V_AV1", "A_OPUS", "D_WEBVTT/SUBTITLES"]
+        );
         // Subtitle codecs are filtered out for MIME
         assert_eq!(codecs.get_mime_codec_ids(), vec!["av01.0.01M.08", "opus"]);
         assert_eq!(
@@ -287,7 +296,10 @@ mod tests {
         let codecs = codecs_from_file("test_vp9.webm");
 
         // test_vp9.webm has: VP9 video, Opus audio, and a WebVTT subtitle track
-        assert_eq!(codecs.get_mkv_codec_ids(), vec!["V_VP9", "A_OPUS", "D_WEBVTT/SUBTITLES"]);
+        assert_eq!(
+            codecs.get_mkv_codec_ids(),
+            vec!["V_VP9", "A_OPUS", "D_WEBVTT/SUBTITLES"]
+        );
         assert_eq!(codecs.get_mime_codec_ids(), vec!["vp9", "opus"]);
         assert_eq!(
             codecs.to_mime_type(ContainerFormat::WebM),
