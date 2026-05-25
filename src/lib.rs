@@ -45,26 +45,51 @@ pub struct Codecs {
     inner: Vec<String>,
 }
 
+/// Returns a sort-priority for a Matroska codec ID so that video codecs
+/// come first, then audio, then subtitle/data codecs.
+fn codec_type_priority(codec_id: &str) -> u8 {
+    match codec_id.get(..2) {
+        Some("V_") => 0,
+        Some("A_") => 1,
+        Some("S_") | Some("D_") => 2,
+        _ => 3,
+    }
+}
+
 impl Codecs {
     pub(crate) fn new(tracks: &Tracks) -> Self {
         let mut codecs = Vec::new();
         for track in &tracks.track_entry {
             codecs.push(track.codec_id.0.to_string());
         }
-        // sort and remove duplicates
-        codecs.sort();
+        // Sort by type (video → audio → subtitle) then alphabetically, and deduplicate.
+        codecs.sort_by(|a, b| {
+            codec_type_priority(a)
+                .cmp(&codec_type_priority(b))
+                .then_with(|| a.cmp(b))
+        });
         codecs.dedup();
         Self { inner: codecs }
     }
 }
 
 /// Convert a Matroska codec ID (e.g. `V_VP9`, `A_OPUS`, `D_WEBVTT/SUBTITLES`)
-/// to the lowercase MIME codec name (e.g. `vp9`, `opus`).
-/// Strips the prefix (`V_`, `A_`, `S_`, `D_`) and lowercases the major codec ID.
+/// to the ISO-standard MIME codec name used in the `codecs` parameter.
+/// Known codecs are mapped explicitly (e.g. `V_AV1` → `av01`, `V_VP9` → `vp09`).
 /// Subtitle/data codecs (`D_`, `S_`) are skipped since they aren't relevant for
 /// the MIME codecs parameter.
 fn mkv_codec_id_to_mime(codec_id: &str) -> Option<String> {
-    // Strip the single-letter prefix + underscore
+    // Explicit mappings for known codecs to their ISO-standard identifiers.
+    // Profile/level parameters are omitted to avoid reporting incorrect values.
+    match codec_id {
+        "V_AV1" => return Some("av01".into()),
+        "V_VP9" => return Some("vp09".into()),
+        "V_VP8" => return Some("vp8".into()),
+        "A_OPUS" => return Some("opus".into()),
+        "A_VORBIS" => return Some("vorbis".into()),
+        _ => {}
+    }
+    // Fallback: strip the single-letter prefix + underscore and lowercase
     let without_prefix = match codec_id.get(..2) {
         Some("V_") | Some("A_") => &codec_id[2..],
         Some("D_") | Some("S_") => return None, // skip subtitle/data codecs
@@ -145,7 +170,11 @@ mod tests {
     /// Helper: build a Codecs from raw Matroska codec ID strings.
     fn codecs_from_raw(ids: &[&str]) -> Codecs {
         let mut inner: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        inner.sort();
+        inner.sort_by(|a, b| {
+            codec_type_priority(a)
+                .cmp(&codec_type_priority(b))
+                .then_with(|| a.cmp(b))
+        });
         inner.dedup();
         Codecs { inner }
     }
@@ -165,9 +194,9 @@ mod tests {
 
     #[test]
     fn test_mkv_codec_id_to_mime_video() {
-        assert_eq!(mkv_codec_id_to_mime("V_VP9"), Some("vp9".into()));
+        assert_eq!(mkv_codec_id_to_mime("V_VP9"), Some("vp09".into()));
         assert_eq!(mkv_codec_id_to_mime("V_VP8"), Some("vp8".into()));
-        assert_eq!(mkv_codec_id_to_mime("V_AV1"), Some("av1".into()));
+        assert_eq!(mkv_codec_id_to_mime("V_AV1"), Some("av01".into()));
     }
 
     #[test]
@@ -203,22 +232,22 @@ mod tests {
     fn test_to_mime_type_webm_vp9_opus() {
         let codecs = codecs_from_raw(&["V_VP9", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::WebM);
-        assert_eq!(mime, "video/webm; codecs=\"opus, vp9\"");
+        assert_eq!(mime, "video/webm; codecs=\"vp09, opus\"");
     }
 
     #[test]
     fn test_to_mime_type_webm_av1_opus() {
         let codecs = codecs_from_raw(&["V_AV1", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::WebM);
-        // Sorted by MKV ID: A_OPUS < V_AV1 → MIME order: opus, av1
-        assert_eq!(mime, "video/webm; codecs=\"opus, av1\"");
+        // Sorted by type priority: V_AV1 (video) before A_OPUS (audio)
+        assert_eq!(mime, "video/webm; codecs=\"av01, opus\"");
     }
 
     #[test]
     fn test_to_mime_type_mkv() {
         let codecs = codecs_from_raw(&["V_VP9", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::Mkv);
-        assert_eq!(mime, "video/x-matroska; codecs=\"opus, vp9\"");
+        assert_eq!(mime, "video/x-matroska; codecs=\"vp09, opus\"");
     }
 
     #[test]
@@ -243,12 +272,12 @@ mod tests {
         let codecs = codecs_from_file("test_av1.webm");
 
         // test_av1.webm has: AV1 video, Opus audio, and a WebVTT subtitle track
-        assert_eq!(codecs.get_mkv_codec_ids(), vec!["A_OPUS", "D_WEBVTT/SUBTITLES", "V_AV1"]);
+        assert_eq!(codecs.get_mkv_codec_ids(), vec!["V_AV1", "A_OPUS", "D_WEBVTT/SUBTITLES"]);
         // Subtitle codecs are filtered out for MIME
-        assert_eq!(codecs.get_mime_codec_ids(), vec!["opus", "av1"]);
+        assert_eq!(codecs.get_mime_codec_ids(), vec!["av01", "opus"]);
         assert_eq!(
             codecs.to_mime_type(ContainerFormat::WebM),
-            "video/webm; codecs=\"opus, av1\""
+            "video/webm; codecs=\"av01, opus\""
         );
     }
 
@@ -257,11 +286,11 @@ mod tests {
         let codecs = codecs_from_file("test_vp9.webm");
 
         // test_vp9.webm has: VP9 video, Opus audio, and a WebVTT subtitle track
-        assert_eq!(codecs.get_mkv_codec_ids(), vec!["A_OPUS", "D_WEBVTT/SUBTITLES", "V_VP9"]);
-        assert_eq!(codecs.get_mime_codec_ids(), vec!["opus", "vp9"]);
+        assert_eq!(codecs.get_mkv_codec_ids(), vec!["V_VP9", "A_OPUS", "D_WEBVTT/SUBTITLES"]);
+        assert_eq!(codecs.get_mime_codec_ids(), vec!["vp09", "opus"]);
         assert_eq!(
             codecs.to_mime_type(ContainerFormat::WebM),
-            "video/webm; codecs=\"opus, vp9\""
+            "video/webm; codecs=\"vp09, opus\""
         );
     }
 }
