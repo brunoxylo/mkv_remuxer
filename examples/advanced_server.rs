@@ -209,12 +209,8 @@ async fn handle_stream_request(
         .unwrap_or_else(|_| Err(mkv_remuxer::Error::InternalBug("Stream thread died".into())));
 
     match stream_result {
-        Ok((output_format, start_sec_out, end_sec_out)) => {
-            let content_type = match output_format {
-                ContainerFormat::Vtt => "text/vtt; charset=utf-8",
-                ContainerFormat::WebM => "video/webm",
-                ContainerFormat::Mkv => "video/mkv",
-            };
+        Ok((output_format, output_codecs, start_sec_out, end_sec_out)) => {
+            let content_type = output_codecs.to_mime_type(output_format);
 
             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
             let mapped = tokio_stream::StreamExt::map(stream, |c| Ok::<_, Infallible>(c));

@@ -1,3 +1,4 @@
+use crate::Codecs;
 use crate::block_ext::{TrackKind, TracksExt};
 use crate::metling_pot::MeltingPot;
 use crate::sink::{Initialized, OutputSink};
@@ -5,6 +6,7 @@ use crate::source::{self, CutInterval, Cutting, InputSource, Remuxing, SeekType,
 use crate::source_mappings::SourcesMappings;
 use crate::{ContainerFormat, Error, Result};
 use log::{debug, info, warn};
+use mkv_element::prelude::Tracks;
 
 /// Track mapping specification: (source_index, track_number)
 pub type TrackMapping = (u64, u64);
@@ -43,6 +45,7 @@ pub struct Remuxer {
     track_count: usize,
     duration_ns: u64,
     output_container: ContainerFormat, // most generous format mkv, then comes webm and last comes vtt
+    output_codecs: Codecs,
 }
 
 impl Remuxer {
@@ -66,8 +69,9 @@ impl Remuxer {
         let mut sources_cutting: Vec<InputSource<Cutting>> = Vec::with_capacity(sources.len());
         for mut source in sources {
             match target_timescale {
-                Some(ts) => { sources_cutting.push(source.initialize(Some(ts))?);
-                },
+                Some(ts) => {
+                    sources_cutting.push(source.initialize(Some(ts))?);
+                }
                 None => {
                     let source = source.initialize(None)?;
                     target_timescale = Some(source.get_target_timecode_scale()?);
@@ -82,8 +86,11 @@ impl Remuxer {
         let mut output_cut_interval = if let Some(cut_interval) = cut_interval {
             match cut_mode {
                 // search for the first video track to use as reference for snapping if needed, if no video track is found we just use dirty cut for all sources if any of the snap keyframe seek types is used
-                Some(RemuxerCutMode::SnapNearestKeyframe) | Some(RemuxerCutMode::SnapPreviousKeyframe) | Some(RemuxerCutMode::SnapNextKeyframe) => {
-                    let first_mapped_video_track = if let Some(ref mappings) = mappings { // there are custom mapping
+                Some(RemuxerCutMode::SnapNearestKeyframe)
+                | Some(RemuxerCutMode::SnapPreviousKeyframe)
+                | Some(RemuxerCutMode::SnapNextKeyframe) => {
+                    let first_mapped_video_track = if let Some(ref mappings) = mappings {
+                        // there are custom mapping
                         let mut first_mapped = None;
                         for &(source_idx, track_num) in mappings {
                             if let Some(source) = sources_cutting.get(source_idx as usize) {
@@ -97,26 +104,45 @@ impl Remuxer {
                             }
                         }
                         first_mapped
-                    } else { // no custom mapping use first video track we can find
+                    } else {
+                        // no custom mapping use first video track we can find
                         let mut first_mapped = None;
                         for (idx, source) in sources_cutting.iter().enumerate() {
-                                let tracks = source.get_tracks()?;
-                                if let Some(track) = tracks.track_entry.iter().find(|t| t.track_type.0 == TrackKind::Video) {
-                                    first_mapped = Some((idx as u64, track.track_number.0));
-                                    break;
-                                }
+                            let tracks = source.get_tracks()?;
+                            if let Some(track) = tracks
+                                .track_entry
+                                .iter()
+                                .find(|t| t.track_type.0 == TrackKind::Video)
+                            {
+                                first_mapped = Some((idx as u64, track.track_number.0));
+                                break;
                             }
-                            first_mapped
+                        }
+                        first_mapped
                     };
 
                     // Cut the video source first to determine the snapped interval, then apply
                     // that interval to all other sources with DirtyCut — all sources stay in
                     // their original order so mapping indices remain valid.
-                    let actual_cut = if let Some((video_src_idx, video_track_num)) = first_mapped_video_track {
+                    let actual_cut = if let Some((video_src_idx, video_track_num)) =
+                        first_mapped_video_track
+                    {
                         let actual = match cut_mode {
-                            Some(RemuxerCutMode::SnapNearestKeyframe) => sources_cutting[video_src_idx as usize].cut(SeekType::SnapNearestKeyframe(video_track_num), cut_interval)?,
-                            Some(RemuxerCutMode::SnapPreviousKeyframe) => sources_cutting[video_src_idx as usize].cut(SeekType::SnapPreviousKeyframe(video_track_num), cut_interval)?,
-                            Some(RemuxerCutMode::SnapNextKeyframe) => sources_cutting[video_src_idx as usize].cut(SeekType::SnapNextKeyframe(video_track_num), cut_interval)?,
+                            Some(RemuxerCutMode::SnapNearestKeyframe) => {
+                                sources_cutting[video_src_idx as usize].cut(
+                                    SeekType::SnapNearestKeyframe(video_track_num),
+                                    cut_interval,
+                                )?
+                            }
+                            Some(RemuxerCutMode::SnapPreviousKeyframe) => {
+                                sources_cutting[video_src_idx as usize].cut(
+                                    SeekType::SnapPreviousKeyframe(video_track_num),
+                                    cut_interval,
+                                )?
+                            }
+                            Some(RemuxerCutMode::SnapNextKeyframe) => sources_cutting
+                                [video_src_idx as usize]
+                                .cut(SeekType::SnapNextKeyframe(video_track_num), cut_interval)?,
                             _ => unreachable!(),
                         };
                         // Apply the snapped interval to all other sources with DirtyCut
@@ -139,22 +165,23 @@ impl Remuxer {
                         initialized_sources.push(source.into_remuxing()?);
                     }
                     actual_cut
-                },
+                }
                 Some(RemuxerCutMode::Squeeze) => {
                     for mut source in sources_cutting.into_iter() {
                         let _ = source.cut(SeekType::Squeeze, cut_interval)?;
                         initialized_sources.push(source.into_remuxing()?);
                     }
                     cut_interval
-                },
+                }
                 Some(RemuxerCutMode::DirtyCut) => {
                     for mut source in sources_cutting.into_iter() {
                         let _ = source.cut(SeekType::DirtyCut, cut_interval)?;
                         initialized_sources.push(source.into_remuxing()?);
                     }
                     cut_interval
-                },
-                None => { // cut interval requested but no cut mode specified, default to squeeze
+                }
+                None => {
+                    // cut interval requested but no cut mode specified, default to squeeze
                     for mut source in sources_cutting.into_iter() {
                         let _ = source.cut(SeekType::Squeeze, cut_interval)?;
                         initialized_sources.push(source.into_remuxing()?);
@@ -162,16 +189,19 @@ impl Remuxer {
                     cut_interval
                 }
             }
-        } else { // no cut, just initialize remuxing directly
-            let mut max_duration :Option<u64> = None;
+        } else {
+            // no cut, just initialize remuxing directly
+            let mut max_duration: Option<u64> = None;
             for mut source in sources_cutting.into_iter() {
-                
                 if let Some(dur) = source.get_output_duration()? {
                     max_duration = Some(dur.max(max_duration.unwrap_or(0)));
                 }
                 initialized_sources.push(source.into_remuxing()?);
             }
-            CutInterval { start_ns: Some(0), end_ns: max_duration }
+            CutInterval {
+                start_ns: Some(0),
+                end_ns: max_duration,
+            }
         };
 
         if initialized_sources.is_empty() {
@@ -188,7 +218,6 @@ impl Remuxer {
         let mut sources_mappings = SourcesMappings::new(initialized_sources)?;
 
         if let Some(ref mappings) = mappings {
-
             debug!("Applying {} custom track mappings", mappings.len());
             for &(source_idx, track_num) in mappings {
                 sources_mappings.add_mapping(source_idx, track_num)?;
@@ -203,13 +232,17 @@ impl Remuxer {
         }
 
         let output_tracks = sources_mappings.get_output_tracks_metadata()?;
-        debug!("Output will have {} tracks", output_tracks.track_entry.len());
+        debug!(
+            "Output will have {} tracks",
+            output_tracks.track_entry.len()
+        );
+
+        let codecs = Codecs::new(&output_tracks);
 
         let chapters = sources_mappings
             .sources
             .iter()
             .find_map(|source| source.get_chapters().ok().flatten());
-            
 
         let mut melting_pot = MeltingPot::new(sources_mappings);
         let duration_ns = melting_pot.get_final_duration()?.unwrap_or(0);
@@ -217,9 +250,11 @@ impl Remuxer {
         let track_count = output_tracks.track_entry.len();
 
         // determine which container fromat to use
-        let output_format =if output_sink.does_support_container_format(ContainerFormat::Mkv) == true {
+        let output_format = if output_sink.does_support_container_format(ContainerFormat::Mkv)
+            == true
+        {
             if melting_pot.can_be_webm()? {
-               ContainerFormat::WebM
+                ContainerFormat::WebM
             } else {
                 ContainerFormat::Mkv
             }
@@ -263,6 +298,7 @@ impl Remuxer {
                 blocks_processed: 0,
                 clusters_written: 0,
                 output_container: output_format,
+                output_codecs: codecs,
                 track_count,
                 duration_ns,
             },
@@ -273,6 +309,11 @@ impl Remuxer {
     /// Returns the container format being used for the output.
     pub fn get_output_container_format(&self) -> ContainerFormat {
         self.output_container
+    }
+
+    /// Returns the codecs being used for the output.
+    pub fn get_output_codecs(&self) -> &Codecs {
+        &self.output_codecs
     }
 
     /// Process one cluster.

@@ -1,5 +1,5 @@
 use crate::{
-    ContainerFormat, Error, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState, Result,
+    Codecs, ContainerFormat, Error, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState, Result,
     sink::{
         ChannelWriterWrapper, OutputSink, Sink, SinkSender, StreamSink, Uninitialized, VttSink,
     },
@@ -106,7 +106,7 @@ impl FolderStreamer {
         cut_mode: Option<RemuxerCutMode>,
         vtt_output: bool,
         tx: mpsc::Sender<Bytes>,
-        ready_tx: tokio::sync::oneshot::Sender<Result<(ContainerFormat, f64, f64)>>,
+        ready_tx: tokio::sync::oneshot::Sender<Result<(ContainerFormat, Codecs, f64, f64)>>,
     ) {
         let all_files = self.scan_media_files();
 
@@ -129,6 +129,7 @@ impl FolderStreamer {
         };
 
         let output_format = remuxer.get_output_container_format();
+        let output_codecs = remuxer.get_output_codecs();
         let start_sec_out = output_interval
             .start_ns
             .map(|ns| ns as f64 / 1e9)
@@ -140,7 +141,12 @@ impl FolderStreamer {
 
         // Notify caller that headers are ready
         if ready_tx
-            .send(Ok((output_format, start_sec_out, end_sec_out)))
+            .send(Ok((
+                output_format,
+                output_codecs.clone(),
+                start_sec_out,
+                end_sec_out,
+            )))
             .is_err()
         {
             return; // Caller dropped receiver

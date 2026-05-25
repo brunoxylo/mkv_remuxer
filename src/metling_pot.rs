@@ -8,7 +8,7 @@ use mkv_element::{ClusterBlock, prelude::*};
 
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
-    clusters: Vec<Option<ClusterReadWrapper>>
+    clusters: Vec<Option<ClusterReadWrapper>>,
 }
 
 impl MeltingPot {
@@ -18,7 +18,7 @@ impl MeltingPot {
         let initial_clusters = (0..num_sources).map(|_| None).collect();
         Self {
             sources_mappings,
-            clusters: initial_clusters
+            clusters: initial_clusters,
         }
     }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
@@ -94,10 +94,7 @@ impl MeltingPot {
             let lowest_timestamp_ns = lowest_timestamp_found.max(0) as u64;
             // not yet initialized
             if output_cluster.is_none() && lowest_cluster_index.is_some() {
-                output_cluster = Some(ClusterWriteWrapper::new(
-                    lowest_timestamp_ns,
-                    timescale,
-                ));
+                output_cluster = Some(ClusterWriteWrapper::new(lowest_timestamp_ns, timescale));
             }
 
             // add pending block to output cluster if it exists
@@ -113,8 +110,15 @@ impl MeltingPot {
                                 .sources_mappings
                                 .is_track_mapped(lowest_index as u64, input_track_index)
                             {
-                                let track_kind = self.sources_mappings.get_track_kind(lowest_index as u64, input_track_index)?;
-                                match o_cluster.add_block(&block, lowest_timestamp_ns, Some(output_trackindex), Some(track_kind)) {
+                                let track_kind = self
+                                    .sources_mappings
+                                    .get_track_kind(lowest_index as u64, input_track_index)?;
+                                match o_cluster.add_block(
+                                    &block,
+                                    lowest_timestamp_ns,
+                                    Some(output_trackindex),
+                                    Some(track_kind),
+                                ) {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
                                         // Cluster is full, break the inner loop and start a new cluster
@@ -144,7 +148,7 @@ impl MeltingPot {
             }
         }
     }
-    pub fn get_final_duration(& mut self) -> Result<Option<u64>> {
+    pub fn get_final_duration(&mut self) -> Result<Option<u64>> {
         let mut max_duration_ns = 0;
         for source in &mut self.sources_mappings.sources {
             max_duration_ns = max_duration_ns.max(source.get_output_duration()?.unwrap_or(0));
@@ -166,12 +170,15 @@ impl MeltingPot {
             let codec = entry.codec_id.0.as_str();
             let ok = matches!(
                 codec,
-                "V_VP8" | "V_VP9" | "V_AV1"
-                | "A_VORBIS" | "A_OPUS"
-                | "D_WEBVTT/SUBTITLES"
-                | "D_WEBVTT/CAPTIONS"
-                | "D_WEBVTT/DESCRIPTIONS"
-                | "D_WEBVTT/METADATA"
+                "V_VP8"
+                    | "V_VP9"
+                    | "V_AV1"
+                    | "A_VORBIS"
+                    | "A_OPUS"
+                    | "D_WEBVTT/SUBTITLES"
+                    | "D_WEBVTT/CAPTIONS"
+                    | "D_WEBVTT/DESCRIPTIONS"
+                    | "D_WEBVTT/METADATA"
             ) || codec.starts_with("D_WEBVTT");
             if !ok {
                 return Ok(false);
@@ -182,7 +189,10 @@ impl MeltingPot {
 
     pub fn is_single_vtt_track(&self) -> Result<bool> {
         let mut only_one_vtt = false;
-        let sub_tracks = self.sources_mappings.get_output_tracks_metadata()?.track_entry;
+        let sub_tracks = self
+            .sources_mappings
+            .get_output_tracks_metadata()?
+            .track_entry;
         for track in sub_tracks {
             let codec = track.codec_id.0.as_str();
             if codec.starts_with("D_WEBVTT") {
@@ -398,13 +408,17 @@ mod tests {
                 assert!(
                     count <= MAX_BLOCKS_PER_CLUSTER,
                     "Cluster {} has {} blocks, exceeding MAX_BLOCKS_PER_CLUSTER ({})",
-                    i + 1, count, MAX_BLOCKS_PER_CLUSTER
+                    i + 1,
+                    count,
+                    MAX_BLOCKS_PER_CLUSTER
                 );
                 if i < last_idx {
                     assert!(
                         count >= MIN_BLOCKS_PER_CLUSTER,
                         "Non-last cluster {} has {} blocks, below MIN_BLOCKS_PER_CLUSTER ({})",
-                        i + 1, count, MIN_BLOCKS_PER_CLUSTER
+                        i + 1,
+                        count,
+                        MIN_BLOCKS_PER_CLUSTER
                     );
                 }
             }
@@ -412,4 +426,3 @@ mod tests {
         Ok(())
     }
 }
-
