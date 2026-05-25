@@ -282,6 +282,7 @@ impl FolderStreamer {
             cut_interval,
             cut_mode,
             Some(remuxer_mappings),
+            false, //dont output chapters bc mse doesnt allow this
         )
     }
 

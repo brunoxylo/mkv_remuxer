@@ -1,20 +1,20 @@
 use std::fmt::Display;
 use std::io::Write;
 
-use crate::Result;
 use crate::ContainerFormat;
+use crate::Result;
 use bytes::Bytes;
 use mkv_element::prelude::*;
 
-mod util;
 mod file_sink;
-mod vtt_sink;
 mod stream_sink;
+mod util;
+mod vtt_sink;
 
-pub use util::{OutputSink, Uninitialized, Initialized};
 pub use file_sink::FileSink;
+pub use stream_sink::StreamSink;
+pub use util::{Initialized, OutputSink, Uninitialized};
 pub use vtt_sink::VttSink;
-pub use stream_sink::{StreamSink};
 
 /// Represents a sink/destination for MKV data (output file or stream)
 pub trait Sink: Send {
@@ -43,7 +43,7 @@ pub enum SinkSender {
 }
 pub struct ChannelWriterWrapper {
     pub tx: SinkSender,
-    prefill_buffer: Vec::<u8>,
+    prefill_buffer: Vec<u8>,
     previously_flushed: bool,
 }
 impl ChannelWriterWrapper {
@@ -55,15 +55,22 @@ impl ChannelWriterWrapper {
         }
     }
     fn send_err(e: &dyn Display) -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("Failed to send data through channel: {}", e))
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("Failed to send data through channel: {}", e),
+        )
     }
     fn send_in_chunks(&mut self, buf: &[u8]) -> std::io::Result<()> {
         // Send data in chunks of 10KB to avoid overwhelming the channel
         const CHUNK_SIZE: usize = 10 * 1024;
         for chunk in buf.chunks(CHUNK_SIZE) {
             match &self.tx {
-                SinkSender::Sync(tx) => tx.send(bytes::Bytes::copy_from_slice(chunk)).map_err(|e| Self::send_err(&e))?,
-                SinkSender::Tokio(tx) => tx.blocking_send(bytes::Bytes::copy_from_slice(chunk)).map_err(|e| Self::send_err(&e))?,
+                SinkSender::Sync(tx) => tx
+                    .send(bytes::Bytes::copy_from_slice(chunk))
+                    .map_err(|e| Self::send_err(&e))?,
+                SinkSender::Tokio(tx) => tx
+                    .blocking_send(bytes::Bytes::copy_from_slice(chunk))
+                    .map_err(|e| Self::send_err(&e))?,
             };
         }
         Ok(())
@@ -71,7 +78,8 @@ impl ChannelWriterWrapper {
 }
 impl Write for ChannelWriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.previously_flushed && self.prefill_buffer.len() < 1000_000 { // dont buffer more than 1MB to avoid excessive memory usage
+        if !self.previously_flushed && self.prefill_buffer.len() < 1000_000 {
+            // dont buffer more than 1MB to avoid excessive memory usage
             // Buffer the first few writes to allow the sink to initialize
             self.prefill_buffer.extend_from_slice(&buf);
         } else {
@@ -91,7 +99,6 @@ impl Write for ChannelWriterWrapper {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -99,30 +106,30 @@ mod tests {
     use super::*;
     use crate::remux;
     use crate::remuxer::RemuxerCutMode;
+    use crate::source::CutInterval;
     use crate::source::{FileSource, InputSource};
     use crate::test_utils::{test_file_path, validate_mkv_output};
-    use crate::source::CutInterval;
 
     fn run_remux_test_with_seek_type(cut_mode: RemuxerCutMode) -> Result<()> {
         // Setup: Create output path in temp directory
         let temp_dir = std::env::temp_dir();
         let cut_mode_name = format!("{:?}", cut_mode);
         let output_path = temp_dir.join(format!("test_german_audio_{}.mkv", cut_mode_name));
-        
+
         // Create input source from test.webm (uninitialized)
         let input_path = test_file_path();
         let input_file = File::open(&input_path)?;
         let source = FileSource::new(input_file)?;
         let input_source = InputSource::from(source);
-        
+
         // Create output sink (uninitialized)
         let output_sink = FileSink::new(&output_path)?;
         let output = OutputSink::from(output_sink);
-        
+
         // Configure cutting: from 20 seconds to the end
         let start_ns = 20_000_000_000u64; // 20 seconds in nanoseconds
         let cut_interval = CutInterval::new().with_start(start_ns);
-        
+
         // We need to pre-check for German audio tracks manually
         // Initialize source temporarily to check tracks
         let input_file = File::open(&input_path)?;
@@ -130,7 +137,6 @@ mod tests {
         let temp_input = InputSource::from(temp_source);
         let mut initialized_temp = temp_input.initialize(None)?.into_remuxing()?;
         let tracks = initialized_temp.get_tracks()?;
-        
 
         let mut output_mappings = Vec::new();
         let mut has_video_track = false;
@@ -143,7 +149,9 @@ mod tests {
             }
         }
         if !has_video_track {
-            panic!("Test file does not contain any video tracks. Please provide a test file with video for this test.");
+            panic!(
+                "Test file does not contain any video tracks. Please provide a test file with video for this test."
+            );
         }
 
         // Look for German audio track
@@ -157,27 +165,37 @@ mod tests {
         }
         // If test.webm doesn't have German audio, try any audio track for testing
         if output_mappings.is_empty() {
-            panic!("Test file does not contain any German audio tracks. Please provide a test file with German audio for this test.");
+            panic!(
+                "Test file does not contain any German audio tracks. Please provide a test file with German audio for this test."
+            );
         }
-        
+
         // Perform remuxing with custom mappings
         let stats = remux(
             vec![input_source],
-            output, 
-            Some(cut_interval), 
+            output,
+            Some(cut_interval),
             Some(cut_mode),
-            Some(output_mappings.clone())
+            Some(output_mappings.clone()),
+            true,
         )?;
-        
-        // Validate we processed some blocks
-        assert!(stats.blocks_processed > 0, "Should have processed at least some blocks");
-        assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
 
+        // Validate we processed some blocks
+        assert!(
+            stats.blocks_processed > 0,
+            "Should have processed at least some blocks"
+        );
+        assert_eq!(
+            stats.track_count,
+            output_mappings.len(),
+            "Track count should match mappings"
+        );
 
         let input_duration_ns = initialized_temp.get_output_duration()?.unwrap_or(0);
         // Validate the output using our comprehensive validation method
-        let validation_report = validate_mkv_output(&output_path, true, Some(input_duration_ns), false, true)?;
-        
+        let validation_report =
+            validate_mkv_output(&output_path, true, Some(input_duration_ns), false, true)?;
+
         // Print report for debugging
         if !validation_report.is_valid() {
             eprintln!("{}", validation_report.summary());
@@ -188,27 +206,42 @@ mod tests {
                 eprintln!("WARNING: {}", warning);
             }
         }
-        
+
         // Assert all validations passed
-        assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
-        assert!(validation_report.timestamps_plausible, "Timestamps should be plausible");
-        assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
-        assert!(validation_report.cluster_block_count_valid,
+        assert!(
+            validation_report.syntax_valid,
+            "Output should have valid EBML syntax"
+        );
+        assert!(
+            validation_report.timestamps_plausible,
+            "Timestamps should be plausible"
+        );
+        assert!(
+            validation_report.all_tracks_present,
+            "All declared tracks should be present in clusters"
+        );
+        assert!(
+            validation_report.cluster_block_count_valid,
             "Cluster block counts should be within [{}, {}]",
             crate::cluster_warpper::MIN_BLOCKS_PER_CLUSTER,
-            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER);
-        
+            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER
+        );
+
         // Cues validation might be less strict, just warn if invalid
         if !validation_report.cues_valid {
             eprintln!("Warning: Cues validation failed");
         }
-        
+
         // Overall validation
-        assert!(validation_report.is_valid(), "Overall MKV validation should pass for {:?}", cut_mode_name);
-        
+        assert!(
+            validation_report.is_valid(),
+            "Overall MKV validation should pass for {:?}",
+            cut_mode_name
+        );
+
         // Cleanup
         //let _ = std::fs::remove_file(&output_path);
-        
+
         Ok(())
     }
 
@@ -230,9 +263,9 @@ mod tests {
     #[test]
     fn validate_input_file() -> Result<()> {
         let input_path = test_file_path();
-        let report =  validate_mkv_output(&input_path, true, None, false, false)?;
+        let report = validate_mkv_output(&input_path, true, None, false, false)?;
         print!("Input file validation report:\n{}", report.summary());
-                // Print report for debugging
+        // Print report for debugging
         if !report.is_valid() {
             eprintln!("{}", report.summary());
             for error in &report.errors {
@@ -244,17 +277,16 @@ mod tests {
         }
         assert!(report.is_valid(), "Input file should be valid");
         Ok(())
-
     }
 
     #[test]
     fn test_remux_webvtt_into_video() -> Result<()> {
         use crate::source::WebVttSource;
-        
+
         // Setup: Create output path in temp directory
         let temp_dir = std::env::temp_dir();
         let output_path = temp_dir.join("test_av1_with_subtitles.mkv");
-        
+
         // First, get the video tracks
         let video_path = std::path::Path::new("test_av1.webm");
         let video_file = File::open(video_path)?;
@@ -262,22 +294,22 @@ mod tests {
         let temp_video_input = InputSource::from(temp_video);
         let mut init_video = temp_video_input.initialize(None)?;
         let video_tracks = init_video.get_tracks()?;
-        
+
         // Create video source from test_av1.webm
         let video_file = File::open(video_path)?;
         let video_source = FileSource::new(video_file)?;
         let video_input = InputSource::from(video_source);
-        
+
         // Create WebVTT subtitle source from example.vtt (first 30 seconds only to match video)
         let vtt_path = std::path::Path::new("example.vtt");
         let vtt_file = File::open(vtt_path)?;
         let vtt_source = WebVttSource::new(vtt_file, "eng".to_string(), false)?;
         let vtt_input = InputSource::from(vtt_source);
-        
+
         // Create output sink
         let output_sink = FileSink::new(&output_path)?;
         let output = OutputSink::from(output_sink);
-        
+
         // Configure output mappings: all tracks from video (source 0), subtitle track from WebVTT (source 1)
         let mut output_mappings = Vec::new();
         // Add all video and audio tracks from source 0
@@ -286,26 +318,34 @@ mod tests {
         }
         // Add subtitle track from source 1 (WebVTT) - track number is 1
         output_mappings.push((1u64, 1u64));
-        
+
         // Apply cut interval to limit output to first 30 seconds to match video
         let cut_interval = CutInterval::new().with_end(30_000_000_000);
-        
+
         // Perform remuxing
         let stats = remux(
             vec![video_input, vtt_input],
-            output, 
+            output,
             Some(cut_interval),
             None, // No special seek type
-            Some(output_mappings.clone())
+            Some(output_mappings.clone()),
+            true,
         )?;
-        
+
         // Validate we processed some blocks
-        assert!(stats.blocks_processed > 0, "Should have processed at least some blocks");
-        assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
-        
+        assert!(
+            stats.blocks_processed > 0,
+            "Should have processed at least some blocks"
+        );
+        assert_eq!(
+            stats.track_count,
+            output_mappings.len(),
+            "Track count should match mappings"
+        );
+
         // Validate the output (skip timestamp plausibility check due to video metadata vs actual frame mismatch)
         let validation_report = validate_mkv_output(&output_path, true, None, false, true)?;
-        
+
         // Print report for debugging
         if !validation_report.is_valid() {
             eprintln!("{}", validation_report.summary());
@@ -316,19 +356,27 @@ mod tests {
                 eprintln!("WARNING: {}", warning);
             }
         }
-        
+
         // Assert critical validations passed
-        assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
+        assert!(
+            validation_report.syntax_valid,
+            "Output should have valid EBML syntax"
+        );
         // Skip timestamps_plausible check - video file duration metadata doesn't match actual frame timestamps
-        assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
-        assert!(validation_report.cluster_block_count_valid,
+        assert!(
+            validation_report.all_tracks_present,
+            "All declared tracks should be present in clusters"
+        );
+        assert!(
+            validation_report.cluster_block_count_valid,
             "Cluster block counts should be within [{}, {}]",
             crate::cluster_warpper::MIN_BLOCKS_PER_CLUSTER,
-            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER);
-        
+            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER
+        );
+
         // Cleanup is commented out for inspection
         // let _ = std::fs::remove_file(&output_path);
-        
+
         Ok(())
     }
 
@@ -371,10 +419,18 @@ mod tests {
             Some(cut_interval),
             Some(RemuxerCutMode::SnapNearestKeyframe),
             Some(output_mappings.clone()),
+            true,
         )?;
 
-        assert!(stats.blocks_processed > 0, "Should have processed at least some blocks");
-        assert_eq!(stats.track_count, output_mappings.len(), "Track count should match mappings");
+        assert!(
+            stats.blocks_processed > 0,
+            "Should have processed at least some blocks"
+        );
+        assert_eq!(
+            stats.track_count,
+            output_mappings.len(),
+            "Track count should match mappings"
+        );
 
         let validation_report = validate_mkv_output(&output_path, true, None, false, true)?;
 
@@ -388,12 +444,20 @@ mod tests {
             }
         }
 
-        assert!(validation_report.syntax_valid, "Output should have valid EBML syntax");
-        assert!(validation_report.all_tracks_present, "All declared tracks should be present in clusters");
-        assert!(validation_report.cluster_block_count_valid,
+        assert!(
+            validation_report.syntax_valid,
+            "Output should have valid EBML syntax"
+        );
+        assert!(
+            validation_report.all_tracks_present,
+            "All declared tracks should be present in clusters"
+        );
+        assert!(
+            validation_report.cluster_block_count_valid,
             "Cluster block counts should be within [{}, {}]",
             crate::cluster_warpper::MIN_BLOCKS_PER_CLUSTER,
-            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER);
+            crate::cluster_warpper::MAX_BLOCKS_PER_CLUSTER
+        );
 
         // let _ = std::fs::remove_file(&output_path);
 

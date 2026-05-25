@@ -60,6 +60,7 @@ impl Remuxer {
         cut_interval: Option<CutInterval>,
         cut_mode: Option<RemuxerCutMode>,
         mappings: Option<Vec<TrackMapping>>,
+        do_chapter_output: bool,
     ) -> Result<(Self, CutInterval)> {
         debug!("Initializing Remuxer with {} sources", sources.len());
 
@@ -239,10 +240,14 @@ impl Remuxer {
 
         let codecs = Codecs::new(&output_tracks);
 
-        let chapters = sources_mappings
-            .sources
-            .iter()
-            .find_map(|source| source.get_chapters().ok().flatten());
+        let chapters = if do_chapter_output {
+            sources_mappings
+                .sources
+                .iter()
+                .find_map(|source| source.get_chapters().ok().flatten())
+        } else {
+            None
+        };
 
         let mut melting_pot = MeltingPot::new(sources_mappings);
         let duration_ns = melting_pot.get_final_duration()?.unwrap_or(0);
@@ -371,9 +376,16 @@ pub fn remux(
     cut_interval: Option<CutInterval>,
     cut_mode: Option<RemuxerCutMode>,
     mappings: Option<Vec<TrackMapping>>,
+    do_chapter_output: bool,
 ) -> Result<RemuxStats> {
-    let (mut remuxer, _actual_cut) =
-        Remuxer::new(sources, output_sink, cut_interval, cut_mode, mappings)?;
+    let (mut remuxer, _actual_cut) = Remuxer::new(
+        sources,
+        output_sink,
+        cut_interval,
+        cut_mode,
+        mappings,
+        do_chapter_output,
+    )?;
 
     loop {
         remuxer = match remuxer.process()? {

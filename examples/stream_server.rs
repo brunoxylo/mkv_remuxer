@@ -22,15 +22,15 @@ use log::{error, info};
 use log4rs::append::file;
 use mkv_remuxer::{
     ContainerFormat, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState,
-    sink::{ChannelWriterWrapper, SinkSender, OutputSink, StreamSink, VttSink},
+    sink::{ChannelWriterWrapper, OutputSink, SinkSender, StreamSink, VttSink},
     source::{CutInterval, FileSource, InputSource, WebVttSource},
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use warp::hyper;
 use warp::Filter;
+use warp::hyper;
 
 #[tokio::main]
 async fn main() {
@@ -139,9 +139,12 @@ async fn handle_video_request(
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1);
 
     // Spawn blocking task for remuxer intialization since it may involve file I/O and processing
-    let (remuxer, output_interval) =  match tokio::task::spawn_blocking(move || {
+    let (remuxer, output_interval) = match tokio::task::spawn_blocking(move || {
         process_video_request(input_path, start_sec, end_sec, tracks, cut_mode, tx)
-    }).await.unwrap() {
+    })
+    .await
+    .unwrap()
+    {
         Ok(result) => result,
         Err(e) => {
             error!("Error initializing remuxer: {}", e);
@@ -153,7 +156,7 @@ async fn handle_video_request(
         }
     };
 
-    let output_format: ContainerFormat = remuxer.get_output_container_format(); 
+    let output_format: ContainerFormat = remuxer.get_output_container_format();
 
     // spawn another blocking task to run the remuxer loop so it doesn't block the async response handling
     tokio::task::spawn_blocking(move || {
@@ -181,9 +184,14 @@ async fn handle_video_request(
     let body = warp::hyper::Body::wrap_stream(mapped_stream);
 
     // safe the start and end times of the segment we are streaming in custom headers so client can use them if needed
-    let start_sec = output_interval.start_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
-    let end_sec = output_interval.end_ns.map(|ns| ns as f64 / 1_000_000_000.0).unwrap_or(0.0);
-
+    let start_sec = output_interval
+        .start_ns
+        .map(|ns| ns as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
+    let end_sec = output_interval
+        .end_ns
+        .map(|ns| ns as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
 
     let content_type = match output_format {
         ContainerFormat::Vtt => "text/vtt; charset=utf-8",
@@ -212,19 +220,33 @@ fn process_video_request(
     cut_mode: Option<RemuxerCutMode>,
     tx: tokio::sync::mpsc::Sender<Bytes>,
 ) -> mkv_remuxer::Result<(Remuxer, CutInterval)> {
-    let is_vtt = input_path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
+    let is_vtt = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        == "vtt";
     let input: InputSource = if is_vtt {
         let vtt_file = std::fs::File::open(&input_path)?;
-        let file_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-        let file_stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
-        let  vtt_source = WebVttSource::new(vtt_file, file_stem, false)?
-            .with_file_name(file_name);
+        let file_name = input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let file_stem = input_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let vtt_source = WebVttSource::new(vtt_file, file_stem, false)?.with_file_name(file_name);
         InputSource::from(vtt_source)
     } else {
         let input_file = std::fs::File::open(&input_path)?;
-        let file_name = input_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-        let  file_source = FileSource::new(input_file)?
-             .with_file_name(file_name);
+        let file_name = input_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let file_source = FileSource::new(input_file)?.with_file_name(file_name);
         InputSource::from(file_source)
     };
 
@@ -261,7 +283,7 @@ fn process_video_request(
     };
 
     info!("Starting remux...");
-    Remuxer::new(vec![input], output, cut_interval, cut_mode, mappings)
+    Remuxer::new(vec![input], output, cut_interval, cut_mode, mappings, false)
 }
 
 async fn handle_files_request() -> Result<warp::reply::Response, Infallible> {
@@ -272,8 +294,16 @@ async fn handle_files_request() -> Result<warp::reply::Response, Infallible> {
             .filter_map(|path| {
                 let is_vtt = path.extension().and_then(|e| e.to_str()).unwrap_or("") == "vtt";
                 let file = std::fs::File::open(&path).ok()?;
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let file_stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 let result: mkv_remuxer::Result<Box<dyn Source>> = if is_vtt {
                     WebVttSource::new(file, file_stem, false)
                         .map(|s| Box::new(s.with_file_name(file_name)) as Box<dyn Source>)
@@ -292,7 +322,8 @@ async fn handle_files_request() -> Result<warp::reply::Response, Infallible> {
             .collect()
     });
 
-    let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}" ));
+    let json =
+        serde_json::to_string_pretty(&infos).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     let response = warp::http::Response::builder()
         .status(200)
         .header("Content-Type", "application/json")

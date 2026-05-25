@@ -75,15 +75,16 @@ impl Codecs {
 
 /// Convert a Matroska codec ID (e.g. `V_VP9`, `A_OPUS`, `D_WEBVTT/SUBTITLES`)
 /// to the ISO-standard MIME codec name used in the `codecs` parameter.
-/// Known codecs are mapped explicitly (e.g. `V_AV1` → `av01.0.01M.08`).
+/// Known codecs are mapped explicitly (e.g. `V_AV1` → `av01.0.19H.10`).
 /// Subtitle/data codecs (`D_`, `S_`) are skipped since they aren't relevant for
 /// the MIME codecs parameter.
 fn mkv_codec_id_to_mime(codec_id: &str) -> Option<String> {
     // Explicit mappings for known codecs to their ISO-standard identifiers.
     // AV1 requires profile/level/bit-depth for MSE isTypeSupported() to accept it.
-    // We use the most conservative params: Main profile, Level 2.1, Main tier, 8-bit.
+    // We declare maximally permissive params so the SourceBuffer won't reject
+    // high-res or HDR frames: Main profile (0), Level 6.3 High tier, 10-bit.
     match codec_id {
-        "V_AV1" => return Some("av01.0.01M.08".into()),
+        "V_AV1" => return Some("av01.0.19H.10".into()),
         "V_VP9" => return Some("vp9".into()),
         "V_VP8" => return Some("vp8".into()),
         "A_OPUS" => return Some("opus".into()),
@@ -197,7 +198,7 @@ mod tests {
     fn test_mkv_codec_id_to_mime_video() {
         assert_eq!(mkv_codec_id_to_mime("V_VP9"), Some("vp9".into()));
         assert_eq!(mkv_codec_id_to_mime("V_VP8"), Some("vp8".into()));
-        assert_eq!(mkv_codec_id_to_mime("V_AV1"), Some("av01.0.01M.08".into()));
+        assert_eq!(mkv_codec_id_to_mime("V_AV1"), Some("av01.0.19H.10".into()));
     }
 
     #[test]
@@ -239,7 +240,7 @@ mod tests {
     fn test_to_mime_type_webm_vp9_opus() {
         let codecs = codecs_from_raw(&["V_VP9", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::WebM);
-        assert_eq!(mime, "video/webm; codecs=\"vp9, opus\"");
+        assert_eq!(mime, "video/webm; codecs=\"vp9,opus\"");
     }
 
     #[test]
@@ -247,14 +248,14 @@ mod tests {
         let codecs = codecs_from_raw(&["V_AV1", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::WebM);
         // Sorted by type priority: V_AV1 (video) before A_OPUS (audio)
-        assert_eq!(mime, "video/webm; codecs=\"av01.0.01M.08, opus\"");
+        assert_eq!(mime, "video/webm; codecs=\"av01.0.19H.10,opus\"");
     }
 
     #[test]
     fn test_to_mime_type_mkv() {
         let codecs = codecs_from_raw(&["V_VP9", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::Mkv);
-        assert_eq!(mime, "video/x-matroska; codecs=\"vp9, opus\"");
+        assert_eq!(mime, "video/x-matroska; codecs=\"vp9,opus\"");
     }
 
     #[test]
@@ -284,10 +285,10 @@ mod tests {
             vec!["V_AV1", "A_OPUS", "D_WEBVTT/SUBTITLES"]
         );
         // Subtitle codecs are filtered out for MIME
-        assert_eq!(codecs.get_mime_codec_ids(), vec!["av01.0.01M.08", "opus"]);
+        assert_eq!(codecs.get_mime_codec_ids(), vec!["av01.0.19H.10", "opus"]);
         assert_eq!(
             codecs.to_mime_type(ContainerFormat::WebM),
-            "video/webm; codecs=\"av01.0.01M.08, opus\""
+            "video/webm; codecs=\"av01.0.19H.10,opus\""
         );
     }
 
@@ -303,7 +304,7 @@ mod tests {
         assert_eq!(codecs.get_mime_codec_ids(), vec!["vp9", "opus"]);
         assert_eq!(
             codecs.to_mime_type(ContainerFormat::WebM),
-            "video/webm; codecs=\"vp9, opus\""
+            "video/webm; codecs=\"vp9,opus\""
         );
     }
 }
