@@ -81,8 +81,8 @@ pub fn patch_tracks_for_webm(tracks: &Tracks) -> Result<Vec<u8>> {
         let header_len = id_len + size_len;
         let element_len = header_len + size as usize;
 
-        if id == 0x9D {
-            //|| id == 0x52F1 { // FieldOrder or AudioEmphasis
+        if id == 0x9D || id == 0x52F1 {
+            // FieldOrder or AudioEmphasis
             // Replace with Void (0xEC)
             let l = element_len;
             if l >= 2 {
