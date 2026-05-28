@@ -1,10 +1,12 @@
-use mkv_element::prelude::Tracks;
-use mkv_element::io::blocking_impl::WriteTo;
 use crate::Result;
 use log::debug;
+use mkv_element::io::blocking_impl::WriteTo;
+use mkv_element::prelude::Tracks;
 
 fn read_vint_id(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     let first = data[0];
     let mut mask = 0x80;
     let mut len = 1;
@@ -12,7 +14,9 @@ fn read_vint_id(data: &[u8]) -> Option<(u64, usize)> {
         mask >>= 1;
         len += 1;
     }
-    if mask == 0 || data.len() < len { return None; }
+    if mask == 0 || data.len() < len {
+        return None;
+    }
     let mut val = 0;
     for i in 0..len {
         val = (val << 8) | (data[i] as u64);
@@ -21,7 +25,9 @@ fn read_vint_id(data: &[u8]) -> Option<(u64, usize)> {
 }
 
 fn read_vint_size(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     let first = data[0];
     let mut mask = 0x80;
     let mut len = 1;
@@ -29,7 +35,9 @@ fn read_vint_size(data: &[u8]) -> Option<(u64, usize)> {
         mask >>= 1;
         len += 1;
     }
-    if mask == 0 || data.len() < len { return None; }
+    if mask == 0 || data.len() < len {
+        return None;
+    }
     let mut val = (first & !mask) as u64;
     for i in 1..len {
         val = (val << 8) | (data[i] as u64);
@@ -38,7 +46,8 @@ fn read_vint_size(data: &[u8]) -> Option<(u64, usize)> {
 }
 
 fn is_container(id: u64) -> bool {
-    matches!(id, 
+    matches!(
+        id,
         0x1654AE6B | // Tracks
         0xAE |       // TrackEntry
         0xE0 |       // Video
@@ -48,25 +57,32 @@ fn is_container(id: u64) -> bool {
         0x6D80 |     // ContentEncodings
         0x6240 |     // ContentEncoding
         0x41E4 |     // BlockAdditionMapping
-        0x6624       // TrackTranslate
+        0x6624 // TrackTranslate
     )
 }
 
 pub fn patch_tracks_for_webm(tracks: &Tracks) -> Result<Vec<u8>> {
     let mut data = Vec::new();
-    tracks.write_to(&mut data).map_err(|e| crate::Error::InvalidConfig(format!("Failed to serialize tracks: {}", e)))?;
-    
+    tracks
+        .write_to(&mut data)
+        .map_err(|e| crate::Error::InvalidConfig(format!("Failed to serialize tracks: {}", e)))?;
+
     let mut offset = 0;
     let mut voided_count = 0;
-    
+
     while offset < data.len() {
-        let Some((id, id_len)) = read_vint_id(&data[offset..]) else { break };
-        let Some((size, size_len)) = read_vint_size(&data[offset + id_len..]) else { break };
-        
+        let Some((id, id_len)) = read_vint_id(&data[offset..]) else {
+            break;
+        };
+        let Some((size, size_len)) = read_vint_size(&data[offset + id_len..]) else {
+            break;
+        };
+
         let header_len = id_len + size_len;
         let element_len = header_len + size as usize;
-        
-        if id == 0x9D || id == 0x52F1 { // FieldOrder or AudioEmphasis
+
+        if id == 0x9D {
+            //|| id == 0x52F1 { // FieldOrder or AudioEmphasis
             // Replace with Void (0xEC)
             let l = element_len;
             if l >= 2 {
@@ -83,7 +99,10 @@ pub fn patch_tracks_for_webm(tracks: &Tracks) -> Result<Vec<u8>> {
                         data[offset + i] = 0;
                     }
                 } else {
-                    debug!("Element too large to void easily: ID 0x{:X}, length {}", id, l);
+                    debug!(
+                        "Element too large to void easily: ID 0x{:X}, length {}",
+                        id, l
+                    );
                 }
             }
             debug!("Voided non-WebM Track element: 0x{:X}", id);
@@ -97,10 +116,10 @@ pub fn patch_tracks_for_webm(tracks: &Tracks) -> Result<Vec<u8>> {
             offset += element_len;
         }
     }
-    
+
     if voided_count > 0 {
         debug!("Voided {} non-WebM Tracks element(s)", voided_count);
     }
-    
+
     Ok(data)
 }
