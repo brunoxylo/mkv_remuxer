@@ -274,7 +274,7 @@ impl<T: MkvReader> FileSource<T> {
 
         let mut filtered = Vec::with_capacity(orig_block_count);
 
-        let result = match self.seek_type {
+        let mut output_cluster: Cluster = match self.seek_type {
             SeekType::SnapNearestKeyframe(_)
             | SeekType::SnapPreviousKeyframe(_)
             | SeekType::SnapNextKeyframe(_) => {
@@ -310,7 +310,7 @@ impl<T: MkvReader> FileSource<T> {
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
-                Ok(cluster)
+                cluster
             }
             SeekType::DirtyCut => {
                 // Drop frames outside range
@@ -336,26 +336,29 @@ impl<T: MkvReader> FileSource<T> {
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
-                Ok(cluster)
+                cluster
             }
             SeekType::Squeeze => {
-                self.process_squeeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks)
+                self.process_squeeze_cluster(cluster, orig_cluster_ticks, shifted_cluster_ticks)?
             }
         };
 
-        if let Ok(ref processed) = result {
-            if processed.blocks.is_empty() && orig_block_count > 0 {
-                debug!(
-                    "Cluster filtering removed all {} blocks (cluster_ns={}, start_ns={:?}, end_ns={:?})",
-                    orig_block_count,
-                    orig_cluster_ns,
-                    self.initial_cluster_pos.get_timestamp_ns(),
-                    self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns())
-                );
-            }
+        if output_cluster.blocks.is_empty() && orig_block_count > 0 {
+            debug!(
+                "Cluster filtering removed all {} blocks (cluster_ns={}, start_ns={:?}, end_ns={:?})",
+                orig_block_count,
+                orig_cluster_ns,
+                self.initial_cluster_pos.get_timestamp_ns(),
+                self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns())
+            );
         }
+        // presort read clusters to enforce strict monotonicity not only inside tracks but also inside a cluster across all tracks
+        // required by chrome MSE
+        output_cluster
+            .blocks
+            .sort_by(|a, b| a.timestamp().unwrap_or(0).cmp(&b.timestamp().unwrap_or(0)));
 
-        result
+        Ok(output_cluster)
     }
 
     fn process_squeeze_cluster(
