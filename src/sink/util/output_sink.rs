@@ -1,8 +1,8 @@
+use super::super::Sink;
 use crate::{APP_NAME, Error};
 use crate::{ContainerFormat, Result};
 use mkv_element::prelude::*;
 use std::marker::PhantomData;
-use super::super::Sink;
 
 // Typestate marker types
 pub struct Uninitialized;
@@ -41,7 +41,6 @@ impl OutputSink<Uninitialized> {
             _state: PhantomData,
         })
     }
-  
 
     pub fn initialize_simple(
         mut self,
@@ -51,21 +50,31 @@ impl OutputSink<Uninitialized> {
         chapters: Option<&Chapters>,
         format: ContainerFormat,
     ) -> Result<OutputSink<Initialized>> {
-
         if self.inner.does_support_container_format(format) == false {
             return Err(Error::InvalidConfig(format!(
-                "The provided sink does not support the specified container format '{}'. Please use a compatible sink or choose a different container format.", 
+                "The provided sink does not support the specified container format '{}'. Please use a compatible sink or choose a different container format.",
                 format
             )));
         }
+        // WebM spec does not allow SegmentUuid or DateUtc in the Info element;
+        // Chrome MSE strictly rejects them. Only include for MKV output.
+        let is_webm = format == ContainerFormat::WebM;
         let info = Info {
             timestamp_scale: TimestampScale(timecode_scale),
             muxing_app: MuxingApp(APP_NAME.to_string()),
             writing_app: WritingApp(APP_NAME.to_string()),
             duration: Some(Duration((duration_ns / timecode_scale) as f64)),
-            date_utc: Some(DateUtc(chrono::Utc::now().timestamp())),
+            date_utc: if is_webm {
+                None
+            } else {
+                Some(DateUtc(chrono::Utc::now().timestamp()))
+            },
             title: None,
-            segment_uuid: Some(SegmentUuid(uuid::Uuid::new_v4().as_bytes().to_vec().into())),
+            segment_uuid: if is_webm {
+                None
+            } else {
+                Some(SegmentUuid(uuid::Uuid::new_v4().as_bytes().to_vec().into()))
+            },
             segment_filename: None,
             prev_uuid: None,
             prev_filename: None,
@@ -87,7 +96,10 @@ impl OutputSink<Uninitialized> {
             crc32: None,
             void: None,
         };
-        self.initialize(tracks, &info, &ebml_header, chapters)
+        // WebM spec does not allow FieldOrder in Video or Emphasis in Audio;
+        // Chrome MSE strictly rejects these Matroska-only elements.
+
+        self.initialize(&tracks, &info, &ebml_header, chapters)
     }
 }
 
