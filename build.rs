@@ -17,10 +17,28 @@ fn main() {
     let xml_content = fs::read_to_string(xml_path)
         .expect("Failed to read ebml_matroska.xml");
 
-    let webm_elements = parse_webm_elements(&xml_content);
+    let mut webm_elements = parse_webm_elements(&xml_content);
+
+    // EBML core elements from RFC 8794 — not in the Matroska schema XML but
+    // always required for a valid EBML stream. Must be whitelisted so the
+    // filter doesn't void out the EBML header.
+    let ebml_core_elements: &[(&str, u32)] = &[
+        ("EBML",                0x1A45DFA3),
+        ("EBMLVersion",         0x4286),
+        ("EBMLReadVersion",     0x42F7),
+        ("EBMLMaxIDLength",     0x42F2),
+        ("EBMLMaxSizeLength",   0x42F3),
+        ("DocType",             0x4282),
+        ("DocTypeVersion",      0x4287),
+        ("DocTypeReadVersion",  0x4285),
+        ("CRC-32",              0xBF),
+        ("Void",                0xEC),
+    ];
+    for &(name, id) in ebml_core_elements {
+        webm_elements.push((name.to_string(), id));
+    }
 
     // Sort by element ID for binary search at runtime
-    let mut webm_elements = webm_elements;
     webm_elements.sort_by_key(|&(_, id)| id);
 
     // Generate the Rust source file
@@ -68,6 +86,49 @@ fn main() {
         "cargo:warning=Generated WebM whitelist with {} elements",
         webm_elements.len()
     );
+
+    // Also collect master (container) element IDs — needed so the filter
+    // knows whether to recurse into an element's children or pass through
+    // its raw data payload.
+    let mut master_elements = parse_master_elements(&xml_content);
+    // EBML and Segment are master elements from RFC 8794
+    master_elements.push(("EBML".to_string(), 0x1A45DFA3));
+    master_elements.sort_by_key(|&(_, id)| id);
+    master_elements.dedup_by_key(|e| e.1);
+
+    writeln!(out_file).unwrap();
+    writeln!(out_file, "/// Number of master (container) element IDs.").unwrap();
+    writeln!(out_file, "pub const MASTER_ELEMENT_COUNT: usize = {};", master_elements.len()).unwrap();
+    writeln!(out_file).unwrap();
+    writeln!(out_file, "/// Sorted array of master element IDs (elements whose payload contains child elements).").unwrap();
+    writeln!(out_file, "pub const MASTER_ELEMENT_IDS: [(&str, u32); {}] = [", master_elements.len()).unwrap();
+    for (name, id) in &master_elements {
+        writeln!(out_file, "    (\"{}\", 0x{:X}),", name, id).unwrap();
+    }
+    writeln!(out_file, "];").unwrap();
+    writeln!(out_file).unwrap();
+    writeln!(out_file, "/// Check whether a given EBML element ID is a master (container) element.").unwrap();
+    writeln!(out_file, "pub const fn is_master_element(id: u32) -> bool {{").unwrap();
+    writeln!(out_file, "    let mut lo = 0usize;").unwrap();
+    writeln!(out_file, "    let mut hi = MASTER_ELEMENT_IDS.len();").unwrap();
+    writeln!(out_file, "    while lo < hi {{").unwrap();
+    writeln!(out_file, "        let mid = lo + (hi - lo) / 2;").unwrap();
+    writeln!(out_file, "        let mid_id = MASTER_ELEMENT_IDS[mid].1;").unwrap();
+    writeln!(out_file, "        if mid_id == id {{").unwrap();
+    writeln!(out_file, "            return true;").unwrap();
+    writeln!(out_file, "        }} else if mid_id < id {{").unwrap();
+    writeln!(out_file, "            lo = mid + 1;").unwrap();
+    writeln!(out_file, "        }} else {{").unwrap();
+    writeln!(out_file, "            hi = mid;").unwrap();
+    writeln!(out_file, "        }}").unwrap();
+    writeln!(out_file, "    }}").unwrap();
+    writeln!(out_file, "    false").unwrap();
+    writeln!(out_file, "}}").unwrap();
+
+    eprintln!(
+        "cargo:warning=Generated master element list with {} elements",
+        master_elements.len()
+    );
 }
 
 /// Parse the EBML Matroska schema XML and return all WebM-compatible elements
@@ -80,20 +141,51 @@ fn main() {
 /// `<extension type="webmproject.org" webm="1"/>`.
 fn parse_webm_elements(xml: &str) -> Vec<(String, u32)> {
     let mut result = Vec::new();
+
+    for (name, id_str, _type_attr, full_block) in iter_elements(xml) {
+        let is_webm = full_block.contains(r#"type="webmproject.org" webm="1""#);
+        if is_webm {
+            let id_hex = id_str.trim_start_matches("0x").trim_start_matches("0X");
+            if let Ok(id) = u32::from_str_radix(id_hex, 16) {
+                result.push((name.to_string(), id));
+            }
+        }
+    }
+
+    result
+}
+
+/// Parse the EBML Matroska schema XML and return all master (container) elements
+/// as `(name, id)` pairs.
+fn parse_master_elements(xml: &str) -> Vec<(String, u32)> {
+    let mut result = Vec::new();
+
+    for (name, id_str, type_attr, _full_block) in iter_elements(xml) {
+        if type_attr.as_deref() == Some("master") {
+            let id_hex = id_str.trim_start_matches("0x").trim_start_matches("0X");
+            if let Ok(id) = u32::from_str_radix(id_hex, 16) {
+                result.push((name.to_string(), id));
+            }
+        }
+    }
+
+    result
+}
+
+/// Iterate over all `<element ...>` blocks in the schema XML.
+/// Returns `(name, id_str, type_attr, full_block_str)` tuples.
+fn iter_elements(xml: &str) -> Vec<(String, String, Option<String>, String)> {
+    let mut result = Vec::new();
     let mut search_from = 0;
 
     loop {
-        // Find the next `<element ` tag
         let tag_start = match xml[search_from..].find("<element ") {
             Some(pos) => search_from + pos,
             None => break,
         };
 
-        // Find the end of the opening tag (`>` that closes the `<element ...>` tag).
-        // We need to handle the self-closing case (`/>`) separately.
         let after_tag = &xml[tag_start..];
 
-        // Find the first `>` in this tag
         let gt_pos = match after_tag.find('>') {
             Some(pos) => pos,
             None => break,
@@ -102,19 +194,14 @@ fn parse_webm_elements(xml: &str) -> Vec<(String, u32)> {
         let opening_tag = &after_tag[..=gt_pos];
         let is_self_closing = opening_tag.ends_with("/>");
 
-        // Extract name and id from the opening tag
         let name = extract_attr(opening_tag, "name");
         let id_str = extract_attr(opening_tag, "id");
+        let type_attr = extract_attr(opening_tag, "type");
 
-        // Determine the full element block content (including children)
         let block_end;
         if is_self_closing {
             block_end = tag_start + gt_pos + 1;
         } else {
-            // Find the matching `</element>`. Since the schema XML has flat
-            // `<element>` definitions (no nested `<element>` children — child
-            // elements in the EBML sense are separate top-level `<element>` entries),
-            // we just find the next `</element>` after the opening tag.
             let after_open = tag_start + gt_pos + 1;
             match xml[after_open..].find("</element>") {
                 Some(pos) => {
@@ -129,15 +216,13 @@ fn parse_webm_elements(xml: &str) -> Vec<(String, u32)> {
 
         let full_block = &xml[tag_start..block_end];
 
-        // Check for WebM compatibility
         if let (Some(name), Some(id_str)) = (name, id_str) {
-            let is_webm = full_block.contains(r#"type="webmproject.org" webm="1""#);
-            if is_webm {
-                let id_hex = id_str.trim_start_matches("0x").trim_start_matches("0X");
-                if let Ok(id) = u32::from_str_radix(id_hex, 16) {
-                    result.push((name.to_string(), id));
-                }
-            }
+            result.push((
+                name.to_string(),
+                id_str.to_string(),
+                type_attr.map(|s| s.to_string()),
+                full_block.to_string(),
+            ));
         }
 
         search_from = block_end;
@@ -154,3 +239,4 @@ fn extract_attr<'a>(tag: &'a str, attr_name: &str) -> Option<&'a str> {
     let end = rest.find('"')?;
     Some(&rest[..end])
 }
+

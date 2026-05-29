@@ -1,4 +1,5 @@
 use super::Sink;
+use crate::sink::WebmFilterWriter;
 use crate::{ClusterBlockExt, ContainerFormat, Error, Result};
 use log::{debug, trace, warn};
 use mkv_element::io::blocking_impl::*;
@@ -9,10 +10,15 @@ use std::path::Path;
 
 const CUE_INTERVAL_NS: u64 = 15_000_000_000; // 15 seconds
 
+/// Combined trait for writers that support both `Write` and `Seek`.
+/// Used as a trait object in `FileSink` so the writer can be either a plain
+/// `BufWriter<File>` (MKV) or a `WebmFilterWriter<BufWriter<File>>` (WebM).
+trait WriteSeek: Write + Seek + Send {}
+impl<T: Write + Seek + Send> WriteSeek for T {}
 
 /// File-based sink implementation for writing MKV files (legacy trait implementation)
 pub struct FileSink {
-    writer: BufWriter<File>,
+    writer: Box<dyn WriteSeek>,
     container_format: ContainerFormat,
     segment_start_offset: u64,
     cues_offset: u64,
@@ -28,10 +34,13 @@ impl FileSink {
         let file = File::create(path.as_ref())?;
         let writer = BufWriter::new(file);
 
-        let format = path.as_ref()
+        let format = path
+            .as_ref()
             .extension()
             .and_then(|ext| ext.to_str())
-            .ok_or_else(|| Error::InvalidConfig("Output file extension must be .mkv or .webm".to_string()))
+            .ok_or_else(|| {
+                Error::InvalidConfig("Output file extension must be .mkv or .webm".to_string())
+            })
             .and_then(|ext_str| {
                 if ext_str.eq_ignore_ascii_case("webm") {
                     Ok(ContainerFormat::WebM)
@@ -45,8 +54,14 @@ impl FileSink {
                 }
             })?;
 
+        let boxed_writer: Box<dyn WriteSeek> = if format == ContainerFormat::WebM {
+            Box::new(WebmFilterWriter::new(writer, true))
+        } else {
+            Box::new(writer)
+        };
+
         Ok(Self {
-            writer,
+            writer: boxed_writer,
             container_format: format,
             segment_start_offset: 0,
             cues_offset: 0,
@@ -59,7 +74,6 @@ impl FileSink {
 }
 
 impl Sink for FileSink {
-
     fn initialize(
         &mut self,
         tracks: &Tracks,
@@ -67,17 +81,21 @@ impl Sink for FileSink {
         ebml_header: &Ebml,
         chapters: Option<&Chapters>,
     ) -> Result<()> {
-        if ebml_header.doc_type == Some(DocType(ContainerFormat::Mkv.to_string())) && self.container_format == ContainerFormat::WebM {
+        if ebml_header.doc_type == Some(DocType(ContainerFormat::Mkv.to_string()))
+            && self.container_format == ContainerFormat::WebM
+        {
             return Err(Error::InvalidConfig(
                 "Output file has .webm extension but contains non-WebM compliant tracks. Please change the output file extension to .mkv or adjust the tracks to be WebM compliant.".to_string(),
             ));
         }
         match ebml_header.doc_type {
-            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::Mkv.to_string() => {},
-            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {},
+            Some(DocType(ref doc_type))
+                if doc_type.to_lowercase() == ContainerFormat::Mkv.to_string() => {}
+            Some(DocType(ref doc_type))
+                if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {}
             _ => {
                 return Err(Error::InvalidConfig(format!(
-                    "EBML header doc type must be mkv or webm for FileSink", 
+                    "EBML header doc type must be mkv or webm for FileSink",
                 )));
             }
         }
@@ -115,17 +133,20 @@ impl Sink for FileSink {
             .map(|d| (d.0 * info.timestamp_scale.0 as f64) as u64)
             .unwrap_or(0);
         let num_clusters = (duration_ns / CUE_INTERVAL_NS).max(1);
-        // Reserve ~64 bytes per cue point, plus some safety 
+        // Reserve ~64 bytes per cue point, plus some safety
         let estimated_cues_size = num_clusters * 25 + 1024;
-        debug!("Reserving {} bytes for cues (estimated {} cue points, total duration {} ns)", estimated_cues_size, num_clusters, duration_ns);
+        debug!(
+            "Reserving {} bytes for cues (estimated {} cue points, total duration {} ns)",
+            estimated_cues_size, num_clusters, duration_ns
+        );
 
         self.cues_offset = self.writer.stream_position()?;
-        
+
         let void = Void {
             size: estimated_cues_size,
         };
         void.write_to(&mut self.writer)?;
-        
+
         // Record the ACTUAL total space occupied by the Void element (header + data)
         let end_of_reserved_space = self.writer.stream_position()?;
         self.reserved_cues_size = end_of_reserved_space - self.cues_offset;
@@ -138,23 +159,28 @@ impl Sink for FileSink {
     }
 
     fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {
-
         // Get cluster position before writing
         let cluster_position = self.writer.stream_position()?;
-        
+
         // Calculate cluster timestamp in nanoseconds
         let cluster_timestamp_ticks = cluster.timestamp.0;
         let cluster_timestamp_ns = cluster_timestamp_ticks * self.timescale;
-        
+
         // Add cue point if 15 seconds have passed since last cue
-        if cluster_timestamp_ns >= self.last_cue_timestamp_ns + CUE_INTERVAL_NS || self.cue_points.is_empty() {
-            self.cue_points.push((cluster_timestamp_ticks, cluster_position));
+        if cluster_timestamp_ns >= self.last_cue_timestamp_ns + CUE_INTERVAL_NS
+            || self.cue_points.is_empty()
+        {
+            self.cue_points
+                .push((cluster_timestamp_ticks, cluster_position));
             self.last_cue_timestamp_ns = cluster_timestamp_ns;
         }
-        
+
         cluster.write_to(&mut self.writer)?;
         self.writer.flush()?;
-        trace!("written cluster at position {}, timestamp {} ns", cluster_position, cluster_timestamp_ns);
+        trace!(
+            "written cluster at position {}, timestamp {} ns",
+            cluster_position, cluster_timestamp_ns
+        );
         Ok(())
     }
 
@@ -163,17 +189,17 @@ impl Sink for FileSink {
         // Generate and write cues from collected cue points
         if !self.cue_points.is_empty() && self.cues_offset > 0 {
             let segment_data_start = self.segment_start_offset;
-            
+
             let mut cues = Cues {
                 crc32: None,
                 cue_point: Vec::new(),
                 void: None,
             };
-            
+
             for (timestamp_ticks, cluster_position) in &self.cue_points {
                 // Calculate position relative to Segment data start
                 let relative_position = cluster_position - segment_data_start;
-                
+
                 let cue_point = CuePoint {
                     crc32: None,
                     cue_time: CueTime(*timestamp_ticks),
@@ -192,34 +218,35 @@ impl Sink for FileSink {
                 };
                 cues.cue_point.push(cue_point);
             }
-            
+
             // Record current position to seek back later
             self.writer.flush()?;
             let current_pos = self.writer.stream_position()?;
-            
+
             // Seek to the reserved space
             self.writer.seek(SeekFrom::Start(self.cues_offset))?;
-            
+
             // Try to serialize cues and truncate if necessary
             let mut cues_to_write = cues;
             let mut cues_buf = Vec::new();
             cues_to_write.write_to(&mut cues_buf)?;
-            
+
             // If cues are too large, truncate cue points until they fit
             if cues_buf.len() as u64 > self.reserved_cues_size {
                 let original_count = cues_to_write.cue_point.len();
-                
+
                 // Iteratively remove cue points from the end until it fits
-                while cues_buf.len() as u64 > self.reserved_cues_size && !cues_to_write.cue_point.is_empty() {
+                while cues_buf.len() as u64 > self.reserved_cues_size
+                    && !cues_to_write.cue_point.is_empty()
+                {
                     cues_to_write.cue_point.pop();
                     cues_buf.clear();
                     cues_to_write.write_to(&mut cues_buf)?;
                 }
 
-                
                 let kept_count = cues_to_write.cue_point.len();
                 let removed_count = original_count - kept_count;
-                
+
                 if removed_count > 0 {
                     warn!(
                         "Truncated cues: removed {} of {} cue points to fit in reserved space ({} bytes). Final size: {} bytes",
@@ -229,7 +256,7 @@ impl Sink for FileSink {
                         cues_buf.len()
                     );
                 }
-                
+
                 // If even an empty cues structure doesn't fit, we have a problem
                 if cues_buf.len() as u64 > self.reserved_cues_size {
                     return Err(crate::Error::InvalidConfig(format!(
@@ -241,18 +268,17 @@ impl Sink for FileSink {
             }
             trace!("cue buf size after truncation: {}", cues_buf.len());
 
-            
             self.writer.write_all(&cues_buf)?;
-            
+
             // If we have remaining reserved space, fill it with Void
             if (cues_buf.len() as u64) < self.reserved_cues_size {
                 let remaining = self.reserved_cues_size - cues_buf.len() as u64;
-                
+
                 // Calculate correct Void payload size by trial
                 // We need: void_header_size + payload_size = remaining
                 // Start with remaining-2 and adjust if header size would be bigger
                 let mut void_payload_size = remaining.saturating_sub(2);
-                
+
                 // Test if this size fits by serializing to a temp buffer
                 loop {
                     let test_void = Void {
@@ -263,7 +289,7 @@ impl Sink for FileSink {
                         if temp_buf.len() as u64 <= remaining {
                             // This size works
                             self.writer.write_all(&temp_buf)?;
-                            
+
                             // Pad any remaining bytes with zeros
                             let pad_bytes = remaining - temp_buf.len() as u64;
                             if pad_bytes > 0 {
@@ -272,7 +298,7 @@ impl Sink for FileSink {
                             break;
                         }
                     }
-                    
+
                     // If we get here, the Void was too large. Reduce payload and try again.
                     if void_payload_size == 0 {
                         // Can't fit a Void at all, just pad with zeros
@@ -282,14 +308,15 @@ impl Sink for FileSink {
                     void_payload_size = void_payload_size.saturating_sub(1);
                 }
             }
-            
+
             // Seek back to the original position
             self.writer.flush()?;
             self.writer.seek(SeekFrom::Start(current_pos))?;
         }
         // seek to segment start pos
-        self.writer.seek(SeekFrom::Start(self.segment_start_offset - 8))?; // we seek from begin of the elements data section back to the element size
-        let segment_length = (end_pos - self.segment_start_offset); 
+        self.writer
+            .seek(SeekFrom::Start(self.segment_start_offset - 8))?; // we seek from begin of the elements data section back to the element size
+        let segment_length = (end_pos - self.segment_start_offset);
         let vint_8byte = encode_vint_8_bytes(segment_length)?;
         self.writer.write_all(&vint_8byte)?;
         self.writer.flush()?;
@@ -298,7 +325,7 @@ impl Sink for FileSink {
     }
 
     fn does_support_container_format(&self, format: ContainerFormat) -> bool {
-        let is_mkv_support =  self.container_format == ContainerFormat::Mkv;
+        let is_mkv_support = self.container_format == ContainerFormat::Mkv;
         match format {
             ContainerFormat::Mkv => is_mkv_support,
             ContainerFormat::WebM => true,
@@ -385,14 +412,14 @@ mod tests {
     }
 }
 
-
-
-fn encode_vint_8_bytes( value: u64) -> Result<[u8;8]> {
+fn encode_vint_8_bytes(value: u64) -> Result<[u8; 8]> {
     // VInt64::new creates the minimal encoding; for fixed 8-byte we encode manually
     if value > 0x00FF_FFFF_FFFF_FFFF {
-        return Err(Error::InvalidConfig("Value too large for 8-byte VINT".into()));
+        return Err(Error::InvalidConfig(
+            "Value too large for 8-byte VINT".into(),
+        ));
     }
-    
+
     let bytes = [
         0x01,
         (value >> 48) as u8,
@@ -403,6 +430,6 @@ fn encode_vint_8_bytes( value: u64) -> Result<[u8;8]> {
         (value >> 8) as u8,
         value as u8,
     ];
-    
+
     Ok(bytes)
 }

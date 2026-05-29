@@ -4,7 +4,7 @@ use mkv_element::prelude::*;
 use std::io::Write;
 
 /// VTT-based sink implementation for writing WebVTT subtitle files
-/// 
+///
 /// This sink extracts subtitle data from MKV clusters and writes it
 /// as WebVTT format to any writer (file, memory buffer, HTTP response, etc.)
 pub struct VttSink<W: Write + Send> {
@@ -24,8 +24,6 @@ struct VttCue {
     settings: Option<String>,
     text: String,
 }
-
-
 
 impl<W: Write + Send> VttSink<W> {
     /// Create a new VTT sink that writes to the specified writer
@@ -47,7 +45,10 @@ impl<W: Write + Send> VttSink<W> {
         let milliseconds = timestamp_ms % 1000;
 
         if hours > 0 {
-            format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, milliseconds)
+            format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                hours, minutes, seconds, milliseconds
+            )
         } else {
             format!("{:02}:{:02}.{:03}", minutes, seconds, milliseconds)
         }
@@ -92,7 +93,9 @@ impl<W: Write + Send> Sink for VttSink<W> {
         _chapters: Option<&Chapters>,
     ) -> Result<()> {
         if self.initialized {
-            return Err(Error::InvalidConfig("VttSink already initialized".to_string()));
+            return Err(Error::InvalidConfig(
+                "VttSink already initialized".to_string(),
+            ));
         }
 
         // Find subtitle tracks
@@ -136,9 +139,9 @@ impl<W: Write + Send> Sink for VttSink<W> {
             return Err(Error::InvalidConfig("VttSink not initialized".to_string()));
         }
 
-        let subtitle_track = self.subtitle_track_number.ok_or_else(|| {
-            Error::InvalidConfig("No subtitle track configured".to_string())
-        })?;
+        let subtitle_track = self
+            .subtitle_track_number
+            .ok_or_else(|| Error::InvalidConfig("No subtitle track configured".to_string()))?;
 
         let cluster_timestamp_ns = cluster.timestamp.0 * self.timecode_scale;
 
@@ -164,8 +167,9 @@ impl<W: Write + Send> Sink for VttSink<W> {
                 mkv_element::ClusterBlock::Group(_) => {
                     let data = block.get_data()?.clone();
                     let timestamp = block.timestamp()?;
-                    let duration = block.get_block_duration()
-                        .ok_or_else(|| Error::InvalidConfig("Subtitle block missing duration".to_string()))?;
+                    let duration = block.get_block_duration().ok_or_else(|| {
+                        Error::InvalidConfig("Subtitle block missing duration".to_string())
+                    })?;
                     (data, timestamp, duration)
                 }
             };
@@ -191,7 +195,9 @@ impl<W: Write + Send> Sink for VttSink<W> {
             } else if block_data[0] & 0x10 != 0 {
                 4
             } else {
-                return Err(Error::InvalidConfig("Invalid track number VINT".to_string()));
+                return Err(Error::InvalidConfig(
+                    "Invalid track number VINT".to_string(),
+                ));
             };
 
             let frame_data_offset = track_vint_len + 3; // VINT + 2 bytes timestamp + 1 byte flags
@@ -254,7 +260,7 @@ impl<W: Write + Send> Sink for VttSink<W> {
         self.writer.flush()?;
         Ok(())
     }
-    
+
     fn does_support_container_format(&self, format: crate::ContainerFormat) -> bool {
         match format {
             ContainerFormat::Mkv => false,
@@ -273,7 +279,10 @@ mod tests {
         assert_eq!(VttSink::<Vec<u8>>::format_timestamp(0), "00:00.000");
         assert_eq!(VttSink::<Vec<u8>>::format_timestamp(5000), "00:05.000");
         assert_eq!(VttSink::<Vec<u8>>::format_timestamp(65000), "01:05.000");
-        assert_eq!(VttSink::<Vec<u8>>::format_timestamp(3665000), "01:01:05.000");
+        assert_eq!(
+            VttSink::<Vec<u8>>::format_timestamp(3665000),
+            "01:01:05.000"
+        );
         assert_eq!(VttSink::<Vec<u8>>::format_timestamp(12345), "00:12.345");
     }
 

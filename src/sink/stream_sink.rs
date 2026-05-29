@@ -1,25 +1,23 @@
 use std::io::Write;
-use std::sync::mpsc;
 
 use super::Sink;
-use crate::sink::ChannelWriterWrapper;
 use crate::{ContainerFormat, Error, Result};
 use log::trace;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 
-/// Stream-based sink implementation for writing MKV files to any stream
+/// Stream-based sink implementation for writing MKV/WebM to any stream.
 ///
-/// This sink writes to any `Write + Send` stream without managing cues,
-/// since seekable streams allow the consumer to navigate the file.
-pub struct StreamSink<W: Write + Send> {
-    writer: W,
+/// The writer is a trait object — pass a raw writer for MKV, or wrap it in
+/// `WebmFilterWriterSend` before passing for automatic WebM element filtering.
+pub struct StreamSink {
+    writer: Box<dyn Write + Send>,
     timescale: u64,
 }
 
-impl<W: Write + Send> StreamSink<W> {
-    /// Create a new stream sink that writes to the specified stream
-    pub fn new(writer: W) -> Result<Self> {
+impl StreamSink {
+    /// Create a new stream sink that writes to the specified stream.
+    pub fn new(writer: Box<dyn Write + Send>) -> Result<Self> {
         Ok(Self {
             writer,
             timescale: 1_000_000,
@@ -27,7 +25,7 @@ impl<W: Write + Send> StreamSink<W> {
     }
 }
 
-impl<W: Write + Send> Sink for StreamSink<W> {
+impl Sink for StreamSink {
     fn initialize(
         &mut self,
         tracks: &Tracks,
@@ -105,7 +103,7 @@ impl<W: Write + Send> Sink for StreamSink<W> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sink::SinkSender;
+    use crate::sink::{ChannelWriterWrapper, SinkSender};
 
     use super::*;
 
@@ -147,7 +145,7 @@ mod tests {
     #[test]
     fn test_stream_sink_basic() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel(100);
-        let mut sink = StreamSink::new(ChannelWriterWrapper::new(SinkSender::Sync(tx)))?;
+        let mut sink = StreamSink::new(Box::new(ChannelWriterWrapper::new(SinkSender::Sync(tx))))?;
 
         let tracks = make_tracks();
         let info = Info {
@@ -183,7 +181,7 @@ mod tests {
     fn test_stream_sink_no_cues() -> Result<()> {
         // Verify that the output doesn't contain cues
         let (tx, rx) = std::sync::mpsc::sync_channel(100);
-        let mut sink = StreamSink::new(ChannelWriterWrapper::new(SinkSender::Sync(tx)))?;
+        let mut sink = StreamSink::new(Box::new(ChannelWriterWrapper::new(SinkSender::Sync(tx))))?;
 
         let info = Info {
             timestamp_scale: TimestampScale(1_000_000),

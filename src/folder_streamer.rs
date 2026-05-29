@@ -2,6 +2,7 @@ use crate::{
     Codecs, ContainerFormat, Error, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState, Result,
     sink::{
         ChannelWriterWrapper, OutputSink, Sink, SinkSender, StreamSink, Uninitialized, VttSink,
+        WebmFilterWriterSend,
     },
     source::{CutInterval, FileSource, InputSource, Source, WebVttSource},
 };
@@ -259,7 +260,8 @@ impl FolderStreamer {
             let vtt_sink = VttSink::new(writer);
             OutputSink::new(Box::new(vtt_sink) as Box<dyn Sink>)
         } else {
-            let stream_sink = StreamSink::new(writer)?;
+            let filtered_writer = WebmFilterWriterSend::new(writer, true);
+            let stream_sink = StreamSink::new(Box::new(filtered_writer))?;
             OutputSink::new(Box::new(stream_sink) as Box<dyn Sink>)
         };
 
