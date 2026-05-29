@@ -8,6 +8,9 @@
 //! Two wrapper types are provided:
 //! - [`WebmFilterWriter`] for `W: Write` (used by `FileSink` with `BufWriter<File>`)
 //! - [`WebmFilterWriterSend`] for `W: Write + Send` (used by `StreamSink`)
+//!
+//! This is necessary because the mkv_element library is not webm aware. And some mandatory mkv
+//! elements such as audio emphasis are not supported in webm.
 
 use log::trace;
 use mkv_element::io::blocking_impl::ReadFrom;
@@ -19,7 +22,7 @@ mod webm_whitelist {
     include!(concat!(env!("OUT_DIR"), "/webm_whitelist.rs"));
 }
 pub use webm_whitelist::{
-    is_master_element, is_webm_element, WEBM_ELEMENT_COUNT, WEBM_ELEMENT_IDS,
+    WEBM_ELEMENT_COUNT, WEBM_ELEMENT_IDS, is_master_element, is_webm_element,
 };
 
 // ─── Void encoding ─────────────────────────────────────────────────────────
