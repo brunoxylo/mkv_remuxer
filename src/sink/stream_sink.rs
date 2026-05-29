@@ -2,15 +2,15 @@ use std::io::Write;
 use std::sync::mpsc;
 
 use super::Sink;
-use crate::sink::{ChannelWriterWrapper};
+use crate::sink::ChannelWriterWrapper;
 use crate::{ContainerFormat, Error, Result};
 use log::trace;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
 
 /// Stream-based sink implementation for writing MKV files to any stream
-/// 
-/// This sink writes to any `Write + Seek` stream without managing cues,
+///
+/// This sink writes to any `Write + Send` stream without managing cues,
 /// since seekable streams allow the consumer to navigate the file.
 pub struct StreamSink<W: Write + Send> {
     writer: W,
@@ -18,7 +18,6 @@ pub struct StreamSink<W: Write + Send> {
 }
 
 impl<W: Write + Send> StreamSink<W> {
-
     /// Create a new stream sink that writes to the specified stream
     pub fn new(writer: W) -> Result<Self> {
         Ok(Self {
@@ -36,13 +35,14 @@ impl<W: Write + Send> Sink for StreamSink<W> {
         ebml_header: &Ebml,
         chapters: Option<&Chapters>,
     ) -> Result<()> {
-
         match ebml_header.doc_type {
-            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::Mkv.to_string() => {},
-            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {},
+            Some(DocType(ref doc_type))
+                if doc_type.to_lowercase() == ContainerFormat::Mkv.to_string() => {}
+            Some(DocType(ref doc_type))
+                if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {}
             _ => {
                 return Err(Error::InvalidConfig(format!(
-                    "EBML header doc type must be mkv or webm for StreamSink", 
+                    "EBML header doc type must be mkv or webm for StreamSink",
                 )));
             }
         }
@@ -75,11 +75,10 @@ impl<W: Write + Send> Sink for StreamSink<W> {
     }
 
     fn write_cluster(&mut self, cluster: &Cluster, _track_number: u64) -> Result<()> {
-        
         // Calculate cluster timestamp in nanoseconds
         let cluster_timestamp_ticks = cluster.timestamp.0;
         let cluster_timestamp_ns = cluster_timestamp_ticks * self.timescale;
-        
+
         cluster.write_to(&mut self.writer)?;
         trace!("written cluster at timestamp {} ns", cluster_timestamp_ns);
         Ok(())
@@ -89,7 +88,7 @@ impl<W: Write + Send> Sink for StreamSink<W> {
         // No cues management needed for stream sink
         // Since the stream is seekable, consumers can navigate the file
         // without cue points
-        
+
         // Just flush any remaining buffered data
         self.writer.flush()?;
         Ok(())

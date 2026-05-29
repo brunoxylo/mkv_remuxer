@@ -13,7 +13,7 @@ mod vtt_sink;
 
 pub use file_sink::FileSink;
 pub use stream_sink::StreamSink;
-pub use util::{Initialized, OutputSink, Uninitialized};
+pub use util::{Initialized, OutputSink, Uninitialized, WebmFilterWriter, WebmFilterWriterSend};
 pub use vtt_sink::VttSink;
 
 /// Represents a sink/destination for MKV data (output file or stream)
