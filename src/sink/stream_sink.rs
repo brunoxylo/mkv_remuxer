@@ -61,15 +61,7 @@ impl<W: Write + Send> Sink for StreamSink<W> {
         info.write_to(&mut self.writer)?;
 
         // Write Tracks element inside the segment
-        match ebml_header.doc_type {
-            Some(DocType(ref doc_type)) if doc_type.to_lowercase() == ContainerFormat::WebM.to_string() => {
-                let patched_tracks = crate::sink::util::webm_patch::patch_tracks_for_webm(tracks)?;
-                self.writer.write_all(&patched_tracks)?;
-            }
-            _ => {
-                tracks.write_to(&mut self.writer)?;
-            }
-        }
+        tracks.write_to(&mut self.writer)?;
 
         // Write Chapters element inside the segment (if present)
         if let Some(chapters) = chapters {
