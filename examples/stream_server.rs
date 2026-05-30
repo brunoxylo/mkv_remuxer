@@ -278,7 +278,7 @@ fn process_video_request(
         OutputSink::from(Box::new(vtt_sink) as Box<dyn mkv_remuxer::Sink>)
     } else {
         let writer = ChannelWriterWrapper::new(SinkSender::Tokio(tx));
-        let stream_sink = StreamSink::new(writer)?;
+        let stream_sink = StreamSink::new(Box::new(writer))?;
         OutputSink::from(Box::new(stream_sink) as Box<dyn mkv_remuxer::Sink>)
     };
 
