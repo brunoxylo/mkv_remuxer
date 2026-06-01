@@ -72,8 +72,8 @@ pub struct ClusterWriteWrapper {
 impl ClusterWriteWrapper {
     /// Create a new cluster with the given starting timestamp in nanoseconds
     pub fn new(start_timestamp_ns: u64, timecode_scale: u64) -> Self {
-        // Convert nanoseconds to ticks
-        let start_timestamp_ticks = start_timestamp_ns / timecode_scale;
+        // Round-to-nearest (consistent with set_timestamp_ns rounding)
+        let start_timestamp_ticks = (start_timestamp_ns as f64 / timecode_scale as f64).round() as u64;
 
         Self {
             cluster: Cluster {

@@ -364,7 +364,11 @@ impl ClusterBlockExt for ClusterBlock {
         cluster_timestamp: u64,
         timecode_scale: u64,
     ) -> Result<(), Error> {
-        let new_ticks = time_ns / timecode_scale;
+        // Round-to-nearest instead of floor to avoid non-uniform audio frame
+        // spacing.  Floor division can turn uniform 20.833ms Opus intervals
+        // into alternating 20/21ms gaps, which causes Chrome's MSE to insert
+        // micro-gaps or overlaps that accumulate into audible A/V drift.
+        let new_ticks = (time_ns as f64 / timecode_scale as f64).round() as u64;
         let new_rel_ticks = new_ticks as i64 - cluster_timestamp as i64;
         let clamped = new_rel_ticks.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
         self.set_timestamp(clamped)
