@@ -354,9 +354,15 @@ impl<T: MkvReader> FileSource<T> {
         }
         // presort read clusters to enforce strict monotonicity not only inside tracks but also inside a cluster across all tracks
         // required by chrome MSE
-        output_cluster
-            .blocks
-            .sort_by(|a, b| a.timestamp().unwrap_or(0).cmp(&b.timestamp().unwrap_or(0)));
+        let cluster_timestamp = output_cluster.timestamp.0 as i64;
+        output_cluster.blocks.sort_by(|a, b| {
+            a.timestamp_ns(cluster_timestamp, self.timecode_scale)
+                .unwrap_or(0)
+                .cmp(
+                    &b.timestamp_ns(cluster_timestamp, self.timecode_scale)
+                        .unwrap_or(0),
+                )
+        });
 
         Ok(output_cluster)
     }
