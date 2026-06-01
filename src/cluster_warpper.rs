@@ -187,7 +187,7 @@ impl ClusterWriteWrapper {
 
     /// Consume the wrapper and return the completed cluster
     pub fn finish(self) -> Cluster {
-        // presort read clusters to enforce strict monotonicity not only inside tracks but also inside a cluster across all tracks
+        // presort written clusters to enforce strict monotonicity not only inside tracks but also inside a cluster across all tracks
         // required by chrome MSE
         let mut cluster = self.cluster;
         cluster
