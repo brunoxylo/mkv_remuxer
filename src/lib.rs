@@ -24,6 +24,7 @@ pub use test_utils::{
     MkvValidationReport, ValidationStats, get_input_duration_ns, validate_mkv_output,
 };
 
+use log::warn;
 use mkv_element::prelude::*;
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -40,9 +41,14 @@ pub enum ContainerFormat {
 }
 
 /// A list of codec names to use for the output container.
+/// Stores both the Matroska codec ID strings and the original `TrackEntry`
+/// objects so that codec-specific MIME parameters (e.g. AV1 profile/level)
+/// can be derived from the actual track metadata.
 #[derive(Debug, Clone)]
 pub struct Codecs {
-    inner: Vec<String>,
+    /// Deduplicated (codec_id, representative TrackEntry) pairs, sorted by
+    /// type priority (video → audio → subtitle) then alphabetically.
+    inner: Vec<(String, TrackEntry)>,
 }
 
 /// Returns a sort-priority for a Matroska codec ID so that video codecs
@@ -58,33 +64,135 @@ fn codec_type_priority(codec_id: &str) -> u8 {
 
 impl Codecs {
     pub(crate) fn new(tracks: &Tracks) -> Self {
-        let mut codecs = Vec::new();
+        let mut entries: Vec<(String, TrackEntry)> = Vec::new();
         for track in &tracks.track_entry {
-            codecs.push(track.codec_id.0.to_string());
+            let codec_id = track.codec_id.0.to_string();
+            entries.push((codec_id, track.clone()));
         }
-        // Sort by type (video → audio → subtitle) then alphabetically, and deduplicate.
-        codecs.sort_by(|a, b| {
+        // Sort by type (video → audio → subtitle) then alphabetically, and deduplicate
+        // by codec_id (keep first TrackEntry encountered for each unique codec_id).
+        entries.sort_by(|(a, _), (b, _)| {
             codec_type_priority(a)
                 .cmp(&codec_type_priority(b))
                 .then_with(|| a.cmp(b))
         });
-        codecs.dedup();
-        Self { inner: codecs }
+        entries.dedup_by(|(a, _), (b, _)| a == b);
+        Self { inner: entries }
     }
 }
 
-/// Convert a Matroska codec ID (e.g. `V_VP9`, `A_OPUS`, `D_WEBVTT/SUBTITLES`)
-/// to the ISO-standard MIME codec name used in the `codecs` parameter.
-/// Known codecs are mapped explicitly (e.g. `V_AV1` → `av01.0.19H.10`).
-/// Subtitle/data codecs (`D_`, `S_`) are skipped since they aren't relevant for
-/// the MIME codecs parameter.
-fn mkv_codec_id_to_mime(codec_id: &str) -> Option<String> {
-    // Explicit mappings for known codecs to their ISO-standard identifiers.
-    // AV1 requires profile/level/bit-depth for MSE isTypeSupported() to accept it.
-    // We declare maximally permissive params so the SourceBuffer won't reject
-    // high-res or HDR frames: Main profile (0), Level 6.3 High tier, 10-bit.
+/// Build the AV1 codec string from the AV1CodecConfigurationRecord stored
+/// in `CodecPrivate` and from the Matroska `Video > Colour` element.
+///
+/// Format (per <https://aomediacodec.github.io/av1-isobmff/#codecsparam>):
+///   `av01.<P>.<LLT>.<DD>[.<M>.<CCC>.<cp>.<tc>.<mc>.<F>]`
+///
+/// Falls back to the conservative default `av01.0.19H.10` if the CodecPrivate
+/// is missing or too short to parse.
+fn av1_codec_string(track: &TrackEntry) -> String {
+    const FALLBACK: &str = "av01.0.19H.10";
+
+    let codec_private = match track.codec_private.as_ref() {
+        Some(cp) => &cp.0,
+        None => {
+            warn!("AV1 track has no CodecPrivate – using fallback codec string");
+            return FALLBACK.into();
+        }
+    };
+
+    // AV1CodecConfigurationRecord is at least 4 bytes.
+    if codec_private.len() < 4 {
+        warn!(
+            "AV1 CodecPrivate too short ({} bytes) – using fallback codec string",
+            codec_private.len()
+        );
+        return FALLBACK.into();
+    }
+
+    // ── Parse the AV1CodecConfigurationRecord ────────────────────────
+    // Byte 0: marker(1) | version(7)
+    // Byte 1: seq_profile(3) | seq_level_idx_0(5)
+    // Byte 2: seq_tier_0(1) | high_bitdepth(1) | twelve_bit(1) | monochrome(1)
+    //         | chroma_subsampling_x(1) | chroma_subsampling_y(1) | chroma_sample_position(2)
+    // Byte 3: reserved(3) | initial_presentation_delay_present(1) | ...(4)
+    let byte1 = codec_private[1];
+    let byte2 = codec_private[2];
+
+    let seq_profile = (byte1 >> 5) & 0x07;
+    let seq_level_idx = byte1 & 0x1F;
+    let seq_tier = (byte2 >> 7) & 0x01;
+    let high_bitdepth = (byte2 >> 6) & 0x01;
+    let twelve_bit = (byte2 >> 5) & 0x01;
+    let monochrome = (byte2 >> 4) & 0x01;
+    let chroma_subsampling_x = (byte2 >> 3) & 0x01;
+    let chroma_subsampling_y = (byte2 >> 2) & 0x01;
+    let chroma_sample_position = byte2 & 0x03;
+
+    // Derive bit depth per the AV1 spec.
+    let bit_depth: u8 = if high_bitdepth != 0 {
+        if twelve_bit != 0 { 12 } else { 10 }
+    } else {
+        8
+    };
+
+    let tier_char = if seq_tier == 0 { 'M' } else { 'H' };
+
+    // chromaSubsampling = "{subsampling_x}{subsampling_y}{chroma_sample_position}"
+    let chroma_subsampling = format!(
+        "{}{}{}",
+        chroma_subsampling_x, chroma_subsampling_y, chroma_sample_position
+    );
+
+    // Colour description from the Matroska Colour element (defaults per CICP
+    // when absent: BT.709 = 1/1/1, studio swing = 0).
+    let (color_primaries, transfer_characteristics, matrix_coefficients, video_full_range) =
+        if let Some(video) = track.video.as_ref() {
+            if let Some(colour) = video.colour.as_ref() {
+                let cp = colour.primaries.0;
+                let tc = colour.transfer_characteristics.0;
+                let mc = colour.matrix_coefficients.0;
+                // Matroska Range: 0=unspecified, 1=broadcast, 2=full, 3=derived
+                // AV1 videoFullRangeFlag: 0=studio/limited, 1=full
+                let vfr = if colour.range.0 == 2 { 1u64 } else { 0u64 };
+                (cp, tc, mc, vfr)
+            } else {
+                (1u64, 1u64, 1u64, 0u64)
+            }
+        } else {
+            (1u64, 1u64, 1u64, 0u64)
+        };
+
+    // Build the full codec string.
+    // All numeric fields after the 4CC are zero-padded to 2 digits, except
+    // videoFullRangeFlag which is a single digit.
+    format!(
+        "av01.{}.{:02}{}.{:02}.{}.{}.{:02}.{:02}.{:02}.{}",
+        seq_profile,
+        seq_level_idx,
+        tier_char,
+        bit_depth,
+        monochrome,
+        chroma_subsampling,
+        color_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+        video_full_range,
+    )
+}
+
+/// Convert a Matroska `TrackEntry` to the ISO-standard MIME codec name used
+/// in the `codecs` parameter.
+///
+/// For AV1 tracks the codec string is derived from the actual track metadata
+/// (CodecPrivate + Colour element).  Other codecs use fixed mappings.
+/// Subtitle/data codecs (`D_`, `S_`) are skipped since they aren't relevant
+/// for the MIME codecs parameter.
+fn track_entry_to_mime(track: &TrackEntry) -> Option<String> {
+    let codec_id = track.codec_id.0.as_str();
+
+    // Explicit mappings for known codecs.
     match codec_id {
-        "V_AV1" => return Some("av01.0.19H.10".into()),
+        "V_AV1" => return Some(av1_codec_string(track)),
         "V_VP9" => return Some("vp9".into()),
         "V_VP8" => return Some("vp8".into()),
         "A_OPUS" => return Some("opus".into()),
@@ -113,7 +221,7 @@ impl Codecs {
         let mime_codecs: Vec<String> = self
             .inner
             .iter()
-            .filter_map(|c| mkv_codec_id_to_mime(c))
+            .filter_map(|(_, te)| track_entry_to_mime(te))
             .collect();
         if mime_codecs.is_empty() {
             prefix.to_string()
@@ -123,16 +231,14 @@ impl Codecs {
     }
 
     pub fn get_mkv_codec_ids(&self) -> Vec<String> {
-        self.inner.clone()
+        self.inner.iter().map(|(id, _)| id.clone()).collect()
     }
 
     pub fn get_mime_codec_ids(&self) -> Vec<String> {
-        let mime_codecs: Vec<String> = self
-            .inner
+        self.inner
             .iter()
-            .filter_map(|c| mkv_codec_id_to_mime(c))
-            .collect();
-        mime_codecs
+            .filter_map(|(_, te)| track_entry_to_mime(te))
+            .collect()
     }
 }
 
@@ -169,16 +275,29 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
+    /// Helper: build a minimal `TrackEntry` stub carrying only a `CodecId`.
+    /// Used by unit tests that don't need real AV1 CodecPrivate data.
+    fn dummy_track_entry(codec_id: &str) -> TrackEntry {
+        let mut te = TrackEntry::default();
+        te.codec_id = CodecId(codec_id.to_string());
+        te
+    }
+
     /// Helper: build a Codecs from raw Matroska codec ID strings.
+    /// Creates dummy `TrackEntry` stubs so unit tests compile without real
+    /// track metadata.
     fn codecs_from_raw(ids: &[&str]) -> Codecs {
-        let mut inner: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        inner.sort_by(|a, b| {
+        let mut entries: Vec<(String, TrackEntry)> = ids
+            .iter()
+            .map(|s| (s.to_string(), dummy_track_entry(s)))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| {
             codec_type_priority(a)
                 .cmp(&codec_type_priority(b))
                 .then_with(|| a.cmp(b))
         });
-        inner.dedup();
-        Codecs { inner }
+        entries.dedup_by(|(a, _), (b, _)| a == b);
+        Codecs { inner: entries }
     }
 
     /// Helper: read the Tracks element from a test file and build Codecs.
@@ -192,46 +311,140 @@ mod tests {
         Codecs::new(&tracks)
     }
 
-    // ── mkv_codec_id_to_mime unit tests ─────────────────────────────────
+    // ── track_entry_to_mime unit tests ──────────────────────────────────
 
     #[test]
-    fn test_mkv_codec_id_to_mime_video() {
-        assert_eq!(mkv_codec_id_to_mime("V_VP9"), Some("vp9".into()));
-        assert_eq!(mkv_codec_id_to_mime("V_VP8"), Some("vp8".into()));
-        assert_eq!(mkv_codec_id_to_mime("V_AV1"), Some("av01.0.19H.10".into()));
+    fn test_track_entry_to_mime_video() {
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("V_VP9")),
+            Some("vp9".into())
+        );
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("V_VP8")),
+            Some("vp8".into())
+        );
+        // AV1 without CodecPrivate falls back to the conservative default
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("V_AV1")),
+            Some("av01.0.19H.10".into())
+        );
     }
 
     #[test]
-    fn test_mkv_codec_id_to_mime_audio() {
-        assert_eq!(mkv_codec_id_to_mime("A_OPUS"), Some("opus".into()));
-        assert_eq!(mkv_codec_id_to_mime("A_VORBIS"), Some("vorbis".into()));
+    fn test_track_entry_to_mime_audio() {
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("A_OPUS")),
+            Some("opus".into())
+        );
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("A_VORBIS")),
+            Some("vorbis".into())
+        );
     }
 
     #[test]
-    fn test_mkv_codec_id_to_mime_strips_suffix() {
+    fn test_track_entry_to_mime_strips_suffix() {
         // Only the major codec ID should be kept
         assert_eq!(
-            mkv_codec_id_to_mime("V_MPEG4/ISO/ASP"),
+            track_entry_to_mime(&dummy_track_entry("V_MPEG4/ISO/ASP")),
             Some("mpeg4".into())
         );
         assert_eq!(
-            mkv_codec_id_to_mime("A_AAC/MPEG2/LC/SBR"),
+            track_entry_to_mime(&dummy_track_entry("A_AAC/MPEG2/LC/SBR")),
             Some("aac".into())
         );
     }
 
     #[test]
-    fn test_mkv_codec_id_to_mime_skips_subtitle_and_data() {
-        assert_eq!(mkv_codec_id_to_mime("D_WEBVTT/SUBTITLES"), None);
-        assert_eq!(mkv_codec_id_to_mime("D_WEBVTT/CAPTIONS"), None);
-        assert_eq!(mkv_codec_id_to_mime("S_TEXT/UTF8"), None);
+    fn test_track_entry_to_mime_skips_subtitle_and_data() {
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("D_WEBVTT/SUBTITLES")),
+            None
+        );
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("D_WEBVTT/CAPTIONS")),
+            None
+        );
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("S_TEXT/UTF8")),
+            None
+        );
     }
 
     #[test]
-    fn test_mkv_codec_id_to_mime_unknown_prefix() {
-        assert_eq!(mkv_codec_id_to_mime("X_SOMETHING"), None);
-        assert_eq!(mkv_codec_id_to_mime(""), None);
-        assert_eq!(mkv_codec_id_to_mime("V"), None);
+    fn test_track_entry_to_mime_unknown_prefix() {
+        assert_eq!(
+            track_entry_to_mime(&dummy_track_entry("X_SOMETHING")),
+            None
+        );
+        assert_eq!(track_entry_to_mime(&dummy_track_entry("")), None);
+        assert_eq!(track_entry_to_mime(&dummy_track_entry("V")), None);
+    }
+
+    // ── av1_codec_string unit tests ────────────────────────────────────
+
+    #[test]
+    fn test_av1_codec_string_parses_config_record() {
+        use bytes::Bytes;
+        // Construct a synthetic AV1CodecConfigurationRecord:
+        // Profile 0, Level 4 (seq_level_idx=4), Main tier, 10-bit, non-mono,
+        // 4:2:0 chroma (subsampling_x=1, subsampling_y=1), sample_position=0
+        let mut te = dummy_track_entry("V_AV1");
+        // Byte 0: marker=1 (0x80) | version=1 => 0x81
+        // Byte 1: seq_profile=0 (0b000) | seq_level_idx=4 (0b00100) => 0x04
+        // Byte 2: seq_tier=0 | high_bitdepth=1 | twelve_bit=0 | monochrome=0
+        //         | chroma_subsampling_x=1 | chroma_subsampling_y=1 | chroma_sample_position=0
+        //       = 0b01001100 => 0x4C
+        // Byte 3: reserved=0, no delay => 0x00
+        te.codec_private = Some(CodecPrivate(Bytes::from_static(&[0x81, 0x04, 0x4C, 0x00])));
+        // Add Colour metadata: BT.709 (1/1/1), studio range
+        te.video = Some(Video {
+            colour: Some(Colour {
+                primaries: Primaries(1),
+                transfer_characteristics: TransferCharacteristics(1),
+                matrix_coefficients: MatrixCoefficients(1),
+                range: Range(1), // broadcast = studio swing
+                ..Colour::default()
+            }),
+            ..Video::default()
+        });
+
+        let result = av1_codec_string(&te);
+        // av01.0.04M.10.0.110.01.01.01.0
+        assert_eq!(result, "av01.0.04M.10.0.110.01.01.01.0");
+    }
+
+    #[test]
+    fn test_av1_codec_string_hdr_content() {
+        use bytes::Bytes;
+        // Profile 0, Level 13 (4.1), High tier, 10-bit, non-mono,
+        // 4:2:0 (sub_x=1, sub_y=1, pos=0), BT.2020 primaries (9),
+        // PQ transfer (16), BT.2020 matrix (9), full range
+        let mut te = dummy_track_entry("V_AV1");
+        // Byte 1: profile=0, level=13 => 0x0D
+        // Byte 2: tier=1 | high_bitdepth=1 | twelve_bit=0 | mono=0
+        //         | sub_x=1 | sub_y=1 | pos=0
+        //       = 0b11001100 => 0xCC
+        te.codec_private = Some(CodecPrivate(Bytes::from_static(&[0x81, 0x0D, 0xCC, 0x00])));
+        te.video = Some(Video {
+            colour: Some(Colour {
+                primaries: Primaries(9),
+                transfer_characteristics: TransferCharacteristics(16),
+                matrix_coefficients: MatrixCoefficients(9),
+                range: Range(2), // full range
+                ..Colour::default()
+            }),
+            ..Video::default()
+        });
+
+        let result = av1_codec_string(&te);
+        assert_eq!(result, "av01.0.13H.10.0.110.09.16.09.1");
+    }
+
+    #[test]
+    fn test_av1_codec_string_no_codec_private_fallback() {
+        let te = dummy_track_entry("V_AV1");
+        assert_eq!(av1_codec_string(&te), "av01.0.19H.10");
     }
 
     // ── Codecs::to_mime_type unit tests ─────────────────────────────────
@@ -244,10 +457,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mime_type_webm_av1_opus() {
+    fn test_to_mime_type_webm_av1_opus_fallback() {
+        // With dummy TrackEntries (no CodecPrivate), AV1 falls back to default
         let codecs = codecs_from_raw(&["V_AV1", "A_OPUS"]);
         let mime = codecs.to_mime_type(ContainerFormat::WebM);
-        // Sorted by type priority: V_AV1 (video) before A_OPUS (audio)
         assert_eq!(mime, "video/webm; codecs=\"av01.0.19H.10,opus\"");
     }
 
@@ -284,11 +497,26 @@ mod tests {
             codecs.get_mkv_codec_ids(),
             vec!["V_AV1", "A_OPUS", "D_WEBVTT/SUBTITLES"]
         );
-        // Subtitle codecs are filtered out for MIME
-        assert_eq!(codecs.get_mime_codec_ids(), vec!["av01.0.19H.10", "opus"]);
-        assert_eq!(
-            codecs.to_mime_type(ContainerFormat::WebM),
-            "video/webm; codecs=\"av01.0.19H.10,opus\""
+        // The AV1 codec string is now derived from the file's actual metadata
+        let mime_ids = codecs.get_mime_codec_ids();
+        assert_eq!(mime_ids.len(), 2);
+        assert!(
+            mime_ids[0].starts_with("av01."),
+            "AV1 MIME codec should start with 'av01.', got: {}",
+            mime_ids[0]
+        );
+        assert_eq!(mime_ids[1], "opus");
+
+        let mime = codecs.to_mime_type(ContainerFormat::WebM);
+        assert!(
+            mime.starts_with("video/webm; codecs=\"av01."),
+            "Full MIME type should contain av01 codec string, got: {}",
+            mime
+        );
+        assert!(
+            mime.contains(",opus\""),
+            "Full MIME type should contain opus, got: {}",
+            mime
         );
     }
 
