@@ -187,7 +187,13 @@ impl ClusterWriteWrapper {
 
     /// Consume the wrapper and return the completed cluster
     pub fn finish(self) -> Cluster {
-        self.cluster
+        // presort read clusters to enforce strict monotonicity not only inside tracks but also inside a cluster across all tracks
+        // required by chrome MSE
+        let mut cluster = self.cluster;
+        cluster
+            .blocks
+            .sort_by(|a, b| a.timestamp().unwrap_or(0).cmp(&b.timestamp().unwrap_or(0)));
+        cluster
     }
 
     /// Get a reference to the cluster without consuming it
