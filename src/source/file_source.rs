@@ -269,7 +269,7 @@ impl<T: MkvReader> FileSource<T> {
             None => None,
         };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
-        cluster.timestamp.0 = (shifted_ns / self.output_timecode_scale as i64).max(0) as u64;
+        cluster.timestamp.0 = ((shifted_ns as f64 / self.output_timecode_scale as f64).round()).max(0.0) as u64;
         let shifted_cluster_ticks = cluster.timestamp.0;
 
         let mut filtered = Vec::with_capacity(orig_block_count);
@@ -352,11 +352,9 @@ impl<T: MkvReader> FileSource<T> {
                 self.end_cluster_pos.as_ref().map(|e| e.get_timestamp_ns())
             );
         }
-        // presort read clusters to enforce strict monotonicity not only inside tracks but also inside a cluster across all tracks
-        // required by chrome MSE
-        output_cluster
-            .blocks
-            .sort_by(|a, b| a.timestamp().unwrap_or(0).cmp(&b.timestamp().unwrap_or(0)));
+        // NOTE: We do NOT sort here — the final sort happens in ClusterWriteWrapper::finish().
+        // Sorting twice can cause subtle interleaving issues between audio/video at the
+        // same tick, triggering audio cracks in Chrome's strict MSE demuxer.
 
         Ok(output_cluster)
     }

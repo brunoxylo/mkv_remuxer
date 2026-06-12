@@ -5,10 +5,16 @@ use crate::{
 };
 use log::{debug, warn};
 use mkv_element::{ClusterBlock, prelude::*};
+use std::collections::HashMap;
 
 pub struct MeltingPot {
     sources_mappings: SourcesMappings,
     clusters: Vec<Option<ClusterReadWrapper>>,
+    /// Per-track audio timestamp grid correction state.
+    /// Maps output track number → (anchor_ns, frame_count, frame_dur_ns).
+    /// Persists across cluster boundaries to maintain a perfectly uniform
+    /// audio timestamp grid for the entire remux session.
+    audio_grid: HashMap<u64, (u64, u64, u64)>,
 }
 
 impl MeltingPot {
@@ -19,6 +25,7 @@ impl MeltingPot {
         Self {
             sources_mappings,
             clusters: initial_clusters,
+            audio_grid: HashMap::new(),
         }
     }
     pub fn generate_next_cluster(&mut self) -> Result<Option<Cluster>> {
@@ -113,9 +120,37 @@ impl MeltingPot {
                                 let track_kind = self
                                     .sources_mappings
                                     .get_track_kind(lowest_index as u64, input_track_index)?;
+
+                                // For audio blocks, snap timestamps to a uniform grid to eliminate
+                                // sub-timescale jitter inherited from the source file.
+                                // Opus encodes exact 20ms frames, but when stored with a 1ms
+                                // timescale, quantization creates alternating 19ms/21ms gaps that
+                                // cause audio cracks and A/V drift in Chrome's strict MSE.
+                                let effective_timestamp_ns = if track_kind == crate::block_ext::TrackKind::Audio {
+                                    let entry = self.audio_grid.entry(output_trackindex).or_insert_with(|| {
+                                        // Initialize: anchor at first audio block, 0 frames seen, 20ms default
+                                        (lowest_timestamp_ns, 0, 20_000_000)
+                                    });
+                                    let (anchor_ns, frame_count, frame_dur_ns) = entry;
+                                    // Re-estimate frame duration from the running average
+                                    // to handle codecs other than 20ms Opus.
+                                    if *frame_count > 0 {
+                                        let elapsed = lowest_timestamp_ns.saturating_sub(*anchor_ns);
+                                        let est = elapsed as f64 / *frame_count as f64;
+                                        // Round to nearest 1ms to get a clean grid quantum
+                                        let est_rounded = ((est / 1_000_000.0).round() as u64).max(1) * 1_000_000;
+                                        *frame_dur_ns = est_rounded;
+                                    }
+                                    let corrected = *anchor_ns + *frame_count * *frame_dur_ns;
+                                    *frame_count += 1;
+                                    corrected
+                                } else {
+                                    lowest_timestamp_ns
+                                };
+
                                 match o_cluster.add_block(
                                     &block,
-                                    lowest_timestamp_ns,
+                                    effective_timestamp_ns,
                                     Some(output_trackindex),
                                     Some(track_kind),
                                 ) {

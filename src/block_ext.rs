@@ -136,7 +136,7 @@ impl ClusterExt for Cluster {
         self.timestamp.0 * timecode_scale
     }
     fn set_timestamp_ns(&mut self, timestamp_ns: u64, timecode_scale: u64) {
-        self.timestamp.0 = timestamp_ns / timecode_scale;
+        self.timestamp.0 = ((timestamp_ns as f64) / (timecode_scale as f64)).round() as u64;
     }
     fn get_keyframes(&self, track_num: u64) -> Vec<usize> {
         self.blocks
