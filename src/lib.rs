@@ -1,9 +1,10 @@
 mod block_ext;
 mod cluster_warpper;
 mod error;
-pub mod folder_streamer;
+pub mod session_streamer;
 mod metling_pot;
 mod remuxer;
+pub mod session;
 pub mod sink;
 pub mod source;
 mod source_mappings;

@@ -19,21 +19,22 @@ pub struct ChunkedSinkHandle {
 impl ChunkedSinkHandle {
     /// Take all buffered data as an immutable `Bytes`, leaving the buffer empty
     /// but keeping its allocation for reuse.
-    pub fn next_segment(&self) -> Bytes {
-        // unwrap allowed the bc when the mutex panicks other parts of the app panicked before
-        let mut buf = self.buffer.lock().unwrap();
-        buf.split().freeze()
+    pub fn next_segment(&self) -> Result<Bytes> {
+        // unwrap allowed the bc when both holders of the mutex are in the same thread
+        // so when one panics the other will too
+        let mut buf = self.buffer.lock()?;
+        Ok(buf.split().freeze())
     }
 
     /// Returns the number of bytes currently buffered.
-    pub fn len(&self) -> usize {
-        let buf = self.buffer.lock().unwrap();
-        buf.len()
+    pub fn len(&self) -> Result<usize> {
+        let buf = self.buffer.lock()?;
+        Ok(buf.len())
     }
 
-    pub fn is_empty(&self) -> bool {
-        let buf = self.buffer.lock().unwrap();
-        buf.is_empty()
+    pub fn is_empty(&self) -> Result<bool> {
+        let buf = self.buffer.lock()?;
+        Ok(buf.is_empty())
     }
 }
 
@@ -93,7 +94,7 @@ impl Sink for ChunkedStreamSink {
             }
         };
         let is_webm = self.container_format == ContainerFormat::WebM;
-        let mut buf = self.buffer.lock().unwrap();
+        let mut buf = self.buffer.lock()?;
         let mut writer = WebmFilterWriterSend::new((&mut *buf).writer(), is_webm);
         // Write EBML header
         ebml_header.write_to(&mut writer)?;
@@ -127,7 +128,7 @@ impl Sink for ChunkedStreamSink {
         let cluster_timestamp_ticks = cluster.timestamp.0;
         let cluster_timestamp_ns = cluster_timestamp_ticks * self.timescale;
         let is_webm = self.container_format == ContainerFormat::WebM;
-        let mut buf = self.buffer.lock().unwrap();
+        let mut buf = self.buffer.lock()?;
         let mut writer = WebmFilterWriterSend::new((&mut *buf).writer(), is_webm);
         cluster.write_to(&mut writer)?;
         trace!("written cluster at timestamp {} ns", cluster_timestamp_ns);
@@ -135,7 +136,7 @@ impl Sink for ChunkedStreamSink {
     }
 
     fn finalize(&mut self) -> Result<()> {
-        let mut buf = self.buffer.lock().unwrap();
+        let mut buf = self.buffer.lock()?;
         *buf = BytesMut::new();
         Ok(())
     }

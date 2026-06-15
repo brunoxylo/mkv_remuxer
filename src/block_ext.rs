@@ -538,10 +538,14 @@ impl TracksExt for Tracks {
             .iter()
             .filter_map(|te| {
                 let kind = TrackKind::from_u64(te.track_type.0);
-                if track_kind.is_none() || track_kind.unwrap() == kind {
-                    Some(te.track_number.0)
+                if let Some(t_kind) = track_kind {
+                    if t_kind == kind {
+                        Some(te.track_number.0)
+                    } else {
+                        None
+                    }
                 } else {
-                    None
+                    Some(te.track_number.0)
                 }
             })
             .collect()

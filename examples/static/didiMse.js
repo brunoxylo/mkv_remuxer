@@ -26,16 +26,38 @@ function _ebmlVintLength(byte) {
 }
 
 class DidiMse extends DidiPlayer {
-    constructor(videoElement, endpointPath) {
-        super(videoElement, endpointPath);
+    constructor(videoElement, endpointPath, sessionBase = null) {
+        super(videoElement, endpointPath, sessionBase);
         this._seekAbort = null;
         this._activeMediaSource = null;
         this._firstSeek = true;  // auto-play on first canplay (replaces HTML autoplay attr)
+
+        // Session state
+        this._sessionId = null;
+        this._clientId = DidiMse._getOrCreateClientId();
 
         // Inline subtitle state
         this._inlineSubTrackId = -1;       // original track ID (for mappings request)
         this._inlineSubOutputTrack = -1;   // track number in the OUTPUT stream (for EBML scanner)
         this._inlineSubCues = [];
+    }
+
+    static _getOrCreateClientId() {
+        let id = localStorage.getItem('didi_client_id');
+        if (!id) {
+            id = crypto.randomUUID();
+            localStorage.setItem('didi_client_id', id);
+        }
+        return id;
+    }
+
+    destroy() {
+        if (this._seekAbort) this._seekAbort.abort();
+        if (this._sessionId) {
+            // Fire-and-forget DELETE
+            fetch(`${this.sessionBase}/session/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
+            this._sessionId = null;
+        }
     }
 
     _onVideoTrackSet(currentAbsTime) {
@@ -52,52 +74,66 @@ class DidiMse extends DidiPlayer {
         console.debug(`[DidiMse] seek() called with seconds=${seconds}`);
         const wasPlaying = !this.video.paused;
 
-        let currentAbsTime = this.video.currentTime + (this.currentSeekOffset || 0);
-        let diff = Math.abs(seconds - currentAbsTime);
-        let seekMode = (diff > 60) ? 'snap' : 'snap_prev';
-
+        let seekMode = 'snap_prev';
         let mappings = `${this.activeFileIndex}_${this.activeVideoTrackId}`;
         if (this.activeAudioFileIndex === undefined) this.activeAudioFileIndex = this.activeFileIndex;
         mappings += `,${this.activeAudioFileIndex}_${this.activeAudioTrackId}`;
 
-        // If inline subtitle extraction is active, include the subtitle track in mappings
-        // The remuxer renumbers tracks based on position: video=1, audio=2, subtitle=3
         if (this._inlineSubTrackId > 0 && this.activeSubtitleFileIndex >= 0) {
             mappings += `,${this.activeSubtitleFileIndex}_${this._inlineSubTrackId}`;
-            // Count commas + 1 to get the 1-based output track number for the subtitle
-            this._inlineSubOutputTrack = mappings.split(',').length; // = 3
+            this._inlineSubOutputTrack = mappings.split(',').length;
         }
 
-        const url = `${this.apiBase}/remux?mappings=${mappings}&seek=${seekMode}&start=${seconds}`;
-
+        // Abort previous session/seek
         if (this._seekAbort) this._seekAbort.abort();
         const controller = new AbortController();
         this._seekAbort = controller;
 
+        // Destroy previous session
+        if (this._sessionId) {
+            fetch(`${this.sessionBase}/session/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
+            this._sessionId = null;
+        }
+
         try {
-            const res = await fetch(url, {
+            // 1. Create session
+            const createRes = await fetch(`${this.sessionBase}/session`, {
+                method: 'POST',
                 signal: controller.signal,
-                headers: { 'Accept-Encoding': 'identity' },
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    client_id: this._clientId,
+                    mappings: mappings,
+                    start: seconds,
+                    seek: seekMode,
+                }),
             });
-            if (!res.ok) {
-                const errText = await res.text();
-                this._emitError(DidiErrorType.NETWORK, errText);
+            if (!createRes.ok) {
+                this._emitError(DidiErrorType.NETWORK, await createRes.text());
                 return;
             }
+            const session = await createRes.json();
+            this._sessionId = session.session_id;
+            const mimeType = session.mime_type;
+            this.currentSeekOffset = session.start_sec || seconds;
+            console.info(`[DidiMse] Session created: ${session.session_id}, mime: ${mimeType}`);
 
-            const headerStart = parseFloat(res.headers.get('x-media-start-sec'));
-            this.currentSeekOffset = !isNaN(headerStart) ? headerStart : seconds;
-            let mimeType = res.headers.get('content-type') || 'video/webm';
-            console.debug(`[DidiMse] Server Content-Type: "${mimeType}" | MSE supported: ${_MSE ? _MSE.isTypeSupported(mimeType) : 'no MSE'}`);
+            // 2. Get init segment (step 0)
+            const initRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
+                signal: controller.signal,
+            });
+            if (!initRes.ok) {
+                this._emitError(DidiErrorType.NETWORK, 'Failed to fetch init segment');
+                return;
+            }
+            const initData = new Uint8Array(await initRes.arrayBuffer());
 
             this._inlineSubCues = [];
-            // Remove only static blob-URL tracks; preserve the dynamic track element.
             this.video.querySelectorAll('track').forEach(t => {
-                if (t === this._dynamicTrackEl) return; // keep it
+                if (t === this._dynamicTrackEl) return;
                 if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
                 t.remove();
             });
-            // Clear cues from the dynamic track so stale subtitles don't linger
             if (this._dynamicTrack && this._dynamicTrack.cues) {
                 Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
             }
@@ -106,575 +142,183 @@ class DidiMse extends DidiPlayer {
                 this._subtitleBlobUrl = null;
             }
 
-            if (_MSE && _MSE.isTypeSupported(mimeType)) {
-                console.info('[DidiMse] ✓ MSE path entered, creating MediaSource…');
-                const ms = new _MSE();
-                this._activeMediaSource = ms;
-                const objectUrl = URL.createObjectURL(ms);
-
-                // With snap_prev the stream starts at the previous keyframe,
-                // so we need to seek the video forward to the actual requested time.
-                const seekOffsetInStream = (seekMode === 'snap_prev' && !isNaN(headerStart))
-                    ? Math.max(0, seconds - headerStart)
-                    : 0;
-
-                const onCanPlay = () => {
-                    console.debug('[DidiMse] ✓ canplay fired');
-                    this.video.removeEventListener('canplay', onCanPlay);
-                    if (seekOffsetInStream > 0.1) {
-                        this.video.currentTime = seekOffsetInStream;
-                    }
-                    if (wasPlaying || this._firstSeek) {
-                        this._firstSeek = false;
-                        this.video.play().catch(() => { });
-                    }
-                    if (this._inlineSubTrackId <= 0) {
-                        this.reloadSubtitles();
-                    }
-                };
-                this.video.addEventListener('canplay', onCanPlay);
-
-                this.video.querySelectorAll('track').forEach(t => {
-                    if (t === this._dynamicTrackEl) return;
-                    if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
-                    t.remove();
-                });
-                if (this._dynamicTrack && this._dynamicTrack.cues) {
-                    Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
-                }
-                if (this._subtitleBlobUrl) {
-                    URL.revokeObjectURL(this._subtitleBlobUrl);
-                    this._subtitleBlobUrl = null;
-                }
-                this.video.src = objectUrl;
-                console.debug('[DidiMse] video.src set, waiting for sourceopen…');
-
-                ms.addEventListener('sourceopen', async () => {
-                    console.info('[DidiMse] ✓ sourceopen fired, readyState:', ms.readyState);
-                    URL.revokeObjectURL(objectUrl);
-
-                    let sb;
-                    try {
-                        sb = ms.addSourceBuffer(mimeType);
-                        console.info('[DidiMse] ✓ addSourceBuffer succeeded for:', mimeType);
-                    } catch (e) {
-                        this._emitError(DidiErrorType.DECODE, 'addSourceBuffer failed: ' + e.message);
-                        ms.endOfStream('decode');
-                        return;
-                    }
-
-                    // Listen for silent MSE errors (Chrome fires these without throwing)
-                    sb.addEventListener('error', (e) => {
-                        console.error('[DidiMse] SourceBuffer error event:', e);
-                        if (this.video.error) {
-                            console.error(`[DidiMse] video.error: code=${this.video.error.code} message="${this.video.error.message}"`);
-                        }
-                    });
-                    ms.addEventListener('sourceclose', () => {
-                        console.warn('[DidiMse] MediaSource closed! readyState:', ms.readyState);
-                    });
-                    ms.addEventListener('sourceended', () => {
-                        console.warn('[DidiMse] MediaSource ended! readyState:', ms.readyState);
-                    });
-
-                    const useInlineSubs = this._inlineSubTrackId > 0;
-
-                    // Set up the dynamic subtitle track element once if needed
-                    if (useInlineSubs) {
-                        if (!this._dynamicTrackEl || !this.video.contains(this._dynamicTrackEl)) {
-                            this._dynamicTrackEl = document.createElement('track');
-                            this._dynamicTrackEl.kind = 'subtitles';
-                            this._dynamicTrackEl.label = 'Inline Subtitles';
-                            this._dynamicTrackEl.srclang = 'und';
-                            this._dynamicTrackEl.default = true;
-                            this.video.appendChild(this._dynamicTrackEl);
-                            this._dynamicTrack = this._dynamicTrackEl.track;
-                            console.debug('[DidiMse Subs] Created <track> element. track:', this._dynamicTrack);
-                        }
-                        if (this._dynamicTrack) this._dynamicTrack.mode = 'showing';
-                        // Clear stale cues from previous seek
-                        if (this._dynamicTrack && this._dynamicTrack.cues) {
-                            Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
-                        }
-                    }
-
-                    // ── MSE pump with chunk accumulation ──
-                    // Chrome's ChunkDemuxer is stricter than Firefox's: it needs complete
-                    // parseable EBML elements per appendBuffer call, and the first append
-                    // MUST contain the full initialization segment (EBML header + Segment
-                    // + Info + Tracks).  We accumulate small network chunks into a pending
-                    // buffer and only call appendBuffer once we have enough data.
-                    //
-                    // Chrome MSE also REQUIRES the Segment element to use unknown/
-                    // indeterminate size.  File-oriented remuxers write a known size;
-                    // Firefox accepts both, Chrome does not.
-                    //
-                    // scanner: optional EbmlSubtitleScanner — fed inline so it's throttled by the pump
-
-                    const MIN_INITIAL_APPEND = 32 * 1024;  // 32KB — ensures full init segment
-                    const MIN_APPEND = 256 * 1024; // 256KB — larger appends reduce pump blocking
-                    const MAX_APPEND = 1024 * 1024; // 1MB  — split very large appends
-
-                    /**
-                     * Diagnose the EBML init segment for Chrome MSE compatibility.
-                     * Does NOT modify the bytestream — the backend is expected to
-                     * provide correct WebM output.  Logs warnings if issues are found.
-                     */
-                    const diagnoseInitSegment = (buf) => {
-                        const data = new Uint8Array(buf);
-
-                        // Helper: read EBML element ID at `pos`, return {id, len} or null
-                        const readElementId = (d, pos) => {
-                            if (pos >= d.length) return null;
-                            const b = d[pos];
-                            let idLen;
-                            if (b & 0x80) idLen = 1;
-                            else if (b & 0x40) idLen = 2;
-                            else if (b & 0x20) idLen = 3;
-                            else if (b & 0x10) idLen = 4;
-                            else return null;
-                            if (pos + idLen > d.length) return null;
-                            let id = 0;
-                            for (let j = 0; j < idLen; j++) id = (id << 8) | d[pos + j];
-                            return { id, len: idLen };
-                        };
-
-                        // Helper: read EBML VINT size at `pos`, return {size, len} or null
-                        const readVintSize = (d, pos) => {
-                            if (pos >= d.length) return null;
-                            const sLen = _ebmlVintLength(d[pos]);
-                            if (sLen === 0 || pos + sLen > d.length) return null;
-                            const mask = (1 << (8 - sLen)) - 1;
-                            let size = d[pos] & mask;
-                            for (let j = 1; j < sLen; j++) size = (size * 256) + d[pos + j];
-                            let isUnknown = (d[pos] & mask) === mask;
-                            for (let j = 1; j < sLen && isUnknown; j++) if (d[pos + j] !== 0xFF) isUnknown = false;
-                            return { size: isUnknown ? -1 : size, len: sLen };
-                        };
-
-                        // ── 1. Check DocType ─────────────────────────────────────
-                        for (let i = 0; i < Math.min(data.length - 12, 64); i++) {
-                            if (data[i] === 0x42 && data[i + 1] === 0x82) {
-                                const sizeStart = i + 2;
-                                const sizeLen = _ebmlVintLength(data[sizeStart]);
-                                if (sizeLen === 0) continue;
-                                let docTypeSize = data[sizeStart] & ((1 << (8 - sizeLen)) - 1);
-                                for (let j = 1; j < sizeLen; j++) docTypeSize = (docTypeSize << 8) | data[sizeStart + j];
-                                const strStart = sizeStart + sizeLen;
-                                const strEnd = strStart + docTypeSize;
-                                if (strEnd > data.length) continue;
-                                const docType = new TextDecoder().decode(data.subarray(strStart, strEnd)).replace(/\0+$/, '');
-                                if (docType === 'webm') {
-                                    console.debug(`[DidiMse] DocType: "webm" — OK`);
-                                } else {
-                                    console.warn(`[DidiMse] DocType: "${docType}" — Chrome MSE requires "webm"!`);
-                                }
-                                break;
-                            }
-                        }
-
-                        // ── 2. Check Segment size ────────────────────────────────
-                        const segId = [0x18, 0x53, 0x80, 0x67];
-                        for (let i = 0; i < Math.min(data.length - 12, 128); i++) {
-                            if (data[i] === segId[0] && data[i + 1] === segId[1] &&
-                                data[i + 2] === segId[2] && data[i + 3] === segId[3]) {
-                                const sizeStart = i + 4;
-                                const sv = readVintSize(data, sizeStart);
-                                if (!sv) break;
-                                if (sv.size === -1) {
-                                    console.debug(`[DidiMse] Segment size: unknown — OK`);
-                                } else {
-                                    console.warn(`[DidiMse] Segment has known size ${sv.size} — Chrome MSE may require unknown size for streaming!`);
-                                }
-
-                                // ── 3. Check Info sub-elements ───────────────────
-                                const segContentStart = sizeStart + sv.len;
-                                const WEBM_INFO_ALLOWED = new Set([
-                                    0x2AD7B1, 0x4489, 0x4D80, 0x5741,  // TimestampScale, Duration, MuxingApp, WritingApp
-                                ]);
-                                const infoId = readElementId(data, segContentStart);
-                                if (infoId && infoId.id === 0x1549A966) {
-                                    const infoSizeV = readVintSize(data, segContentStart + infoId.len);
-                                    if (infoSizeV && infoSizeV.size > 0) {
-                                        const infoContentStart = segContentStart + infoId.len + infoSizeV.len;
-                                        const infoContentEnd = infoContentStart + infoSizeV.size;
-                                        let pos = infoContentStart;
-                                        let nonWebm = [];
-                                        while (pos < infoContentEnd && pos < data.length) {
-                                            const elId = readElementId(data, pos);
-                                            if (!elId) break;
-                                            const elSize = readVintSize(data, pos + elId.len);
-                                            if (!elSize || elSize.size < 0) break;
-                                            if (!WEBM_INFO_ALLOWED.has(elId.id) && elId.id !== 0xEC) {
-                                                nonWebm.push(`0x${elId.id.toString(16).toUpperCase()}`);
-                                            }
-                                            pos += elId.len + elSize.len + elSize.size;
-                                        }
-                                        if (nonWebm.length > 0) {
-                                            console.warn(`[DidiMse] Info contains non-WebM element(s): ${nonWebm.join(', ')} — Chrome may reject these`);
-                                        } else {
-                                            console.debug('[DidiMse] Info sub-elements: all WebM-compatible — OK');
-                                        }
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    };
-
-
-                    const pumpStream = async (reader, scanner, startProcessedCues = 0) => {
-                        let processedCuesCount = startProcessedCues;
-                        let chunkCount = 0;
-                        let appendCount = 0;
-                        let pendingBuf = null;       // accumulated bytes not yet appended
-                        let pendingLen = 0;
-
-                        /** Merge `chunk` into pendingBuf. */
-                        const accumulate = (chunk) => {
-                            if (!pendingBuf) {
-                                pendingBuf = new Uint8Array(chunk);
-                                pendingLen = chunk.byteLength;
-                            } else {
-                                const combined = new Uint8Array(pendingLen + chunk.byteLength);
-                                combined.set(pendingBuf.subarray(0, pendingLen), 0);
-                                combined.set(chunk, pendingLen);
-                                pendingBuf = combined;
-                                pendingLen = combined.byteLength;
-                            }
-                        };
-
-                        /** Append the accumulated pending buffer to the SourceBuffer. */
-                        const flushPending = async () => {
-                            if (!pendingBuf || pendingLen === 0) return;
-                            let data = pendingBuf.subarray(0, pendingLen);
-
-                            // On the very first append, patch for Chrome MSE compatibility
-                            if (appendCount === 0) {
-                                // Diagnostic: log first 512 bytes as hex (enough to cover EBML+Segment+Info+Tracks header)
-                                const hexLen = Math.min(512, data.length);
-                                const hex = Array.from(data.subarray(0, hexLen))
-                                    .map(b => b.toString(16).padStart(2, '0')).join(' ');
-                                console.debug(`[DidiMse] first append hex (${data.length} bytes, showing ${hexLen}): ${hex}`);
-
-                                // Structured EBML element listing for debugging
-                                try {
-                                    const readId = (d, p) => {
-                                        if (p >= d.length) return null;
-                                        const b = d[p];
-                                        let l = (b & 0x80) ? 1 : (b & 0x40) ? 2 : (b & 0x20) ? 3 : (b & 0x10) ? 4 : 0;
-                                        if (!l || p + l > d.length) return null;
-                                        let id = 0;
-                                        for (let j = 0; j < l; j++) id = (id << 8) | d[p + j];
-                                        return { id, len: l };
-                                    };
-                                    const readSz = (d, p) => {
-                                        if (p >= d.length) return null;
-                                        const sl = _ebmlVintLength(d[p]);
-                                        if (!sl || p + sl > d.length) return null;
-                                        const m = (1 << (8 - sl)) - 1;
-                                        let sz = d[p] & m;
-                                        for (let j = 1; j < sl; j++) sz = sz * 256 + d[p + j];
-                                        let unk = (d[p] & m) === m;
-                                        for (let j = 1; j < sl && unk; j++) if (d[p + j] !== 0xFF) unk = false;
-                                        return { size: unk ? -1 : sz, len: sl };
-                                    };
-                                    const NAMES = {
-                                        0x1A45DFA3: 'EBML', 0x18538067: 'Segment', 0x1549A966: 'Info',
-                                        0x1654AE6B: 'Tracks', 0x1F43B675: 'Cluster', 0x114D9B74: 'SeekHead',
-                                        0x1C53BB6B: 'Cues', 0x1254C367: 'Tags', 0x1941A469: 'Attachments',
-                                        0xAE: 'TrackEntry', 0xD7: 'TrackNumber', 0x73C5: 'TrackUID',
-                                        0x83: 'TrackType', 0x86: 'CodecID', 0xE0: 'Video', 0xE1: 'Audio',
-                                        0x63A2: 'CodecPrivate', 0x22B59C: 'Language', 0x536E: 'Name',
-                                        0xB0: 'PixelWidth', 0xBA: 'PixelHeight', 0xB5: 'SamplingFrequency',
-                                        0x9F: 'Channels', 0x6264: 'BitDepth', 0x56AA: 'CodecDelay',
-                                        0x56BB: 'SeekPreRoll', 0x2AD7B1: 'TimestampScale', 0x4489: 'Duration',
-                                        0x4D80: 'MuxingApp', 0x5741: 'WritingApp', 0x73A4: 'SegmentUID',
-                                        0x4461: 'DateUTC', 0xEC: 'Void', 0xBF: 'CRC-32',
-                                        0x55EE: 'MaxBlockAdditionID', 0x55B0: 'Colour', 0x55B1: 'MatrixCoefficients',
-                                        0x55B2: 'BitsPerChannel', 0x55B5: 'ChromaSitingHorz',
-                                        0x55B6: 'ChromaSitingVert', 0x55B7: 'Range',
-                                        0x55B8: 'TransferCharacteristics', 0x55B9: 'Primaries',
-                                        0x54B0: 'DisplayWidth', 0x54BA: 'DisplayHeight', 0x54B2: 'DisplayUnit',
-                                        0x55AA: 'FlagForced', 0x88: 'FlagDefault', 0xB9: 'FlagEnabled',
-                                        0x9C: 'FlagLacing', 0x23E383: 'DefaultDuration',
-                                    };
-                                    // Walk top-level elements inside Segment
-                                    let pos = 0;
-                                    // Skip EBML header
-                                    const ebmlId = readId(data, pos);
-                                    if (ebmlId) {
-                                        const ebmlSz = readSz(data, pos + ebmlId.len);
-                                        if (ebmlSz && ebmlSz.size > 0) {
-                                            console.debug(`[DidiMse EBML] EBML header: ${ebmlId.len + ebmlSz.len + ebmlSz.size} bytes`);
-                                            pos = ebmlId.len + ebmlSz.len + ebmlSz.size;
-                                        }
-                                    }
-                                    // Segment
-                                    const segIdR = readId(data, pos);
-                                    if (segIdR) {
-                                        const segSzR = readSz(data, pos + segIdR.len);
-                                        if (segSzR) {
-                                            pos += segIdR.len + segSzR.len; // now at Segment content
-                                            // Walk children
-                                            const limit = Math.min(data.length, pos + 4096);
-                                            while (pos < limit) {
-                                                const cId = readId(data, pos);
-                                                if (!cId) break;
-                                                const cSz = readSz(data, pos + cId.len);
-                                                if (!cSz) break;
-                                                const name = NAMES[cId.id] || `0x${cId.id.toString(16).toUpperCase()}`;
-                                                const sizeStr = cSz.size === -1 ? 'unknown' : cSz.size;
-                                                console.debug(`[DidiMse EBML]   ${name} (id=0x${cId.id.toString(16)}, size=${sizeStr}) @ byte ${pos}`);
-
-                                                // For Info and Tracks, also list their children
-                                                if (cId.id === 0x1549A966 || cId.id === 0x1654AE6B) {
-                                                    const contentStart = pos + cId.len + cSz.len;
-                                                    const contentEnd = Math.min(contentStart + cSz.size, data.length);
-                                                    let cp = contentStart;
-                                                    while (cp < contentEnd) {
-                                                        const chId = readId(data, cp);
-                                                        if (!chId) break;
-                                                        const chSz = readSz(data, cp + chId.len);
-                                                        if (!chSz || chSz.size < 0) break;
-                                                        const chName = NAMES[chId.id] || `0x${chId.id.toString(16).toUpperCase()}`;
-                                                        const totalLen = chId.len + chSz.len + chSz.size;
-                                                        // For TrackEntry, also show its children
-                                                        if (chId.id === 0xAE) {
-                                                            console.debug(`[DidiMse EBML]     ${chName} (size=${chSz.size}) @ byte ${cp}`);
-                                                            let tp = cp + chId.len + chSz.len;
-                                                            const tEnd = Math.min(tp + chSz.size, data.length);
-                                                            while (tp < tEnd) {
-                                                                const tId = readId(data, tp);
-                                                                if (!tId) break;
-                                                                const tSz = readSz(data, tp + tId.len);
-                                                                if (!tSz || tSz.size < 0) break;
-                                                                const tName = NAMES[tId.id] || `0x${tId.id.toString(16).toUpperCase()}`;
-                                                                // Show value for small elements
-                                                                let valStr = '';
-                                                                if (tSz.size <= 8 && tSz.size > 0) {
-                                                                    const vStart = tp + tId.len + tSz.len;
-                                                                    const vBytes = Array.from(data.subarray(vStart, vStart + tSz.size));
-                                                                    if (tId.id === 0x86 || tId.id === 0x22B59C || tId.id === 0x536E) {
-                                                                        valStr = ` = "${new TextDecoder().decode(data.subarray(vStart, vStart + tSz.size))}"`;
-                                                                    } else {
-                                                                        let v = 0; vBytes.forEach(b => v = v * 256 + b);
-                                                                        valStr = ` = ${v}`;
-                                                                    }
-                                                                }
-                                                                console.debug(`[DidiMse EBML]       ${tName} (size=${tSz.size})${valStr}`);
-                                                                tp += tId.len + tSz.len + tSz.size;
-                                                            }
-                                                        } else {
-                                                            console.debug(`[DidiMse EBML]     ${chName} (size=${chSz.size}) @ byte ${cp}`);
-                                                        }
-                                                        cp += totalLen;
-                                                    }
-                                                }
-                                                // Stop at first Cluster (we only want the init segment)
-                                                if (cId.id === 0x1F43B675) break;
-                                                if (cSz.size === -1) break; // unknown size = Cluster
-                                                pos += cId.len + cSz.len + cSz.size;
-                                            }
-                                        }
-                                    }
-                                } catch (e) { console.warn('[DidiMse EBML] decode error:', e); }
-
-                                diagnoseInitSegment(data);  // log-only, no byte mutation
-                            }
-
-                            // Split large buffers into ≤ MAX_APPEND slices
-                            for (let offset = 0; offset < data.byteLength; offset += MAX_APPEND) {
-                                if (controller.signal.aborted || ms.readyState !== 'open') return;
-                                const slice = data.subarray(offset, Math.min(offset + MAX_APPEND, data.byteLength));
-
-                                if (sb.updating) {
-                                    await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-                                }
-                                if (controller.signal.aborted || ms.readyState !== 'open') return;
-
-                                appendCount++;
-                                const hexPreview = Array.from(slice.subarray(0, Math.min(32, slice.length))).map(b => b.toString(16).padStart(2, '0')).join(' ');
-                                if (appendCount <= 8) console.debug(`[DidiMse] appendBuffer #${appendCount}: ${slice.byteLength} bytes, hex: ${hexPreview}`);
-                                sb.appendBuffer(slice);
-                                await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-                                if (appendCount <= 8) {
-                                    const bufInfo = sb.buffered.length > 0 ? sb.buffered.end(sb.buffered.length - 1).toFixed(1) + 's' : 'none';
-                                    console.debug(`[DidiMse] appendBuffer #${appendCount} done, buffered: ${bufInfo}, readyState: ${ms.readyState}`);
-                                }
-
-                                // Buffer health diagnostics
-                                if (sb.buffered.length > 0) {
-                                    const bufEnd = sb.buffered.end(sb.buffered.length - 1);
-                                    const ahead = bufEnd - this.video.currentTime;
-
-                                    // Warn on low buffer (potential stutter)
-                                    if (ahead < 2 && ahead >= 0 && !this.video.paused) {
-                                        console.warn(`[DidiMse] LOW BUFFER: only ${ahead.toFixed(2)}s ahead of playhead`);
-                                    }
-
-                                    // Detect buffered gaps (discontinuities cause audio glitches)
-                                    if (sb.buffered.length > 1) {
-                                        let gapInfo = '';
-                                        for (let r = 0; r < sb.buffered.length - 1; r++) {
-                                            const gapStart = sb.buffered.end(r);
-                                            const gapEnd = sb.buffered.start(r + 1);
-                                            gapInfo += ` [${gapStart.toFixed(2)}-${gapEnd.toFixed(2)}]`;
-                                        }
-                                        console.warn(`[DidiMse] BUFFERED GAP(s):${gapInfo} (${sb.buffered.length} ranges)`);
-                                    }
-
-                                    // Throttle: if buffer is >30s ahead of playhead, wait
-                                    while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
-                                        await new Promise(r => setTimeout(r, 1000));
-                                        if (sb.buffered.length === 0) break;
-                                        const newAhead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
-                                        if (newAhead <= 30) break;
-                                    }
-                                }
-                            }
-                            pendingBuf = null;
-                            pendingLen = 0;
-                        };
-
-                        try {
-                            while (true) {
-                                if (controller.signal.aborted || ms.readyState !== 'open') {
-                                    console.warn(`[DidiMse] pump aborted at loop top (aborted=${controller.signal.aborted}, readyState=${ms.readyState}, chunks=${chunkCount})`);
-                                    return 'aborted';
-                                }
-
-                                const { done, value } = await reader.read();
-                                if (done) {
-                                    // Flush any remaining buffered data
-                                    await flushPending();
-                                    console.info(`[DidiMse] pump done after ${chunkCount} chunks, ${appendCount} appends`);
-                                    return 'done';
-                                }
-                                chunkCount++;
-                                if (chunkCount <= 5) console.debug(`[DidiMse] chunk #${chunkCount}: ${value.byteLength} bytes`);
-
-                                // Feed chunk to subtitle scanner inline (naturally throttled with pump)
-                                if (scanner) {
-                                    scanner.feed(value);
-                                    const cues = scanner.getCues();
-                                    if (cues.length > processedCuesCount) {
-                                        for (let i = processedCuesCount; i < cues.length; i++) {
-                                            const cue = cues[i];
-                                            const delaySec = (this.subtitleDelayMs || 0) / 1000;
-                                            const startSec = (cue.startMs / 1000) + delaySec;
-                                            const endSec = startSec + (cue.durationMs / 1000);
-                                            if (endSec > 0) {
-                                                try {
-                                                    const vttCue = new VTTCue(Math.max(0, startSec), endSec, cue.text);
-                                                    if (this._dynamicTrack) this._dynamicTrack.addCue(vttCue);
-                                                } catch (e) { /* ignore invalid cue */ }
-                                            }
-                                        }
-                                        processedCuesCount = cues.length;
-                                    }
-                                }
-
-                                // Accumulate chunk into pending buffer
-                                accumulate(value);
-
-                                // Decide whether to flush: use a larger threshold for the
-                                // first append (must contain full init segment) and a smaller
-                                // one for subsequent appends.
-                                const threshold = (appendCount === 0) ? MIN_INITIAL_APPEND : MIN_APPEND;
-                                if (pendingLen >= threshold) {
-                                    await flushPending();
-                                    if (controller.signal.aborted || ms.readyState !== 'open') {
-                                        console.warn(`[DidiMse] pump aborted after flush (readyState=${ms.readyState})`);
-                                        return 'aborted';
-                                    }
-                                }
-                            }
-                        } catch (e) {
-                            if (e.name === 'AbortError' || controller.signal.aborted) { console.warn('[DidiMse] pump caught AbortError'); return 'aborted'; }
-                            console.error('[DidiMse] Pump error:', e);
-                            return 'error';
-                        }
-                    };
-
-                    // Create initial subtitle scanner (one per stream segment)
-                    let activeScanner = useInlineSubs
-                        ? new EbmlSubtitleScanner(this._inlineSubOutputTrack)
-                        : null;
-
-                    // Run with reconnection on network errors
-                    (async () => {
-                        let result = await pumpStream(res.body.getReader(), activeScanner);
-                        let backoff = 1000;
-
-                        while (result === 'error' && ms.readyState === 'open' && !controller.signal.aborted) {
-                            // Resume from end of buffered data, or current playback position
-                            // (NOT the original seek position which may be minutes stale)
-                            let resumeAt;
-                            if (sb.buffered.length > 0) {
-                                resumeAt = sb.buffered.end(sb.buffered.length - 1) + this.currentSeekOffset;
-                            } else {
-                                resumeAt = this.video.currentTime + (this.currentSeekOffset || 0);
-                            }
-                            console.info(`[DidiMse] Reconnecting from ${resumeAt.toFixed(1)}s in ${(backoff / 1000).toFixed(0)}s...`);
-                            await new Promise(r => setTimeout(r, backoff));
-                            backoff = Math.min(backoff * 2, 10000);
-                            if (controller.signal.aborted || ms.readyState !== 'open') break;
-
-                            try {
-                                const res2 = await fetch(
-                                    `${this.apiBase}/remux?mappings=${mappings}&seek=prev_keyframe&start=${resumeAt}`,
-                                    { signal: controller.signal, headers: { 'Accept-Encoding': 'identity' } }
-                                );
-                                if (controller.signal.aborted || ms.readyState !== 'open') break;
-                                if (!res2.ok) { continue; }
-
-                                const s = parseFloat(res2.headers.get('x-media-start-sec'));
-                                if (!isNaN(s)) {
-                                    if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-                                    if (controller.signal.aborted || ms.readyState !== 'open') break;
-                                    sb.timestampOffset = s - this.currentSeekOffset;
-                                }
-                                backoff = 1000;
-                                // Fresh scanner for the new segment; cues from previous segment remain in the track
-                                if (useInlineSubs) {
-                                    activeScanner = new EbmlSubtitleScanner(this._inlineSubOutputTrack);
-                                }
-                                result = await pumpStream(res2.body.getReader(), activeScanner);
-                            } catch (err) {
-                                if (err.name === 'AbortError' || err.name === 'InvalidStateError' || controller.signal.aborted || ms.readyState !== 'open') break;
-                                console.error('[DidiMse] Reconnect failed:', err);
-                                result = 'error';
-                            }
-                        }
-
-                        console.info(`[DidiMse] pump exited with result: "${result}", ms.readyState: ${ms.readyState}`);
-                        if (result === 'done' && ms.readyState === 'open') {
-                            try { ms.endOfStream(); } catch (e) { }
-                        } else if (result === 'error' && ms.readyState === 'open') {
-                            this._emitError(DidiErrorType.NETWORK, 'Stream failed');
-                            try { ms.endOfStream('network'); } catch (e) { }
-                        }
-                    })();
-                }, { once: true });
-
-
-            } else {
-                // MSE is the only supported path — never fall back to direct video.src.
-                controller.abort();
-                console.error(
-                    `[DidiMse] FATAL: MSE rejected the stream.\n` +
-                    `  Content-Type from server: "${mimeType}"\n` +
-                    `  _MSE available: ${!!_MSE}\n` +
-                    `  isTypeSupported("${mimeType}"): ${_MSE ? _MSE.isTypeSupported(mimeType) : 'N/A'}\n` +
-                    `  isTypeSupported("video/webm; codecs=\\"vp9,opus\\""): ${_MSE ? _MSE.isTypeSupported('video/webm; codecs="vp9,opus"') : 'N/A'}\n` +
-                    `  → Fix: the backend must send Content-Type with codec parameters ` +
-                    `(e.g. 'video/webm; codecs="vp9,opus"') instead of bare "${mimeType}".`
-                );
-                this._emitError(DidiErrorType.DECODE,
-                    `MSE does not support mimeType "${mimeType}". The server must include codec parameters in Content-Type.`);
+            if (!_MSE || !_MSE.isTypeSupported(mimeType)) {
+                this._emitError(DidiErrorType.DECODE, `MSE does not support "${mimeType}"`);
                 return;
             }
+
+            // 3. Set up MediaSource
+            const ms = new _MSE();
+            this._activeMediaSource = ms;
+            const objectUrl = URL.createObjectURL(ms);
+
+            const seekOffsetInStream = (seekMode === 'snap_prev' && !isNaN(session.start_sec))
+                ? Math.max(0, seconds - session.start_sec) : 0;
+
+            const onCanPlay = () => {
+                this.video.removeEventListener('canplay', onCanPlay);
+                if (seekOffsetInStream > 0.1) this.video.currentTime = seekOffsetInStream;
+                if (wasPlaying || this._firstSeek) {
+                    this._firstSeek = false;
+                    this.video.play().catch(() => {});
+                }
+                if (this._inlineSubTrackId <= 0) this.reloadSubtitles();
+            };
+            this.video.addEventListener('canplay', onCanPlay);
+            this.video.src = objectUrl;
+
+            ms.addEventListener('sourceopen', async () => {
+                URL.revokeObjectURL(objectUrl);
+                let sb;
+                try {
+                    sb = ms.addSourceBuffer(mimeType);
+                } catch (e) {
+                    this._emitError(DidiErrorType.DECODE, 'addSourceBuffer failed: ' + e.message);
+                    ms.endOfStream('decode');
+                    return;
+                }
+
+                sb.addEventListener('error', (e) => {
+                    console.error('[DidiMse] SourceBuffer error:', e);
+                });
+
+                const useInlineSubs = this._inlineSubTrackId > 0;
+                if (useInlineSubs) {
+                    if (!this._dynamicTrackEl || !this.video.contains(this._dynamicTrackEl)) {
+                        this._dynamicTrackEl = document.createElement('track');
+                        this._dynamicTrackEl.kind = 'subtitles';
+                        this._dynamicTrackEl.label = 'Inline Subtitles';
+                        this._dynamicTrackEl.srclang = 'und';
+                        this._dynamicTrackEl.default = true;
+                        this.video.appendChild(this._dynamicTrackEl);
+                        this._dynamicTrack = this._dynamicTrackEl.track;
+                    }
+                    if (this._dynamicTrack) this._dynamicTrack.mode = 'showing';
+                    if (this._dynamicTrack && this._dynamicTrack.cues) {
+                        Array.from(this._dynamicTrack.cues).forEach(c => this._dynamicTrack.removeCue(c));
+                    }
+                }
+
+                let scanner = useInlineSubs
+                    ? new EbmlSubtitleScanner(this._inlineSubOutputTrack)
+                    : null;
+
+                // Helper: append data to SourceBuffer and wait
+                const appendToSb = async (data) => {
+                    if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                    if (controller.signal.aborted || ms.readyState !== 'open') return false;
+                    sb.appendBuffer(data);
+                    await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                    return true;
+                };
+
+                // 4. Append init segment
+                if (!(await appendToSb(initData))) return;
+                console.info('[DidiMse] Init segment appended');
+
+                // 5. Session pump: POST /next → GET /segment → appendBuffer
+                let step = 0;
+                let backoff = 500;
+                let processedCuesCount = 0;
+
+                while (!controller.signal.aborted && ms.readyState === 'open') {
+                    // Throttle: wait if buffer is >30s ahead
+                    if (sb.buffered.length > 0) {
+                        const ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                        while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
+                            await new Promise(r => setTimeout(r, 1000));
+                            if (sb.buffered.length === 0) break;
+                            const newAhead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                            if (newAhead <= 30) break;
+                        }
+                    }
+
+                    // Advance to next segment
+                    let nextRes;
+                    try {
+                        nextRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/next`, {
+                            method: 'POST',
+                            signal: controller.signal,
+                        });
+                    } catch (e) {
+                        if (e.name === 'AbortError') break;
+                        console.warn(`[DidiMse] /next failed, retrying in ${backoff}ms:`, e.message);
+                        await new Promise(r => setTimeout(r, backoff));
+                        backoff = Math.min(backoff * 2, 10000);
+                        continue;
+                    }
+
+                    if (nextRes.status === 410) {
+                        // Session finished — no more segments
+                        console.info('[DidiMse] Session finished (410 Gone)');
+                        break;
+                    }
+                    if (!nextRes.ok) {
+                        console.warn(`[DidiMse] /next error ${nextRes.status}, retrying...`);
+                        await new Promise(r => setTimeout(r, backoff));
+                        backoff = Math.min(backoff * 2, 10000);
+                        continue;
+                    }
+                    backoff = 500; // reset on success
+
+                    const stepData = await nextRes.json();
+                    step = stepData.step;
+
+                    // Fetch the segment data
+                    let segRes;
+                    try {
+                        segRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
+                            signal: controller.signal,
+                        });
+                    } catch (e) {
+                        if (e.name === 'AbortError') break;
+                        console.warn(`[DidiMse] /segment failed, retrying...`);
+                        await new Promise(r => setTimeout(r, 1000));
+                        continue;
+                    }
+                    if (!segRes.ok) {
+                        console.warn(`[DidiMse] /segment error ${segRes.status}`);
+                        continue;
+                    }
+
+                    const segData = new Uint8Array(await segRes.arrayBuffer());
+
+                    // Feed to subtitle scanner
+                    if (scanner) {
+                        scanner.feed(segData);
+                        const cues = scanner.getCues();
+                        for (let i = processedCuesCount; i < cues.length; i++) {
+                            const cue = cues[i];
+                            const delaySec = (this.subtitleDelayMs || 0) / 1000;
+                            const startSec = (cue.startMs / 1000) + delaySec;
+                            const endSec = startSec + (cue.durationMs / 1000);
+                            if (endSec > 0) {
+                                try {
+                                    const vttCue = new VTTCue(Math.max(0, startSec), endSec, cue.text);
+                                    if (this._dynamicTrack) this._dynamicTrack.addCue(vttCue);
+                                } catch (e) { /* ignore invalid cue */ }
+                            }
+                        }
+                        processedCuesCount = cues.length;
+                    }
+
+                    // Append to SourceBuffer
+                    if (!(await appendToSb(segData))) break;
+
+                    if (step <= 3) {
+                        const bufInfo = sb.buffered.length > 0
+                            ? sb.buffered.end(sb.buffered.length - 1).toFixed(1) + 's' : 'none';
+                        console.debug(`[DidiMse] Step ${step}: ${segData.byteLength} bytes, buffered: ${bufInfo}`);
+                    }
+                }
+
+                // End of stream
+                if (ms.readyState === 'open') {
+                    try { ms.endOfStream(); } catch (e) {}
+                }
+                console.info(`[DidiMse] Session pump finished at step ${step}`);
+            }, { once: true });
+
         } catch (e) {
             if (e.name !== 'AbortError') {
                 this._emitError(DidiErrorType.NETWORK, e.message || 'Unknown playback error');

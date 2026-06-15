@@ -446,9 +446,7 @@ impl ChunkedRemuxer {
         ))
     }
 
-    /// Returns the initialization segment (EBML header + tracks) that was
-    /// written during construction. Call this *before* the first `process()` if
-    /// you need the init segment separately.
+    /// Advance the remuxer by one cluster and return the resulting bytes.
     pub fn next_segment(&mut self) -> Result<ChunkedRemuxerResponse> {
         let remuxer = match self.remuxer.take() {
             Some(remuxer) => remuxer,
@@ -467,7 +465,7 @@ impl ChunkedRemuxer {
                 return Ok(ChunkedRemuxerResponse::Finished(stats));
             }
         }
-        let bytes = self.handle.next_segment();
+        let bytes = self.handle.next_segment()?;
         if bytes.is_empty() {
             return Err(Error::InternalBug(
                 "internal buffer is empty while it should be full".to_string(),
@@ -514,7 +512,7 @@ mod tests {
         )?;
 
         // The init segment should have data (EBML header + tracks)
-        let init = remuxer.handle.next_segment();
+        let init = remuxer.handle.next_segment()?;
         assert!(
             !init.is_empty(),
             "Init segment should contain EBML header and tracks"
@@ -541,10 +539,7 @@ mod tests {
                         stats.blocks_processed > 0,
                         "Should have processed at least some blocks"
                     );
-                    assert!(
-                        stats.track_count > 0,
-                        "Should have at least one track"
-                    );
+                    assert!(stats.track_count > 0, "Should have at least one track");
                     break;
                 }
             }
@@ -611,7 +606,7 @@ mod tests {
         )?;
 
         // Drain init segment
-        let init = remuxer.handle.next_segment();
+        let init = remuxer.handle.next_segment()?;
         assert!(!init.is_empty(), "Init segment should not be empty");
 
         let mut all_data = init.to_vec();

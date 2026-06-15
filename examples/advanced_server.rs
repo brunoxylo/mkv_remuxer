@@ -5,6 +5,15 @@
 /// - API Endpoint for listing media files with metadata
 /// - Remuxing endpoint with support for complex mappings (multiple files), seeking, and track selection
 /// - Direct file serving endpoint (via redirect to static server) for proper Range support
+/// - **Session-based chunked streaming** for resilient, segment-by-segment delivery
+///
+/// Session API:
+///   POST /session                → create session (body: { client_id, mappings, start, end, seek })
+///   GET  /session/{id}/init      → get init segment (EBML header + tracks)
+///   GET  /session/{id}/segment   → get current segment (idempotent, retry-safe)
+///   POST /session/{id}/next      → advance to next segment
+///   GET  /session/{id}/step      → get current step index
+///   DELETE /session/{id}         → destroy session
 ///
 /// Usage:
 ///   cargo run --example advanced_server
@@ -14,7 +23,8 @@ use bytes::Bytes;
 use log::{error, info};
 use mkv_remuxer::ContainerFormat;
 use mkv_remuxer::RemuxerCutMode;
-use mkv_remuxer::folder_streamer::FolderStreamer;
+use mkv_remuxer::session_streamer::SessionStreamer;
+use mkv_remuxer::session::{AdvanceResponse, SessionStore};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -30,30 +40,28 @@ async fn main() {
     info!("Starting Advanced MKV Remuxer Server on http://localhost:3031");
 
     let root_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let streamer = Arc::new(FolderStreamer::new(root_dir));
+    let streamer = Arc::new(SessionStreamer::new(root_dir));
     let streamer_filter = warp::any().map(move || streamer.clone());
+
+    let session_store = SessionStore::new();
+    let session_filter = {
+        let store = Arc::clone(&session_store);
+        warp::any().map(move || Arc::clone(&store))
+    };
 
     // Static files
     let static_files = warp::fs::dir("examples/static");
     let static_media = warp::path("static_media").and(warp::fs::dir("."));
 
-    // GET /video/list
+    // GET /my_video
     let list_route = warp::get()
         .and(warp::path("my_video"))
         .and(warp::path::end())
         .and(streamer_filter.clone())
         .and_then(handle_list_files);
 
-    // GET /video/stream?mappings=0_1,1_2&start=10&end=20&seek=squeeze
-    let stream_route = warp::get()
-        .and(warp::path("my_video"))
-        .and(warp::path("remux"))
-        .and(warp::path::end())
-        .and(warp::query::<HashMap<String, String>>())
-        .and(streamer_filter.clone())
-        .and_then(handle_stream_request);
 
-    // GET /video/direct/:index
+    // GET /my_video/direct/:index
     let direct_route = warp::get()
         .and(warp::path("my_video"))
         .and(warp::path("direct"))
@@ -63,22 +71,84 @@ async fn main() {
         .and(streamer_filter.clone())
         .and_then(handle_direct_request);
 
+    // ── Session routes ──────────────────────────────────────────────────
+
+    // POST /session  (create)
+    let session_create = warp::post()
+        .and(warp::path("session"))
+        .and(warp::path::end())
+        .and(warp::body::json())
+        .and(streamer_filter.clone())
+        .and(session_filter.clone())
+        .and_then(handle_session_create);
+
+
+
+    // GET /session/{id}/segment
+    let session_segment = warp::get()
+        .and(warp::path("session"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("segment"))
+        .and(warp::path::end())
+        .and(session_filter.clone())
+        .and_then(handle_session_segment);
+
+    // POST /session/{id}/next
+    let session_next = warp::post()
+        .and(warp::path("session"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("next"))
+        .and(warp::path::end())
+        .and(session_filter.clone())
+        .and_then(handle_session_next);
+
+    // GET /session/{id}/step
+    let session_step = warp::get()
+        .and(warp::path("session"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("step"))
+        .and(warp::path::end())
+        .and(session_filter.clone())
+        .and_then(handle_session_step);
+
+    // DELETE /session/{id}
+    let session_destroy = warp::delete()
+        .and(warp::path("session"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(session_filter.clone())
+        .and_then(handle_session_destroy);
+
     let cors = warp::cors()
         .allow_any_origin()
-        .allow_methods(vec!["GET", "POST", "DELETE"]);
+        .allow_methods(vec!["GET", "POST", "DELETE"])
+        .allow_header("content-type")
+        .expose_headers(vec![
+            "X-Media-Start-Sec",
+            "X-Media-End-Sec",
+            "X-Session-Id",
+            "X-Mime-Type",
+            "X-Container-Format",
+        ]);
 
     let routes = static_files
         .or(static_media)
         .or(list_route)
-        .or(stream_route)
         .or(direct_route)
+        .or(session_create)
+        .or(session_segment)
+        .or(session_next)
+        .or(session_step)
+        .or(session_destroy)
         .with(cors);
 
     warp::serve(routes).run(([127, 0, 0, 1], 3031)).await;
 }
 
+// ── Existing handlers (unchanged) ──────────────────────────────────────────
+
 async fn handle_list_files(
-    streamer: Arc<FolderStreamer>,
+    streamer: Arc<SessionStreamer>,
 ) -> Result<warp::reply::Response, Infallible> {
     use warp::Reply;
     match tokio::task::spawn_blocking(move || streamer.list_files()).await {
@@ -98,7 +168,7 @@ async fn handle_list_files(
 async fn handle_direct_request(
     index: usize,
     range_header: Option<String>,
-    streamer: Arc<FolderStreamer>,
+    streamer: Arc<SessionStreamer>,
 ) -> Result<warp::reply::Response, Infallible> {
     let mut start_byte = 0;
     let mut end_byte = None;
@@ -145,7 +215,6 @@ async fn handle_direct_request(
                 .header("Content-Range", content_range)
                 .header("Accept-Ranges", "bytes")
                 .header("Content-Length", (end - start_byte + 1).to_string())
-                // Use application/octet-stream or let browser infer; ideally we'd guess based on extension
                 .header("Content-Type", "video/webm")
                 .body(body)
                 .unwrap();
@@ -162,81 +231,213 @@ async fn handle_direct_request(
     }
 }
 
-async fn handle_stream_request(
-    params: HashMap<String, String>,
-    streamer: Arc<FolderStreamer>,
-) -> Result<warp::reply::Response, Infallible> {
-    let start_sec = params
-        .get("start")
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let end_sec = params.get("end").and_then(|s| s.parse::<f64>().ok());
-    let seek_mode_str = params.get("seek").map(|s| s.as_str()).unwrap_or("squeeze");
-    let vtt_output = params
-        .get("vtt_output")
-        .map(|v| v == "true")
-        .unwrap_or(false);
 
-    let cut_mode = match seek_mode_str {
+// ── Session handlers ───────────────────────────────────────────────────────
+
+fn parse_cut_mode(s: &str) -> Option<RemuxerCutMode> {
+    match s {
         "squeeze" => Some(RemuxerCutMode::Squeeze),
         "dirty" => Some(RemuxerCutMode::DirtyCut),
         "snap" => Some(RemuxerCutMode::SnapNearestKeyframe),
         "snap_prev" => Some(RemuxerCutMode::SnapPreviousKeyframe),
         "snap_next" => Some(RemuxerCutMode::SnapNextKeyframe),
         _ => Some(RemuxerCutMode::Squeeze),
+    }
+}
+
+/// POST /session
+/// Body: { "client_id": "...", "mappings": "0_1,0_2", "start": 0.0, "end": null, "seek": "snap" }
+async fn handle_session_create(
+    body: HashMap<String, serde_json::Value>,
+    streamer: Arc<SessionStreamer>,
+    store: Arc<SessionStore>,
+) -> Result<warp::reply::Response, Infallible> {
+    use warp::Reply;
+
+    let client_id = match body.get("client_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "client_id is required"})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )
+            .into_response());
+        }
     };
 
-    let mappings_str = params.get("mappings").unwrap_or(&String::new()).clone();
+    let mappings = body
+        .get("mappings")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let start_sec = body
+        .get("start")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let end_sec = body.get("end").and_then(|v| v.as_f64());
+    let cut_mode = body
+        .get("seek")
+        .and_then(|v| v.as_str())
+        .map(parse_cut_mode)
+        .flatten();
 
-    let (tx, rx) = mpsc::channel::<Bytes>(4);
+    info!(
+        "Creating session: client_id={}, mappings={}, start={}, end={:?}",
+        client_id, mappings, start_sec, end_sec
+    );
 
-    let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel();
+    let result = tokio::task::spawn_blocking(move || {
+        streamer.create_chunked_session(mappings, start_sec, end_sec, cut_mode)
+    })
+    .await;
 
-    tokio::task::spawn_blocking(move || {
-        streamer.start_remuxing_stream(
-            mappings_str,
-            start_sec,
-            end_sec,
-            cut_mode,
-            vtt_output,
-            tx,
-            oneshot_tx,
-        );
+    let (remuxer, mime_type, container_format, start_out, end_out) = match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            error!("Session creation error: {}", e);
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )
+            .into_response());
+        }
+        Err(e) => {
+            error!("Session task panic: {}", e);
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "Internal error"})),
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response());
+        }
+    };
+
+    let session_info = match store.create_session(
+        client_id,
+        remuxer,
+        mime_type,
+        container_format,
+        start_out,
+        end_out,
+    ) {
+        Ok(info) => info,
+        Err(e) => {
+            error!("Session init error: {}", e);
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+                warp::http::StatusCode::BAD_REQUEST,
+            )
+            .into_response());
+        }
+    };
+
+    let response_json = serde_json::json!({
+        "session_id": session_info.session_id,
+        "mime_type": session_info.mime_type,
+        "container_format": session_info.container_format.to_string(),
+        "start_sec": session_info.start_sec,
+        "end_sec": session_info.end_sec,
+        "step": 0,
     });
 
-    let stream_result = oneshot_rx
-        .await
-        .unwrap_or_else(|_| Err(mkv_remuxer::Error::InternalBug("Stream thread died".into())));
+    Ok(warp::reply::with_status(warp::reply::json(&response_json), warp::http::StatusCode::CREATED)
+        .into_response())
+}
 
-    match stream_result {
-        Ok((output_format, output_codecs, start_sec_out, end_sec_out)) => {
-            let content_type = output_codecs.to_mime_type(output_format);
-
-            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            let mapped = tokio_stream::StreamExt::map(stream, |c| Ok::<_, Infallible>(c));
-            let body = hyper::Body::wrap_stream(mapped);
-
+/// GET /session/{id}/segment  → binary current segment (idempotent)
+async fn handle_session_segment(
+    session_id: String,
+    store: Arc<SessionStore>,
+) -> Result<warp::reply::Response, Infallible> {
+    match store.get_segment(&session_id) {
+        Ok(bytes) => {
             let response = warp::http::Response::builder()
                 .status(200)
-                .header("Content-Type", content_type)
-                .header("X-Media-Start-Sec", format!("{:.3}", start_sec_out))
-                .header("X-Media-End-Sec", format!("{:.3}", end_sec_out))
-                .header(
-                    "Access-Control-Expose-Headers",
-                    "X-Media-Start-Sec, X-Media-End-Sec",
-                )
-                .body(body)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", bytes.len().to_string())
+                .body(hyper::Body::from(bytes))
                 .unwrap();
-
             Ok(response)
         }
         Err(e) => {
-            error!("Remuxer stream error: {}", e);
             let response = warp::http::Response::builder()
-                .status(400)
-                .body(hyper::Body::from(format!("Error: {}", e)))
+                .status(404)
+                .header("Content-Type", "application/json")
+                .body(hyper::Body::from(
+                    serde_json::json!({"error": e.to_string()}).to_string(),
+                ))
                 .unwrap();
             Ok(response)
         }
     }
+}
+
+/// POST /session/{id}/next  → advance iterator, return new step or error if finished
+async fn handle_session_next(
+    session_id: String,
+    store: Arc<SessionStore>,
+) -> Result<warp::reply::Response, Infallible> {
+    use warp::Reply;
+
+    let store_clone = Arc::clone(&store);
+    let sid = session_id.clone();
+
+    let result =
+        tokio::task::spawn_blocking(move || store_clone.advance(&sid)).await;
+
+    match result {
+        Ok(Ok(resp)) => {
+            Ok(warp::reply::json(&serde_json::json!({"step": resp.step})).into_response())
+        }
+        Ok(Err(e)) => {
+            let status = if e.to_string().contains("not found") {
+                404
+            } else if e.to_string().contains("finished") {
+                410 // Gone
+            } else {
+                500
+            };
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+                warp::http::StatusCode::from_u16(status).unwrap(),
+            )
+            .into_response())
+        }
+        Err(e) => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": format!("Task panic: {}", e)})),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .into_response()),
+    }
+}
+
+/// GET /session/{id}/step  → current step index
+async fn handle_session_step(
+    session_id: String,
+    store: Arc<SessionStore>,
+) -> Result<warp::reply::Response, Infallible> {
+    use warp::Reply;
+    match store.get_step(&session_id) {
+        Ok((step, finished)) => {
+            Ok(warp::reply::json(&serde_json::json!({"step": step, "finished": finished}))
+                .into_response())
+        }
+        Err(e) => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+            warp::http::StatusCode::NOT_FOUND,
+        )
+        .into_response()),
+    }
+}
+
+/// DELETE /session/{id}  → destroy session
+async fn handle_session_destroy(
+    session_id: String,
+    store: Arc<SessionStore>,
+) -> Result<warp::reply::Response, Infallible> {
+    store.destroy_session(&session_id);
+    let response = warp::http::Response::builder()
+        .status(204)
+        .body(hyper::Body::empty())
+        .unwrap();
+    Ok(response)
 }

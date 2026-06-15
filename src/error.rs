@@ -72,7 +72,8 @@ pub enum Error {
     RemuxError(String),
     ClusterIsFull(String),
     FileCorrupted(String),
-    ChannelClosed(String)
+    ChannelClosed(String),
+    MutexLockingError(String),
 }
 
 impl fmt::Display for Error {
@@ -109,6 +110,7 @@ impl fmt::Display for Error {
             Error::Done => write!(f, "Remuxing completed"),
             Error::FileCorrupted(msg) => write!(f, "File is corrupted: {}", msg),
             Error::ChannelClosed(msg) => write!(f, "Channel closed: {}", msg),
+            Error::MutexLockingError(msg) => write!(f, "Mutex locking error: {}", msg),
         }
     }
 }
@@ -124,11 +126,17 @@ impl Clone for Error {
             Error::MissingElement(s) => Error::MissingElement(s.clone()),
             Error::InternalBug(s) => Error::InternalBug(s.clone()),
             Error::InvalidTimestamp(s) => Error::InvalidTimestamp(s.clone()),
-            Error::SeekFailed { target_ns, reason } => Error::SeekFailed { target_ns: *target_ns, reason: reason.clone() },
+            Error::SeekFailed { target_ns, reason } => Error::SeekFailed {
+                target_ns: *target_ns,
+                reason: reason.clone(),
+            },
             Error::NotFound(s) => Error::NotFound(s.clone()),
             Error::InvalidConfig(s) => Error::InvalidConfig(s.clone()),
             Error::TrackMappingError(s) => Error::TrackMappingError(s.clone()),
-            Error::UnsupportedCodec { codec_id, reason } => Error::UnsupportedCodec { codec_id: codec_id.clone(), reason: reason.clone() },
+            Error::UnsupportedCodec { codec_id, reason } => Error::UnsupportedCodec {
+                codec_id: codec_id.clone(),
+                reason: reason.clone(),
+            },
             Error::TimecodeScaleError(s) => Error::TimecodeScaleError(s.clone()),
             Error::InvalidBlockData(s) => Error::InvalidBlockData(s.clone()),
             Error::UnexpectedEof => Error::UnexpectedEof,
@@ -139,6 +147,7 @@ impl Clone for Error {
             Error::ClusterIsFull(s) => Error::ClusterIsFull(s.clone()),
             Error::FileCorrupted(s) => Error::FileCorrupted(s.clone()),
             Error::ChannelClosed(s) => Error::ChannelClosed(s.clone()),
+            Error::MutexLockingError(s) => Error::MutexLockingError(s.clone()),
         }
     }
 }
@@ -175,6 +184,13 @@ impl From<mkv_element::Error> for Error {
             mkv_element::Error::Io(err) => filter_ioi_err(err),
             _ => Error::MkvElement(err),
         }
+    }
+}
+
+// Conversion from std::sync::PoisonError (mutex poisoning)
+impl<T> From<std::sync::PoisonError<T>> for Error {
+    fn from(err: std::sync::PoisonError<T>) -> Self {
+        Error::MutexLockingError(err.to_string())
     }
 }
 

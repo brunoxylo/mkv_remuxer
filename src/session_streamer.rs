@@ -1,9 +1,5 @@
 use crate::{
-    Codecs, ContainerFormat, Error, MkvBasicInfo, Remuxer, RemuxerCutMode, RemuxerState, Result,
-    sink::{
-        ChannelWriterWrapper, OutputSink, Sink, SinkSender, StreamSink, Uninitialized, VttSink,
-        WebmFilterWriterSend,
-    },
+    ChunkedRemuxer, ContainerFormat, Error, MkvBasicInfo, RemuxerCutMode, Result,
     source::{CutInterval, FileSource, InputSource, Source, WebVttSource},
 };
 use bytes::Bytes;
@@ -12,11 +8,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-pub struct FolderStreamer {
+pub struct SessionStreamer {
     pub root_dir: PathBuf,
 }
 
-impl FolderStreamer {
+impl SessionStreamer {
     pub fn new(root_dir: PathBuf) -> Self {
         Self { root_dir }
     }
@@ -88,96 +84,12 @@ impl FolderStreamer {
             .collect()
     }
 
-    /// Starts the streaming process with remuxing.
-    ///
-    /// **Warning:** This method is blocking. You need to wrap it inside a thread
-    /// (e.g., using `tokio::task::spawn_blocking`) when running in an asynchronous context.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a tuple with:
-    /// - `ContainerFormat`
-    /// - `start_sec: f64`
-    /// - `end_sec: f64`
-    pub fn start_remuxing_stream(
-        &self,
-        mappings_str: String,
-        start_sec: f64,
-        end_sec: Option<f64>,
-        cut_mode: Option<RemuxerCutMode>,
-        vtt_output: bool,
-        tx: mpsc::Sender<Bytes>,
-        ready_tx: tokio::sync::oneshot::Sender<Result<(ContainerFormat, Codecs, f64, f64)>>,
-    ) {
-        let all_files = self.scan_media_files();
-
-        let init_result = Self::initialize_remuxer(
-            all_files,
-            mappings_str,
-            start_sec,
-            end_sec,
-            cut_mode,
-            vtt_output,
-            tx,
-        );
-
-        let (mut remuxer, output_interval) = match init_result {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-
-        let output_format = remuxer.get_output_container_format();
-        let output_codecs = remuxer.get_output_codecs();
-        let start_sec_out = output_interval
-            .start_ns
-            .map(|ns| ns as f64 / 1e9)
-            .unwrap_or(0.0);
-        let end_sec_out = output_interval
-            .end_ns
-            .map(|ns| ns as f64 / 1e9)
-            .unwrap_or(0.0);
-
-        // Notify caller that headers are ready
-        if ready_tx
-            .send(Ok((
-                output_format,
-                output_codecs.clone(),
-                start_sec_out,
-                end_sec_out,
-            )))
-            .is_err()
-        {
-            return; // Caller dropped receiver
-        }
-
-        loop {
-            match remuxer.process() {
-                Ok(state) => match state {
-                    RemuxerState::Processing(r) => {
-                        remuxer = r;
-                    }
-                    RemuxerState::Done(_) => break,
-                },
-                Err(e) => {
-                    log::trace!("Remuxing loop error: {}", e);
-                    break;
-                }
-            }
-        }
-    }
-
-    fn initialize_remuxer(
+    /// Parse user mapping string and open source files.
+    /// Returns (sources, remuxer_mappings) ready for Remuxer/ChunkedRemuxer.
+    fn parse_sources_and_mappings(
         all_files: Vec<PathBuf>,
         mappings_str: String,
-        start_sec: f64,
-        end_sec: Option<f64>,
-        cut_mode: Option<RemuxerCutMode>,
-        vtt_output: bool,
-        tx: mpsc::Sender<Bytes>,
-    ) -> Result<(Remuxer, CutInterval)> {
+    ) -> Result<(Vec<InputSource>, Vec<(u64, u64)>)> {
         let user_mappings: Vec<(usize, u32)> = mappings_str
             .split(',')
             .filter(|s| !s.is_empty())
@@ -255,15 +167,24 @@ impl FolderStreamer {
             })
             .collect();
 
-        let writer = ChannelWriterWrapper::new(SinkSender::Tokio(tx));
-        let output_sink: OutputSink<Uninitialized> = if vtt_output {
-            let vtt_sink = VttSink::new(writer);
-            OutputSink::new(Box::new(vtt_sink) as Box<dyn Sink>)
-        } else {
-            let filtered_writer = WebmFilterWriterSend::new(writer, true);
-            let stream_sink = StreamSink::new(Box::new(filtered_writer))?;
-            OutputSink::new(Box::new(stream_sink) as Box<dyn Sink>)
-        };
+        Ok((sources, remuxer_mappings))
+    }
+
+    /// Create a ChunkedRemuxer session for segment-by-segment streaming.
+    ///
+    /// Returns `(ChunkedRemuxer, mime_type, container_format, start_sec, end_sec)`.
+    ///
+    /// **Warning:** This method is blocking — call from `spawn_blocking`.
+    pub fn create_chunked_session(
+        &self,
+        mappings_str: String,
+        start_sec: f64,
+        end_sec: Option<f64>,
+        cut_mode: Option<RemuxerCutMode>,
+    ) -> Result<(ChunkedRemuxer, String, ContainerFormat, f64, f64)> {
+        let all_files = self.scan_media_files();
+        let (sources, remuxer_mappings) =
+            Self::parse_sources_and_mappings(all_files, mappings_str)?;
 
         let cut_interval = if start_sec > 0.0 || end_sec.is_some() {
             let mut interval = CutInterval::new();
@@ -278,16 +199,31 @@ impl FolderStreamer {
             None
         };
 
-        Remuxer::new(
+        let (remuxer, output_interval) = ChunkedRemuxer::new(
             sources,
-            output_sink,
             cut_interval,
             cut_mode,
             Some(remuxer_mappings),
-            false, //dont output chapters bc mse doesnt allow this
-        )
-    }
+            false, // no chapters for streaming
+        )?;
 
+        let container_format = remuxer.get_output_container_format().unwrap_or(ContainerFormat::WebM);
+        let codecs = remuxer.get_output_codecs();
+        let mime_type = codecs
+            .map(|c| c.to_mime_type(container_format))
+            .unwrap_or_else(|| "video/webm".to_string());
+
+        let start_sec_out = output_interval
+            .start_ns
+            .map(|ns| ns as f64 / 1e9)
+            .unwrap_or(0.0);
+        let end_sec_out = output_interval
+            .end_ns
+            .map(|ns| ns as f64 / 1e9)
+            .unwrap_or(0.0);
+
+        Ok((remuxer, mime_type, container_format, start_sec_out, end_sec_out))
+    }
     /// Starts the streaming process without remuxing (just stream the file as is).
     ///
     /// **Warning:** This method is blocking. You need to wrap it inside a thread
