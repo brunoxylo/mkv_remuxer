@@ -5,6 +5,7 @@ use crate::sink::{Initialized, OutputSink};
 use crate::source::{self, CutInterval, Cutting, InputSource, Remuxing, SeekType, Uninitialized};
 use crate::source_mappings::SourcesMappings;
 use crate::{ContainerFormat, Error, Result};
+use bytes::Bytes;
 use log::{debug, info, warn};
 use mkv_element::prelude::Tracks;
 
@@ -398,4 +399,266 @@ pub fn remux(
 pub enum RemuxerState {
     Processing(Remuxer),
     Done(RemuxStats),
+}
+
+pub enum ChunkedRemuxerResponse {
+    Finished(RemuxStats),
+    Segment(Bytes),
+}
+
+pub struct ChunkedRemuxer {
+    remuxer: Option<Remuxer>,
+    handle: crate::sink::ChunkedSinkHandle,
+}
+
+impl ChunkedRemuxer {
+    /// Create a new chunked remuxer.
+    ///
+    /// Uses a [`ChunkedStreamSink`](crate::sink::ChunkedStreamSink) internally
+    /// so that each `process()` call returns the newly written bytes.
+    pub fn new(
+        sources: Vec<InputSource<Uninitialized>>,
+        cut_interval: Option<CutInterval>,
+        cut_mode: Option<RemuxerCutMode>,
+        mappings: Option<Vec<TrackMapping>>,
+        do_chapter_output: bool,
+    ) -> Result<(Self, CutInterval)> {
+        let (sink, handle) = crate::sink::ChunkedStreamSink::new();
+        let output = crate::sink::OutputSink::from(sink);
+
+        let (remuxer, actual_cut) = Remuxer::new(
+            sources,
+            output,
+            cut_interval,
+            cut_mode,
+            mappings,
+            do_chapter_output,
+        )?;
+
+        // The initialization header is now in the buffer — it will be
+        // returned as part of the first `process()` call.
+        Ok((
+            Self {
+                remuxer: Some(remuxer),
+                handle,
+            },
+            actual_cut,
+        ))
+    }
+
+    /// Returns the initialization segment (EBML header + tracks) that was
+    /// written during construction. Call this *before* the first `process()` if
+    /// you need the init segment separately.
+    pub fn next_segment(&mut self) -> Result<ChunkedRemuxerResponse> {
+        let remuxer = match self.remuxer.take() {
+            Some(remuxer) => remuxer,
+            None => {
+                return Err(Error::InternalBug(
+                    "remuxer is gone while it should be there".to_string(),
+                ));
+            }
+        };
+        let next_step = remuxer.process()?;
+        match next_step {
+            RemuxerState::Processing(remuxer) => {
+                self.remuxer = Some(remuxer);
+            }
+            RemuxerState::Done(stats) => {
+                return Ok(ChunkedRemuxerResponse::Finished(stats));
+            }
+        }
+        let bytes = self.handle.next_segment();
+        if bytes.is_empty() {
+            return Err(Error::InternalBug(
+                "internal buffer is empty while it should be full".to_string(),
+            ));
+        }
+        Ok(ChunkedRemuxerResponse::Segment(bytes))
+    }
+
+    /// Returns the output container format chosen by the remuxer.
+    pub fn get_output_container_format(&self) -> Option<ContainerFormat> {
+        self.remuxer
+            .as_ref()
+            .map(|r| r.get_output_container_format())
+    }
+
+    /// Returns the output codecs chosen by the remuxer.
+    pub fn get_output_codecs(&self) -> Option<&Codecs> {
+        self.remuxer.as_ref().map(|r| r.get_output_codecs())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::FileSource;
+    use crate::test_utils::{test_file_path, validate_mkv_output};
+    use std::fs::File;
+    use std::io::Write;
+
+    /// Helper: create input sources from the default test file.
+    fn make_source() -> InputSource<Uninitialized> {
+        let file = File::open(test_file_path()).expect("Failed to open test file");
+        FileSource::new(file).unwrap().into()
+    }
+
+    #[test]
+    fn test_chunked_remuxer_basic() -> Result<()> {
+        let (mut remuxer, _cut) = ChunkedRemuxer::new(
+            vec![make_source()],
+            None, // no cut
+            None, // no cut mode
+            None, // default mappings
+            true, // include chapters
+        )?;
+
+        // The init segment should have data (EBML header + tracks)
+        let init = remuxer.handle.next_segment();
+        assert!(
+            !init.is_empty(),
+            "Init segment should contain EBML header and tracks"
+        );
+        assert!(
+            init.len() > 50,
+            "Init segment should be substantial (got {} bytes)",
+            init.len()
+        );
+
+        // Collect all cluster segments
+        let mut all_data = init.to_vec();
+        let mut segment_count = 0u64;
+
+        loop {
+            match remuxer.next_segment()? {
+                ChunkedRemuxerResponse::Segment(bytes) => {
+                    assert!(!bytes.is_empty(), "Segment should not be empty");
+                    all_data.extend_from_slice(&bytes);
+                    segment_count += 1;
+                }
+                ChunkedRemuxerResponse::Finished(stats) => {
+                    assert!(
+                        stats.blocks_processed > 0,
+                        "Should have processed at least some blocks"
+                    );
+                    assert!(
+                        stats.track_count > 0,
+                        "Should have at least one track"
+                    );
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            segment_count > 0,
+            "Should have produced at least one cluster segment"
+        );
+
+        // Write concatenated output to a temp file and validate it
+        let temp_dir = std::env::temp_dir();
+        let output_path = temp_dir.join("test_chunked_remuxer_basic.mkv");
+        {
+            let mut out = File::create(&output_path)?;
+            out.write_all(&all_data)?;
+        }
+
+        // The chunked output uses unknown segment size (streaming), so we
+        // can't validate segment_size or cues — but syntax, timestamps, and
+        // track presence should all be valid.
+        let report = validate_mkv_output(&output_path, false, None, false, true)?;
+
+        if !report.syntax_valid || !report.all_tracks_present || !report.timestamps_plausible {
+            eprintln!("{}", report.summary());
+            for e in &report.errors {
+                eprintln!("ERROR: {}", e);
+            }
+        }
+
+        assert!(report.syntax_valid, "Output should have valid EBML syntax");
+        assert!(
+            report.timestamps_plausible,
+            "Timestamps should be plausible"
+        );
+        assert!(
+            report.all_tracks_present,
+            "All declared tracks should be present in clusters"
+        );
+        assert!(
+            report.stats.total_clusters > 0,
+            "Should have at least one cluster"
+        );
+        assert!(
+            report.stats.total_blocks > 0,
+            "Should have at least one block"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunked_remuxer_with_cut() -> Result<()> {
+        let start_ns = 10_000_000_000u64; // 10 seconds
+        let end_ns = 20_000_000_000u64; // 20 seconds
+        let cut = CutInterval::new().with_range(start_ns, end_ns);
+
+        let (mut remuxer, actual_cut) = ChunkedRemuxer::new(
+            vec![make_source()],
+            Some(cut),
+            Some(RemuxerCutMode::SnapNearestKeyframe),
+            None,
+            false,
+        )?;
+
+        // Drain init segment
+        let init = remuxer.handle.next_segment();
+        assert!(!init.is_empty(), "Init segment should not be empty");
+
+        let mut all_data = init.to_vec();
+        let mut segment_count = 0u64;
+        let mut stats_out = None;
+
+        loop {
+            match remuxer.next_segment()? {
+                ChunkedRemuxerResponse::Segment(bytes) => {
+                    all_data.extend_from_slice(&bytes);
+                    segment_count += 1;
+                }
+                ChunkedRemuxerResponse::Finished(stats) => {
+                    stats_out = Some(stats);
+                    break;
+                }
+            }
+        }
+
+        let stats = stats_out.unwrap();
+        assert!(stats.blocks_processed > 0, "Should have processed blocks");
+        assert!(segment_count > 0, "Should have produced cluster segments");
+
+        // The duration should be roughly 10 seconds (may vary due to keyframe snap)
+        let expected_max_duration_ns = 15_000_000_000u64; // allow generous margin
+        assert!(
+            stats.duration_ns <= expected_max_duration_ns,
+            "Cut duration {} ns should be <= {} ns",
+            stats.duration_ns,
+            expected_max_duration_ns
+        );
+
+        // Write and validate
+        let temp_dir = std::env::temp_dir();
+        let output_path = temp_dir.join("test_chunked_remuxer_cut.mkv");
+        {
+            let mut out = File::create(&output_path)?;
+            out.write_all(&all_data)?;
+        }
+
+        let report = validate_mkv_output(&output_path, false, None, false, false)?;
+        assert!(report.syntax_valid, "Output should have valid EBML syntax");
+        assert!(
+            report.all_tracks_present,
+            "All declared tracks should be present"
+        );
+
+        Ok(())
+    }
 }

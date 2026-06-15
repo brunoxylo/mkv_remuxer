@@ -6,11 +6,13 @@ use crate::Result;
 use bytes::Bytes;
 use mkv_element::prelude::*;
 
+mod chunked_stream_sink;
 mod file_sink;
 mod stream_sink;
 mod util;
 mod vtt_sink;
 
+pub use chunked_stream_sink::{ChunkedSinkHandle, ChunkedStreamSink};
 pub use file_sink::FileSink;
 pub use stream_sink::StreamSink;
 pub use util::{Initialized, OutputSink, Uninitialized, WebmFilterWriter, WebmFilterWriterSend};

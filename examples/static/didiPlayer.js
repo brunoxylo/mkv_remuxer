@@ -79,7 +79,7 @@ class DidiPlayer {
             const name = (f.file_name || '').toLowerCase();
             return name !== 'thumbnails.mkv' && name !== 'thumbnails.webm';
         });
-        console.log('Loaded files:', this.files);
+        console.debug('Loaded files:', this.files);
     }
 
     getAllVideoTracks() {
@@ -272,7 +272,7 @@ class DidiPlayer {
      */
     static load(videoElement, endpointPath, forceClass = null) {
         const PlayerClass = forceClass || DidiPlayer.detectPlatform();
-        console.log(`[DidiPlayer] Loading ${PlayerClass.name}`);
+        console.info(`[DidiPlayer] Loading ${PlayerClass.name}`);
         return new PlayerClass(videoElement, endpointPath);
     }
 

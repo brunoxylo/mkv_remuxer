@@ -15,8 +15,11 @@ pub use cluster_warpper::{ClusterReadWrapper, ClusterWriteWrapper};
 pub use error::{Error, Result};
 pub use metling_pot::MeltingPot;
 pub use mkv_element;
-pub use remuxer::{RemuxStats, Remuxer, RemuxerCutMode, RemuxerState, TrackMapping, remux};
-pub use sink::{FileSink, Sink};
+pub use remuxer::{
+    ChunkedRemuxer, ChunkedRemuxerResponse, RemuxStats, Remuxer, RemuxerCutMode, RemuxerState,
+    TrackMapping, remux,
+};
+pub use sink::{ChunkedSinkHandle, ChunkedStreamSink, FileSink, Sink};
 pub use source::util::basic_info::MkvBasicInfo;
 pub use source::{CutInterval, Cutting, InputSource, MkvReader, Remuxing, SeekType, Source};
 pub use source_mappings::SourcesMappings;
@@ -365,18 +368,12 @@ mod tests {
             track_entry_to_mime(&dummy_track_entry("D_WEBVTT/CAPTIONS")),
             None
         );
-        assert_eq!(
-            track_entry_to_mime(&dummy_track_entry("S_TEXT/UTF8")),
-            None
-        );
+        assert_eq!(track_entry_to_mime(&dummy_track_entry("S_TEXT/UTF8")), None);
     }
 
     #[test]
     fn test_track_entry_to_mime_unknown_prefix() {
-        assert_eq!(
-            track_entry_to_mime(&dummy_track_entry("X_SOMETHING")),
-            None
-        );
+        assert_eq!(track_entry_to_mime(&dummy_track_entry("X_SOMETHING")), None);
         assert_eq!(track_entry_to_mime(&dummy_track_entry("")), None);
         assert_eq!(track_entry_to_mime(&dummy_track_entry("V")), None);
     }

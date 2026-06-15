@@ -30,6 +30,7 @@ class DidiMse extends DidiPlayer {
         super(videoElement, endpointPath);
         this._seekAbort = null;
         this._activeMediaSource = null;
+        this._firstSeek = true;  // auto-play on first canplay (replaces HTML autoplay attr)
 
         // Inline subtitle state
         this._inlineSubTrackId = -1;       // original track ID (for mappings request)
@@ -48,7 +49,7 @@ class DidiMse extends DidiPlayer {
     }
 
     async seek(seconds) {
-        console.trace(`[DidiMse] seek() called with seconds=${seconds}`);
+        console.debug(`[DidiMse] seek() called with seconds=${seconds}`);
         const wasPlaying = !this.video.paused;
 
         let currentAbsTime = this.video.currentTime + (this.currentSeekOffset || 0);
@@ -87,7 +88,7 @@ class DidiMse extends DidiPlayer {
             const headerStart = parseFloat(res.headers.get('x-media-start-sec'));
             this.currentSeekOffset = !isNaN(headerStart) ? headerStart : seconds;
             let mimeType = res.headers.get('content-type') || 'video/webm';
-            console.log(`[DidiMse] Server Content-Type: "${mimeType}" | MSE supported: ${_MSE ? _MSE.isTypeSupported(mimeType) : 'no MSE'}`);
+            console.debug(`[DidiMse] Server Content-Type: "${mimeType}" | MSE supported: ${_MSE ? _MSE.isTypeSupported(mimeType) : 'no MSE'}`);
 
             this._inlineSubCues = [];
             // Remove only static blob-URL tracks; preserve the dynamic track element.
@@ -106,7 +107,7 @@ class DidiMse extends DidiPlayer {
             }
 
             if (_MSE && _MSE.isTypeSupported(mimeType)) {
-                console.log('[DidiMse] ✓ MSE path entered, creating MediaSource…');
+                console.info('[DidiMse] ✓ MSE path entered, creating MediaSource…');
                 const ms = new _MSE();
                 this._activeMediaSource = ms;
                 const objectUrl = URL.createObjectURL(ms);
@@ -118,12 +119,15 @@ class DidiMse extends DidiPlayer {
                     : 0;
 
                 const onCanPlay = () => {
-                    console.log('[DidiMse] ✓ canplay fired');
+                    console.debug('[DidiMse] ✓ canplay fired');
                     this.video.removeEventListener('canplay', onCanPlay);
                     if (seekOffsetInStream > 0.1) {
                         this.video.currentTime = seekOffsetInStream;
                     }
-                    if (wasPlaying) this.video.play().catch(() => { });
+                    if (wasPlaying || this._firstSeek) {
+                        this._firstSeek = false;
+                        this.video.play().catch(() => { });
+                    }
                     if (this._inlineSubTrackId <= 0) {
                         this.reloadSubtitles();
                     }
@@ -143,16 +147,16 @@ class DidiMse extends DidiPlayer {
                     this._subtitleBlobUrl = null;
                 }
                 this.video.src = objectUrl;
-                console.log('[DidiMse] video.src set, waiting for sourceopen…');
+                console.debug('[DidiMse] video.src set, waiting for sourceopen…');
 
                 ms.addEventListener('sourceopen', async () => {
-                    console.log('[DidiMse] ✓ sourceopen fired, readyState:', ms.readyState);
+                    console.info('[DidiMse] ✓ sourceopen fired, readyState:', ms.readyState);
                     URL.revokeObjectURL(objectUrl);
 
                     let sb;
                     try {
                         sb = ms.addSourceBuffer(mimeType);
-                        console.log('[DidiMse] ✓ addSourceBuffer succeeded for:', mimeType);
+                        console.info('[DidiMse] ✓ addSourceBuffer succeeded for:', mimeType);
                     } catch (e) {
                         this._emitError(DidiErrorType.DECODE, 'addSourceBuffer failed: ' + e.message);
                         ms.endOfStream('decode');
@@ -185,7 +189,7 @@ class DidiMse extends DidiPlayer {
                             this._dynamicTrackEl.default = true;
                             this.video.appendChild(this._dynamicTrackEl);
                             this._dynamicTrack = this._dynamicTrackEl.track;
-                            console.log('[DidiMse Subs] Created <track> element. track:', this._dynamicTrack);
+                            console.debug('[DidiMse Subs] Created <track> element. track:', this._dynamicTrack);
                         }
                         if (this._dynamicTrack) this._dynamicTrack.mode = 'showing';
                         // Clear stale cues from previous seek
@@ -208,166 +212,114 @@ class DidiMse extends DidiPlayer {
                     // scanner: optional EbmlSubtitleScanner — fed inline so it's throttled by the pump
 
                     const MIN_INITIAL_APPEND = 32 * 1024;  // 32KB — ensures full init segment
-                    const MIN_APPEND = 64 * 1024;  // 64KB — subsequent appends
+                    const MIN_APPEND = 256 * 1024; // 256KB — larger appends reduce pump blocking
                     const MAX_APPEND = 1024 * 1024; // 1MB  — split very large appends
 
                     /**
-                     * Patch the EBML init segment for Chrome MSE compatibility:
-                     *  1. If DocType is "matroska", rewrite to "webm".
-                     *  2. If the Segment element has a known size, rewrite to unknown.
-                     *  3. Void out Matroska-only elements inside Info that Chrome's
-                     *     strict WebM parser rejects (SegmentUID, DateUTC, etc.).
-                     *     The WebM spec only allows: TimestampScale, Duration,
-                     *     MuxingApp, WritingApp inside Info.
+                     * Diagnose the EBML init segment for Chrome MSE compatibility.
+                     * Does NOT modify the bytestream — the backend is expected to
+                     * provide correct WebM output.  Logs warnings if issues are found.
                      */
-                    const patchForMse = (buf) => {
-                        const out = new Uint8Array(buf);  // copy so we can mutate
+                    const diagnoseInitSegment = (buf) => {
+                        const data = new Uint8Array(buf);
 
                         // Helper: read EBML element ID at `pos`, return {id, len} or null
-                        const readElementId = (data, pos) => {
-                            if (pos >= data.length) return null;
-                            const b = data[pos];
+                        const readElementId = (d, pos) => {
+                            if (pos >= d.length) return null;
+                            const b = d[pos];
                             let idLen;
                             if (b & 0x80) idLen = 1;
                             else if (b & 0x40) idLen = 2;
                             else if (b & 0x20) idLen = 3;
                             else if (b & 0x10) idLen = 4;
                             else return null;
-                            if (pos + idLen > data.length) return null;
+                            if (pos + idLen > d.length) return null;
                             let id = 0;
-                            for (let j = 0; j < idLen; j++) id = (id << 8) | data[pos + j];
+                            for (let j = 0; j < idLen; j++) id = (id << 8) | d[pos + j];
                             return { id, len: idLen };
                         };
 
                         // Helper: read EBML VINT size at `pos`, return {size, len} or null
-                        const readVintSize = (data, pos) => {
-                            if (pos >= data.length) return null;
-                            const sLen = _ebmlVintLength(data[pos]);
-                            if (sLen === 0 || pos + sLen > data.length) return null;
+                        const readVintSize = (d, pos) => {
+                            if (pos >= d.length) return null;
+                            const sLen = _ebmlVintLength(d[pos]);
+                            if (sLen === 0 || pos + sLen > d.length) return null;
                             const mask = (1 << (8 - sLen)) - 1;
-                            let size = data[pos] & mask;
-                            for (let j = 1; j < sLen; j++) size = (size * 256) + data[pos + j];
-                            // Check for "unknown" size (all data bits 1)
-                            let isUnknown = (data[pos] & mask) === mask;
-                            for (let j = 1; j < sLen && isUnknown; j++) if (data[pos + j] !== 0xFF) isUnknown = false;
+                            let size = d[pos] & mask;
+                            for (let j = 1; j < sLen; j++) size = (size * 256) + d[pos + j];
+                            let isUnknown = (d[pos] & mask) === mask;
+                            for (let j = 1; j < sLen && isUnknown; j++) if (d[pos + j] !== 0xFF) isUnknown = false;
                             return { size: isUnknown ? -1 : size, len: sLen };
                         };
 
-                        // Helper: replace element at `pos` with a Void element of same total length
-                        const voidElement = (data, pos, totalLen) => {
-                            // Void element: ID=0xEC (1 byte), then VINT size, then padding
-                            const payloadLen = totalLen - 1; // subtract 1 for the Void ID byte
-                            // We need a VINT that encodes payloadLen - vintLen (data bytes).
-                            // For simplicity, try 1-byte VINT first (handles up to 126 data bytes = 128 total)
-                            let vintLen;
-                            if (payloadLen - 1 <= 0x7E) vintLen = 1;
-                            else if (payloadLen - 2 <= 0x3FFE) vintLen = 2;
-                            else if (payloadLen - 3 <= 0x1FFFFE) vintLen = 3;
-                            else vintLen = 4;
-                            const dataLen = payloadLen - vintLen;
-                            data[pos] = 0xEC;  // Void ID
-                            // Write VINT size
-                            if (vintLen === 1) {
-                                data[pos + 1] = 0x80 | dataLen;
-                            } else if (vintLen === 2) {
-                                data[pos + 1] = 0x40 | ((dataLen >> 8) & 0x3F);
-                                data[pos + 2] = dataLen & 0xFF;
-                            } else if (vintLen === 3) {
-                                data[pos + 1] = 0x20 | ((dataLen >> 16) & 0x1F);
-                                data[pos + 2] = (dataLen >> 8) & 0xFF;
-                                data[pos + 3] = dataLen & 0xFF;
-                            }
-                            // Fill data with zeros (padding)
-                            for (let j = 1 + vintLen; j < totalLen; j++) data[pos + j] = 0x00;
-                        };
-
-                        // ── 1. Patch DocType ─────────────────────────────────────
-                        for (let i = 0; i < Math.min(out.length - 12, 64); i++) {
-                            if (out[i] === 0x42 && out[i + 1] === 0x82) {
+                        // ── 1. Check DocType ─────────────────────────────────────
+                        for (let i = 0; i < Math.min(data.length - 12, 64); i++) {
+                            if (data[i] === 0x42 && data[i + 1] === 0x82) {
                                 const sizeStart = i + 2;
-                                const sizeLen = _ebmlVintLength(out[sizeStart]);
+                                const sizeLen = _ebmlVintLength(data[sizeStart]);
                                 if (sizeLen === 0) continue;
-                                let docTypeSize = out[sizeStart] & ((1 << (8 - sizeLen)) - 1);
-                                for (let j = 1; j < sizeLen; j++) docTypeSize = (docTypeSize << 8) | out[sizeStart + j];
+                                let docTypeSize = data[sizeStart] & ((1 << (8 - sizeLen)) - 1);
+                                for (let j = 1; j < sizeLen; j++) docTypeSize = (docTypeSize << 8) | data[sizeStart + j];
                                 const strStart = sizeStart + sizeLen;
                                 const strEnd = strStart + docTypeSize;
-                                if (strEnd > out.length) continue;
-                                const docType = new TextDecoder().decode(out.subarray(strStart, strEnd));
-                                console.log(`[DidiMse] EBML DocType: "${docType}" (${docTypeSize} bytes)`);
-                                if (docType.replace(/\0+$/, '') === 'matroska') {
-                                    console.warn('[DidiMse] Patching DocType "matroska" → "webm"');
-                                    const webm = new TextEncoder().encode('webm');
-                                    for (let k = 0; k < docTypeSize; k++) {
-                                        out[strStart + k] = k < webm.length ? webm[k] : 0;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-
-                        // ── 2. Patch Segment size to unknown ─────────────────────
-                        const segId = [0x18, 0x53, 0x80, 0x67];
-                        let segmentContentStart = -1;
-                        for (let i = 0; i < Math.min(out.length - 12, 128); i++) {
-                            if (out[i] === segId[0] && out[i + 1] === segId[1] &&
-                                out[i + 2] === segId[2] && out[i + 3] === segId[3]) {
-                                const sizeStart = i + 4;
-                                const sv = readVintSize(out, sizeStart);
-                                if (!sv) break;
-                                segmentContentStart = sizeStart + sv.len;
-
-                                if (sv.size === -1) {
-                                    console.log(`[DidiMse] Segment size: unknown (${sv.len}-byte VINT) — OK`);
+                                if (strEnd > data.length) continue;
+                                const docType = new TextDecoder().decode(data.subarray(strStart, strEnd)).replace(/\0+$/, '');
+                                if (docType === 'webm') {
+                                    console.debug(`[DidiMse] DocType: "webm" — OK`);
                                 } else {
-                                    console.warn(`[DidiMse] Segment has known size ${sv.size} — patching to unknown`);
-                                    const mask = (1 << (8 - sv.len)) - 1;
-                                    out[sizeStart] = (1 << (8 - sv.len)) | mask;
-                                    for (let j = 1; j < sv.len; j++) out[sizeStart + j] = 0xFF;
+                                    console.warn(`[DidiMse] DocType: "${docType}" — Chrome MSE requires "webm"!`);
                                 }
                                 break;
                             }
                         }
 
-                        // ── 3. Void out Matroska-only elements inside Info ───────
-                        // WebM-allowed Info sub-elements:
-                        const WEBM_INFO_ALLOWED = new Set([
-                            0x2AD7B1,  // TimestampScale
-                            0x4489,    // Duration
-                            0x4D80,    // MuxingApp
-                            0x5741,    // WritingApp
-                        ]);
-                        // Info element ID = 0x1549A966
-                        if (segmentContentStart > 0) {
-                            const infoId = readElementId(out, segmentContentStart);
-                            if (infoId && infoId.id === 0x1549A966) {
-                                const infoSizeV = readVintSize(out, segmentContentStart + infoId.len);
-                                if (infoSizeV && infoSizeV.size > 0) {
-                                    const infoContentStart = segmentContentStart + infoId.len + infoSizeV.len;
-                                    const infoContentEnd = infoContentStart + infoSizeV.size;
-                                    let pos = infoContentStart;
-                                    let voided = [];
-                                    while (pos < infoContentEnd && pos < out.length) {
-                                        const elId = readElementId(out, pos);
-                                        if (!elId) break;
-                                        const elSize = readVintSize(out, pos + elId.len);
-                                        if (!elSize || elSize.size < 0) break;
-                                        const totalLen = elId.len + elSize.len + elSize.size;
+                        // ── 2. Check Segment size ────────────────────────────────
+                        const segId = [0x18, 0x53, 0x80, 0x67];
+                        for (let i = 0; i < Math.min(data.length - 12, 128); i++) {
+                            if (data[i] === segId[0] && data[i + 1] === segId[1] &&
+                                data[i + 2] === segId[2] && data[i + 3] === segId[3]) {
+                                const sizeStart = i + 4;
+                                const sv = readVintSize(data, sizeStart);
+                                if (!sv) break;
+                                if (sv.size === -1) {
+                                    console.debug(`[DidiMse] Segment size: unknown — OK`);
+                                } else {
+                                    console.warn(`[DidiMse] Segment has known size ${sv.size} — Chrome MSE may require unknown size for streaming!`);
+                                }
 
-                                        if (!WEBM_INFO_ALLOWED.has(elId.id)) {
-                                            voided.push(`0x${elId.id.toString(16).toUpperCase()}`);
-                                            voidElement(out, pos, totalLen);
+                                // ── 3. Check Info sub-elements ───────────────────
+                                const segContentStart = sizeStart + sv.len;
+                                const WEBM_INFO_ALLOWED = new Set([
+                                    0x2AD7B1, 0x4489, 0x4D80, 0x5741,  // TimestampScale, Duration, MuxingApp, WritingApp
+                                ]);
+                                const infoId = readElementId(data, segContentStart);
+                                if (infoId && infoId.id === 0x1549A966) {
+                                    const infoSizeV = readVintSize(data, segContentStart + infoId.len);
+                                    if (infoSizeV && infoSizeV.size > 0) {
+                                        const infoContentStart = segContentStart + infoId.len + infoSizeV.len;
+                                        const infoContentEnd = infoContentStart + infoSizeV.size;
+                                        let pos = infoContentStart;
+                                        let nonWebm = [];
+                                        while (pos < infoContentEnd && pos < data.length) {
+                                            const elId = readElementId(data, pos);
+                                            if (!elId) break;
+                                            const elSize = readVintSize(data, pos + elId.len);
+                                            if (!elSize || elSize.size < 0) break;
+                                            if (!WEBM_INFO_ALLOWED.has(elId.id) && elId.id !== 0xEC) {
+                                                nonWebm.push(`0x${elId.id.toString(16).toUpperCase()}`);
+                                            }
+                                            pos += elId.len + elSize.len + elSize.size;
                                         }
-                                        pos += totalLen;
-                                    }
-                                    if (voided.length > 0) {
-                                        console.warn(`[DidiMse] Voided ${voided.length} Matroska-only Info element(s): ${voided.join(', ')} — not in WebM spec`);
-                                    } else {
-                                        console.log('[DidiMse] Info element: all sub-elements are WebM-compatible — OK');
+                                        if (nonWebm.length > 0) {
+                                            console.warn(`[DidiMse] Info contains non-WebM element(s): ${nonWebm.join(', ')} — Chrome may reject these`);
+                                        } else {
+                                            console.debug('[DidiMse] Info sub-elements: all WebM-compatible — OK');
+                                        }
                                     }
                                 }
+                                break;
                             }
                         }
-                        return out;
                     };
 
 
@@ -403,7 +355,7 @@ class DidiMse extends DidiPlayer {
                                 const hexLen = Math.min(512, data.length);
                                 const hex = Array.from(data.subarray(0, hexLen))
                                     .map(b => b.toString(16).padStart(2, '0')).join(' ');
-                                console.log(`[DidiMse] first append hex (${data.length} bytes, showing ${hexLen}): ${hex}`);
+                                console.debug(`[DidiMse] first append hex (${data.length} bytes, showing ${hexLen}): ${hex}`);
 
                                 // Structured EBML element listing for debugging
                                 try {
@@ -454,7 +406,7 @@ class DidiMse extends DidiPlayer {
                                     if (ebmlId) {
                                         const ebmlSz = readSz(data, pos + ebmlId.len);
                                         if (ebmlSz && ebmlSz.size > 0) {
-                                            console.log(`[DidiMse EBML] EBML header: ${ebmlId.len + ebmlSz.len + ebmlSz.size} bytes`);
+                                            console.debug(`[DidiMse EBML] EBML header: ${ebmlId.len + ebmlSz.len + ebmlSz.size} bytes`);
                                             pos = ebmlId.len + ebmlSz.len + ebmlSz.size;
                                         }
                                     }
@@ -473,7 +425,7 @@ class DidiMse extends DidiPlayer {
                                                 if (!cSz) break;
                                                 const name = NAMES[cId.id] || `0x${cId.id.toString(16).toUpperCase()}`;
                                                 const sizeStr = cSz.size === -1 ? 'unknown' : cSz.size;
-                                                console.log(`[DidiMse EBML]   ${name} (id=0x${cId.id.toString(16)}, size=${sizeStr}) @ byte ${pos}`);
+                                                console.debug(`[DidiMse EBML]   ${name} (id=0x${cId.id.toString(16)}, size=${sizeStr}) @ byte ${pos}`);
 
                                                 // For Info and Tracks, also list their children
                                                 if (cId.id === 0x1549A966 || cId.id === 0x1654AE6B) {
@@ -489,7 +441,7 @@ class DidiMse extends DidiPlayer {
                                                         const totalLen = chId.len + chSz.len + chSz.size;
                                                         // For TrackEntry, also show its children
                                                         if (chId.id === 0xAE) {
-                                                            console.log(`[DidiMse EBML]     ${chName} (size=${chSz.size}) @ byte ${cp}`);
+                                                            console.debug(`[DidiMse EBML]     ${chName} (size=${chSz.size}) @ byte ${cp}`);
                                                             let tp = cp + chId.len + chSz.len;
                                                             const tEnd = Math.min(tp + chSz.size, data.length);
                                                             while (tp < tEnd) {
@@ -510,11 +462,11 @@ class DidiMse extends DidiPlayer {
                                                                         valStr = ` = ${v}`;
                                                                     }
                                                                 }
-                                                                console.log(`[DidiMse EBML]       ${tName} (size=${tSz.size})${valStr}`);
+                                                                console.debug(`[DidiMse EBML]       ${tName} (size=${tSz.size})${valStr}`);
                                                                 tp += tId.len + tSz.len + tSz.size;
                                                             }
                                                         } else {
-                                                            console.log(`[DidiMse EBML]     ${chName} (size=${chSz.size}) @ byte ${cp}`);
+                                                            console.debug(`[DidiMse EBML]     ${chName} (size=${chSz.size}) @ byte ${cp}`);
                                                         }
                                                         cp += totalLen;
                                                     }
@@ -528,7 +480,7 @@ class DidiMse extends DidiPlayer {
                                     }
                                 } catch (e) { console.warn('[DidiMse EBML] decode error:', e); }
 
-                                data = patchForMse(data);
+                                diagnoseInitSegment(data);  // log-only, no byte mutation
                             }
 
                             // Split large buffers into ≤ MAX_APPEND slices
@@ -543,21 +495,41 @@ class DidiMse extends DidiPlayer {
 
                                 appendCount++;
                                 const hexPreview = Array.from(slice.subarray(0, Math.min(32, slice.length))).map(b => b.toString(16).padStart(2, '0')).join(' ');
-                                if (appendCount <= 8) console.log(`[DidiMse] appendBuffer #${appendCount}: ${slice.byteLength} bytes, hex: ${hexPreview}`);
+                                if (appendCount <= 8) console.debug(`[DidiMse] appendBuffer #${appendCount}: ${slice.byteLength} bytes, hex: ${hexPreview}`);
                                 sb.appendBuffer(slice);
                                 await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
                                 if (appendCount <= 8) {
                                     const bufInfo = sb.buffered.length > 0 ? sb.buffered.end(sb.buffered.length - 1).toFixed(1) + 's' : 'none';
-                                    console.log(`[DidiMse] appendBuffer #${appendCount} done, buffered: ${bufInfo}, readyState: ${ms.readyState}`);
+                                    console.debug(`[DidiMse] appendBuffer #${appendCount} done, buffered: ${bufInfo}, readyState: ${ms.readyState}`);
                                 }
 
-                                // Throttle: if buffer is >30s ahead of playhead, wait
+                                // Buffer health diagnostics
                                 if (sb.buffered.length > 0) {
-                                    let ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                                    const bufEnd = sb.buffered.end(sb.buffered.length - 1);
+                                    const ahead = bufEnd - this.video.currentTime;
+
+                                    // Warn on low buffer (potential stutter)
+                                    if (ahead < 2 && ahead >= 0 && !this.video.paused) {
+                                        console.warn(`[DidiMse] LOW BUFFER: only ${ahead.toFixed(2)}s ahead of playhead`);
+                                    }
+
+                                    // Detect buffered gaps (discontinuities cause audio glitches)
+                                    if (sb.buffered.length > 1) {
+                                        let gapInfo = '';
+                                        for (let r = 0; r < sb.buffered.length - 1; r++) {
+                                            const gapStart = sb.buffered.end(r);
+                                            const gapEnd = sb.buffered.start(r + 1);
+                                            gapInfo += ` [${gapStart.toFixed(2)}-${gapEnd.toFixed(2)}]`;
+                                        }
+                                        console.warn(`[DidiMse] BUFFERED GAP(s):${gapInfo} (${sb.buffered.length} ranges)`);
+                                    }
+
+                                    // Throttle: if buffer is >30s ahead of playhead, wait
                                     while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
                                         await new Promise(r => setTimeout(r, 1000));
                                         if (sb.buffered.length === 0) break;
-                                        ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                                        const newAhead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                                        if (newAhead <= 30) break;
                                     }
                                 }
                             }
@@ -576,11 +548,11 @@ class DidiMse extends DidiPlayer {
                                 if (done) {
                                     // Flush any remaining buffered data
                                     await flushPending();
-                                    console.log(`[DidiMse] pump done after ${chunkCount} chunks, ${appendCount} appends`);
+                                    console.info(`[DidiMse] pump done after ${chunkCount} chunks, ${appendCount} appends`);
                                     return 'done';
                                 }
                                 chunkCount++;
-                                if (chunkCount <= 5) console.log(`[DidiMse] chunk #${chunkCount}: ${value.byteLength} bytes`);
+                                if (chunkCount <= 5) console.debug(`[DidiMse] chunk #${chunkCount}: ${value.byteLength} bytes`);
 
                                 // Feed chunk to subtitle scanner inline (naturally throttled with pump)
                                 if (scanner) {
@@ -644,7 +616,7 @@ class DidiMse extends DidiPlayer {
                             } else {
                                 resumeAt = this.video.currentTime + (this.currentSeekOffset || 0);
                             }
-                            console.log(`[DidiMse] Reconnecting from ${resumeAt.toFixed(1)}s in ${(backoff / 1000).toFixed(0)}s...`);
+                            console.info(`[DidiMse] Reconnecting from ${resumeAt.toFixed(1)}s in ${(backoff / 1000).toFixed(0)}s...`);
                             await new Promise(r => setTimeout(r, backoff));
                             backoff = Math.min(backoff * 2, 10000);
                             if (controller.signal.aborted || ms.readyState !== 'open') break;
@@ -676,7 +648,7 @@ class DidiMse extends DidiPlayer {
                             }
                         }
 
-                        console.log(`[DidiMse] pump exited with result: "${result}", ms.readyState: ${ms.readyState}`);
+                        console.info(`[DidiMse] pump exited with result: "${result}", ms.readyState: ${ms.readyState}`);
                         if (result === 'done' && ms.readyState === 'open') {
                             try { ms.endOfStream(); } catch (e) { }
                         } else if (result === 'error' && ms.readyState === 'open') {
