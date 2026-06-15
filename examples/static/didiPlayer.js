@@ -31,9 +31,10 @@ class DidiPlayer {
     /** Subtitle codecs that can be rendered by the player (WebVTT only). */
     static SUPPORTED_SUBTITLE_CODECS = ['webvtt', 's_text/webvtt'];
 
-    constructor(videoElement, endpointPath) {
+    constructor(videoElement, endpointPath, sessionBase = null) {
         this.video = videoElement;
         this.apiBase = endpointPath;
+        this.sessionBase = sessionBase || '/sessions';
         this.files = [];
         this.activeFileIndex = -1;
         this.activeVideoTrackId = -1;
@@ -268,14 +269,16 @@ class DidiPlayer {
      * @param {HTMLVideoElement} videoElement
      * @param {string} endpointPath - base API path for media listing/remuxing
      * @param {Object} [opts] - optional config
+     * @param {string} [opts.sessionBase] - base path for session API (defaults to endpointPath)
      * @param {Function} [opts.forceClass] - pass DidiMse or DidiLegacy to override auto-detection
      * @returns {DidiPlayer}
      */
     static load(videoElement, endpointPath, opts = {}) {
         const forceClass = typeof opts === 'function' ? opts : opts.forceClass;
+        const sessionBase = (typeof opts === 'object' && opts.sessionBase) || null;
         const PlayerClass = forceClass || DidiPlayer.detectPlatform();
         console.info(`[DidiPlayer] Loading ${PlayerClass.name}`);
-        return new PlayerClass(videoElement, endpointPath);
+        return new PlayerClass(videoElement, endpointPath, sessionBase);
     }
 
     /**

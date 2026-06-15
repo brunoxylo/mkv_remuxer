@@ -26,8 +26,8 @@ function _ebmlVintLength(byte) {
 }
 
 class DidiMse extends DidiPlayer {
-    constructor(videoElement, endpointPath) {
-        super(videoElement, endpointPath);
+    constructor(videoElement, endpointPath, sessionBase = null) {
+        super(videoElement, endpointPath, sessionBase);
         this._seekAbort = null;
         this._activeMediaSource = null;
         this._firstSeek = true;  // auto-play on first canplay (replaces HTML autoplay attr)
@@ -35,6 +35,7 @@ class DidiMse extends DidiPlayer {
         // Session state
         this._sessionId = null;
         this._clientId = DidiMse._getOrCreateClientId();
+        this._keepaliveInterval = null;
 
         // Inline subtitle state
         this._inlineSubTrackId = -1;       // original track ID (for mappings request)
@@ -52,11 +53,43 @@ class DidiMse extends DidiPlayer {
     }
 
     destroy() {
+        this._stopKeepalive();
         if (this._seekAbort) this._seekAbort.abort();
         if (this._sessionId) {
             // Fire-and-forget DELETE
-            fetch(`/sessions/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
+            fetch(`${this.sessionBase}/session/${this._sessionId}`, { method: 'DELETE', cache: 'no-store' }).catch(() => { });
             this._sessionId = null;
+        }
+    }
+
+    /**
+     * Start polling GET /session/{id}/step every 60s to keep the server
+     * session alive (prevents the 3-minute inactivity timeout).
+     * Stops automatically if the server reports the session is gone.
+     */
+    _startKeepalive() {
+        this._stopKeepalive();
+        this._keepaliveInterval = setInterval(async () => {
+            if (!this._sessionId) {
+                this._stopKeepalive();
+                return;
+            }
+            try {
+                const res = await fetch(`${this.sessionBase}/session/${this._sessionId}/step`, { cache: 'no-store' });
+                if (!res.ok) {
+                    console.warn(`[DidiMse] Keepalive: session ${this._sessionId} gone (${res.status}), stopping poll`);
+                    this._stopKeepalive();
+                }
+            } catch (e) {
+                console.warn('[DidiMse] Keepalive fetch failed:', e.message);
+            }
+        }, 60_000);
+    }
+
+    _stopKeepalive() {
+        if (this._keepaliveInterval) {
+            clearInterval(this._keepaliveInterval);
+            this._keepaliveInterval = null;
         }
     }
 
@@ -84,27 +117,28 @@ class DidiMse extends DidiPlayer {
             this._inlineSubOutputTrack = mappings.split(',').length;
         }
 
-        // Abort previous session/seek
+        // Abort previous session/seek and stop keepalive
+        this._stopKeepalive();
         if (this._seekAbort) this._seekAbort.abort();
         const controller = new AbortController();
         this._seekAbort = controller;
 
         // Destroy previous session
         if (this._sessionId) {
-            fetch(`/sessions/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
+            fetch(`${this.sessionBase}/session/${this._sessionId}`, { method: 'DELETE', cache: 'no-store' }).catch(() => { });
             this._sessionId = null;
         }
-
         try {
-            // 1. Create session
-            const streamParams = new URLSearchParams({
+            // 1. Create session (GET apiBase/start_stream_session?mappings=...&start=...&seek=...)
+            const qs = new URLSearchParams({
                 client_id: this._clientId,
                 mappings: mappings,
-                start: seconds.toString(),
+                start: String(seconds),
                 seek: seekMode,
             });
-            const createRes = await fetch(`${this.apiBase}/start_stream_session?${streamParams}`, {
+            const createRes = await fetch(`${this.apiBase}/start_stream_session?${qs}`, {
                 signal: controller.signal,
+                cache: 'no-store',
             });
             if (!createRes.ok) {
                 this._emitError(DidiErrorType.NETWORK, await createRes.text());
@@ -115,10 +149,12 @@ class DidiMse extends DidiPlayer {
             const mimeType = session.mime_type;
             this.currentSeekOffset = session.start_sec || seconds;
             console.info(`[DidiMse] Session created: ${session.session_id}, mime: ${mimeType}`);
+            this._startKeepalive();
 
             // 2. Get init segment (step 0)
-            const initRes = await fetch(`/sessions/${this._sessionId}/segment`, {
+            const initRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
                 signal: controller.signal,
+                cache: 'no-store',
             });
             if (!initRes.ok) {
                 this._emitError(DidiErrorType.NETWORK, 'Failed to fetch init segment');
@@ -156,10 +192,8 @@ class DidiMse extends DidiPlayer {
             const onCanPlay = () => {
                 this.video.removeEventListener('canplay', onCanPlay);
                 if (seekOffsetInStream > 0.1) this.video.currentTime = seekOffsetInStream;
-                if (wasPlaying || this._firstSeek) {
-                    this._firstSeek = false;
-                    this.video.play().catch(() => {});
-                }
+                this._firstSeek = false;
+                this.video.play().catch(() => { });
                 if (this._inlineSubTrackId <= 0) this.reloadSubtitles();
             };
             this.video.addEventListener('canplay', onCanPlay);
@@ -203,11 +237,35 @@ class DidiMse extends DidiPlayer {
 
                 // Helper: append data to SourceBuffer and wait
                 const appendToSb = async (data) => {
-                    if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-                    if (controller.signal.aborted || ms.readyState !== 'open') return false;
-                    sb.appendBuffer(data);
-                    await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-                    return true;
+                    try {
+                        if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                        if (controller.signal.aborted || ms.readyState !== 'open') return false;
+                        try {
+                            sb.appendBuffer(data);
+                        } catch (e) {
+                            if (e.name === 'QuotaExceededError') {
+                                console.warn('[DidiMse] QuotaExceededError — evicting old buffer');
+                                const ct = this.video.currentTime;
+                                if (ct > 1 && sb.buffered.length > 0) {
+                                    const evictEnd = Math.max(0, ct - 1);
+                                    if (evictEnd > sb.buffered.start(0)) {
+                                        sb.remove(sb.buffered.start(0), evictEnd);
+                                        await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                                    }
+                                }
+                                if (controller.signal.aborted || ms.readyState !== 'open') return false;
+                                sb.appendBuffer(data);
+                            } else {
+                                throw e;
+                            }
+                        }
+                        await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+                        return true;
+                    } catch (e) {
+                        // SourceBuffer invalidated by a concurrent seek
+                        console.debug('[DidiMse] appendToSb failed (sb invalidated):', e.message);
+                        return false;
+                    }
                 };
 
                 // 4. Append init segment
@@ -221,22 +279,29 @@ class DidiMse extends DidiPlayer {
 
                 while (!controller.signal.aborted && ms.readyState === 'open') {
                     // Throttle: wait if buffer is >30s ahead
-                    if (sb.buffered.length > 0) {
-                        const ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
-                        while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
-                            await new Promise(r => setTimeout(r, 1000));
-                            if (sb.buffered.length === 0) break;
-                            const newAhead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
-                            if (newAhead <= 30) break;
+                    try {
+                        if (sb.buffered.length > 0) {
+                            const ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                            while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
+                                await new Promise(r => setTimeout(r, 1000));
+                                if (sb.buffered.length === 0) break;
+                                const newAhead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
+                                if (newAhead <= 30) break;
+                            }
                         }
+                    } catch (e) {
+                        // SourceBuffer became invalid (new seek destroyed the MediaSource)
+                        console.debug('[DidiMse] SourceBuffer invalidated during throttle, exiting pump');
+                        break;
                     }
 
                     // Advance to next segment
                     let nextRes;
                     try {
-                        nextRes = await fetch(`/sessions/${this._sessionId}/next`, {
+                        nextRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/next`, {
                             method: 'POST',
                             signal: controller.signal,
+                            cache: 'no-store',
                         });
                     } catch (e) {
                         if (e.name === 'AbortError') break;
@@ -265,8 +330,9 @@ class DidiMse extends DidiPlayer {
                     // Fetch the segment data
                     let segRes;
                     try {
-                        segRes = await fetch(`/sessions/${this._sessionId}/segment`, {
+                        segRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
                             signal: controller.signal,
+                            cache: 'no-store',
                         });
                     } catch (e) {
                         if (e.name === 'AbortError') break;
@@ -304,15 +370,17 @@ class DidiMse extends DidiPlayer {
                     if (!(await appendToSb(segData))) break;
 
                     if (step <= 3) {
-                        const bufInfo = sb.buffered.length > 0
-                            ? sb.buffered.end(sb.buffered.length - 1).toFixed(1) + 's' : 'none';
-                        console.debug(`[DidiMse] Step ${step}: ${segData.byteLength} bytes, buffered: ${bufInfo}`);
+                        try {
+                            const bufInfo = sb.buffered.length > 0
+                                ? sb.buffered.end(sb.buffered.length - 1).toFixed(1) + 's' : 'none';
+                            console.debug(`[DidiMse] Step ${step}: ${segData.byteLength} bytes, buffered: ${bufInfo}`);
+                        } catch (e) { /* sb invalidated */ }
                     }
                 }
 
                 // End of stream
                 if (ms.readyState === 'open') {
-                    try { ms.endOfStream(); } catch (e) {}
+                    try { ms.endOfStream(); } catch (e) { }
                 }
                 console.info(`[DidiMse] Session pump finished at step ${step}`);
             }, { once: true });
