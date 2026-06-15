@@ -8,12 +8,11 @@
 /// - **Session-based chunked streaming** for resilient, segment-by-segment delivery
 ///
 /// Session API:
-///   POST /session                → create session (body: { client_id, mappings, start, end, seek })
-///   GET  /session/{id}/init      → get init segment (EBML header + tracks)
-///   GET  /session/{id}/segment   → get current segment (idempotent, retry-safe)
-///   POST /session/{id}/next      → advance to next segment
-///   GET  /session/{id}/step      → get current step index
-///   DELETE /session/{id}         → destroy session
+///   GET  /my_video/start_stream_session?mappings=0_1,1_2&start=10&end=20&seek=squeeze  → create session
+///   GET  /sessions/{id}/segment          → get current segment (idempotent, retry-safe)
+///   POST /sessions/{id}/next             → advance to next segment
+///   GET  /sessions/{id}/step             → get current step index
+///   DELETE /sessions/{id}                → destroy session
 ///
 /// Usage:
 ///   cargo run --example advanced_server
@@ -21,10 +20,9 @@
 ///
 use bytes::Bytes;
 use log::{error, info};
-use mkv_remuxer::ContainerFormat;
 use mkv_remuxer::RemuxerCutMode;
 use mkv_remuxer::session_streamer::SessionStreamer;
-use mkv_remuxer::session::{AdvanceResponse, SessionStore};
+use mkv_remuxer::session::SessionStore;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -73,47 +71,48 @@ async fn main() {
 
     // ── Session routes ──────────────────────────────────────────────────
 
-    // POST /session  (create)
-    let session_create = warp::post()
-        .and(warp::path("session"))
+    // GET /my_video/start_stream_session?mappings=...&start=...&end=...&seek=...  (create session)
+    let session_create = warp::get()
+        .and(warp::path("my_video"))
+        .and(warp::path("start_stream_session"))
         .and(warp::path::end())
-        .and(warp::body::json())
+        .and(warp::query::<HashMap<String, String>>())
         .and(streamer_filter.clone())
         .and(session_filter.clone())
         .and_then(handle_session_create);
 
 
 
-    // GET /session/{id}/segment
+    // GET /sessions/{id}/segment
     let session_segment = warp::get()
-        .and(warp::path("session"))
+        .and(warp::path("sessions"))
         .and(warp::path::param::<String>())
         .and(warp::path("segment"))
         .and(warp::path::end())
         .and(session_filter.clone())
         .and_then(handle_session_segment);
 
-    // POST /session/{id}/next
+    // POST /sessions/{id}/next
     let session_next = warp::post()
-        .and(warp::path("session"))
+        .and(warp::path("sessions"))
         .and(warp::path::param::<String>())
         .and(warp::path("next"))
         .and(warp::path::end())
         .and(session_filter.clone())
         .and_then(handle_session_next);
 
-    // GET /session/{id}/step
+    // GET /sessions/{id}/step
     let session_step = warp::get()
-        .and(warp::path("session"))
+        .and(warp::path("sessions"))
         .and(warp::path::param::<String>())
         .and(warp::path("step"))
         .and(warp::path::end())
         .and(session_filter.clone())
         .and_then(handle_session_step);
 
-    // DELETE /session/{id}
+    // DELETE /sessions/{id}
     let session_destroy = warp::delete()
-        .and(warp::path("session"))
+        .and(warp::path("sessions"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(session_filter.clone())
@@ -245,40 +244,31 @@ fn parse_cut_mode(s: &str) -> Option<RemuxerCutMode> {
     }
 }
 
-/// POST /session
-/// Body: { "client_id": "...", "mappings": "0_1,0_2", "start": 0.0, "end": null, "seek": "snap" }
+/// GET /my_video/start_stream_session?mappings=0_1,1_2&start=10&end=20&seek=squeeze
 async fn handle_session_create(
-    body: HashMap<String, serde_json::Value>,
+    params: HashMap<String, String>,
     streamer: Arc<SessionStreamer>,
     store: Arc<SessionStore>,
 ) -> Result<warp::reply::Response, Infallible> {
     use warp::Reply;
 
-    let client_id = match body.get("client_id").and_then(|v| v.as_str()) {
-        Some(id) => id.to_string(),
-        None => {
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({"error": "client_id is required"})),
-                warp::http::StatusCode::BAD_REQUEST,
-            )
-            .into_response());
-        }
-    };
+    let client_id = params
+        .get("client_id")
+        .cloned()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let mappings = body
+    let mappings = params
         .get("mappings")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let start_sec = body
+        .cloned()
+        .unwrap_or_default();
+    let start_sec = params
         .get("start")
-        .and_then(|v| v.as_f64())
+        .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    let end_sec = body.get("end").and_then(|v| v.as_f64());
-    let cut_mode = body
+    let end_sec = params.get("end").and_then(|s| s.parse::<f64>().ok());
+    let cut_mode = params
         .get("seek")
-        .and_then(|v| v.as_str())
-        .map(parse_cut_mode)
+        .map(|s| parse_cut_mode(s))
         .flatten();
 
     info!(
@@ -343,7 +333,7 @@ async fn handle_session_create(
         .into_response())
 }
 
-/// GET /session/{id}/segment  → binary current segment (idempotent)
+/// GET /sessions/{id}/segment  → binary current segment (idempotent)
 async fn handle_session_segment(
     session_id: String,
     store: Arc<SessionStore>,
@@ -371,7 +361,7 @@ async fn handle_session_segment(
     }
 }
 
-/// POST /session/{id}/next  → advance iterator, return new step or error if finished
+/// POST /sessions/{id}/next  → advance iterator, return new step or error if finished
 async fn handle_session_next(
     session_id: String,
     store: Arc<SessionStore>,
@@ -410,7 +400,7 @@ async fn handle_session_next(
     }
 }
 
-/// GET /session/{id}/step  → current step index
+/// GET /sessions/{id}/step  → current step index
 async fn handle_session_step(
     session_id: String,
     store: Arc<SessionStore>,
@@ -429,12 +419,12 @@ async fn handle_session_step(
     }
 }
 
-/// DELETE /session/{id}  → destroy session
+/// DELETE /sessions/{id}  → destroy session
 async fn handle_session_destroy(
     session_id: String,
     store: Arc<SessionStore>,
 ) -> Result<warp::reply::Response, Infallible> {
-    store.destroy_session(&session_id);
+    let _ = store.destroy_session(&session_id);
     let response = warp::http::Response::builder()
         .status(204)
         .body(hyper::Body::empty())

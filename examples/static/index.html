@@ -179,7 +179,7 @@
         document.addEventListener('DOMContentLoaded', async () => {
             const video = document.getElementById('videoPlayer');
             const base = window.location.origin;
-            let player = DidiPlayer.load(video, base + '/my_video', { sessionBase: base });
+            let player = DidiPlayer.load(video, base + '/my_video');
 
             const toggleBtn = document.getElementById('togglePlayerBtn');
             const updateToggleLabel = () => {
@@ -330,7 +330,7 @@
                 if (player.destroy) player.destroy();
 
                 const newClass = (player instanceof DidiLegacy) ? DidiMse : DidiLegacy;
-                player = DidiPlayer.load(video, base + '/my_video', { sessionBase: base, forceClass: newClass });
+                player = DidiPlayer.load(video, base + '/my_video', { forceClass: newClass });
                 connectErrorChannel(player);
                 updateToggleLabel();
 

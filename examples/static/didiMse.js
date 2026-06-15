@@ -26,8 +26,8 @@ function _ebmlVintLength(byte) {
 }
 
 class DidiMse extends DidiPlayer {
-    constructor(videoElement, endpointPath, sessionBase = null) {
-        super(videoElement, endpointPath, sessionBase);
+    constructor(videoElement, endpointPath) {
+        super(videoElement, endpointPath);
         this._seekAbort = null;
         this._activeMediaSource = null;
         this._firstSeek = true;  // auto-play on first canplay (replaces HTML autoplay attr)
@@ -55,7 +55,7 @@ class DidiMse extends DidiPlayer {
         if (this._seekAbort) this._seekAbort.abort();
         if (this._sessionId) {
             // Fire-and-forget DELETE
-            fetch(`${this.sessionBase}/session/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
+            fetch(`/sessions/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
             this._sessionId = null;
         }
     }
@@ -91,22 +91,20 @@ class DidiMse extends DidiPlayer {
 
         // Destroy previous session
         if (this._sessionId) {
-            fetch(`${this.sessionBase}/session/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
+            fetch(`/sessions/${this._sessionId}`, { method: 'DELETE' }).catch(() => {});
             this._sessionId = null;
         }
 
         try {
             // 1. Create session
-            const createRes = await fetch(`${this.sessionBase}/session`, {
-                method: 'POST',
+            const streamParams = new URLSearchParams({
+                client_id: this._clientId,
+                mappings: mappings,
+                start: seconds.toString(),
+                seek: seekMode,
+            });
+            const createRes = await fetch(`${this.apiBase}/start_stream_session?${streamParams}`, {
                 signal: controller.signal,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    client_id: this._clientId,
-                    mappings: mappings,
-                    start: seconds,
-                    seek: seekMode,
-                }),
             });
             if (!createRes.ok) {
                 this._emitError(DidiErrorType.NETWORK, await createRes.text());
@@ -119,7 +117,7 @@ class DidiMse extends DidiPlayer {
             console.info(`[DidiMse] Session created: ${session.session_id}, mime: ${mimeType}`);
 
             // 2. Get init segment (step 0)
-            const initRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
+            const initRes = await fetch(`/sessions/${this._sessionId}/segment`, {
                 signal: controller.signal,
             });
             if (!initRes.ok) {
@@ -236,7 +234,7 @@ class DidiMse extends DidiPlayer {
                     // Advance to next segment
                     let nextRes;
                     try {
-                        nextRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/next`, {
+                        nextRes = await fetch(`/sessions/${this._sessionId}/next`, {
                             method: 'POST',
                             signal: controller.signal,
                         });
@@ -267,7 +265,7 @@ class DidiMse extends DidiPlayer {
                     // Fetch the segment data
                     let segRes;
                     try {
-                        segRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
+                        segRes = await fetch(`/sessions/${this._sessionId}/segment`, {
                             signal: controller.signal,
                         });
                     } catch (e) {
