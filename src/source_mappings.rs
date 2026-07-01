@@ -1,4 +1,4 @@
-use mkv_element::prelude::{TrackEntry, Tracks};
+use mkv_element::prelude::{CodecName, Name, TrackEntry, Tracks};
 
 use crate::{Error, Result, block_ext::TrackKind, source::{Remuxing, InputSource}};
 
@@ -167,6 +167,43 @@ impl SourcesMappings {
                 let mut output_track = track.clone();
                 // Set the track number to match the output position (1-based)
                 output_track.track_number.0 = (output_index + 1) as u64;
+
+                // Sanitize track Name: Chrome MSE requires ASCII-only strings for
+                // the WebM TrackEntry Name element.  Strip any non-ASCII characters
+                // so the init segment is accepted by all browsers.
+                if let Some(ref name) = output_track.name {
+                    let original = &name.0;
+                    if !original.is_ascii() {
+                        let sanitized: String = original.chars().filter(|c| c.is_ascii()).collect();
+                        log::warn!(
+                            "Track {} Name contains non-ASCII characters, sanitizing: {:?} -> {:?}",
+                            output_track.track_number.0, original, sanitized
+                        );
+                        if sanitized.is_empty() {
+                            output_track.name = None;
+                        } else {
+                            output_track.name = Some(Name(sanitized));
+                        }
+                    }
+                }
+
+                // Same for CodecName
+                if let Some(ref codec_name) = output_track.codec_name {
+                    let original = &codec_name.0;
+                    if !original.is_ascii() {
+                        let sanitized: String = original.chars().filter(|c| c.is_ascii()).collect();
+                        log::warn!(
+                            "Track {} CodecName contains non-ASCII characters, sanitizing: {:?} -> {:?}",
+                            output_track.track_number.0, original, sanitized
+                        );
+                        if sanitized.is_empty() {
+                            output_track.codec_name = None;
+                        } else {
+                            output_track.codec_name = Some(CodecName(sanitized));
+                        }
+                    }
+                }
+
                 output_tracks.push(output_track);
             } else {
                 return Err(Error::TrackMappingError(format!(
