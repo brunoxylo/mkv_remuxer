@@ -1,6 +1,10 @@
 use mkv_element::prelude::{CodecName, Name, TrackEntry, Tracks};
 
-use crate::{Error, Result, block_ext::TrackKind, source::{Remuxing, InputSource}};
+use crate::{
+    Error, Result,
+    block_ext::TrackKind,
+    source::{InputSource, Remuxing},
+};
 
 /// Wrapper struct to hold multiple sources and their track mappings for remuxing
 /// provides convenient methods for managing track mappings
@@ -37,7 +41,7 @@ impl SourcesMappings {
     }
     pub fn delete_current_mappings(&mut self) {
         self.mappings.clear();
-    }  
+    }
 
     /// Get all tracks from all sources as 2D array, first index is the source index, second index is the track number
     pub fn get_all_input_tracks(&mut self) -> Result<Vec<Vec<TrackEntry>>> {
@@ -51,7 +55,10 @@ impl SourcesMappings {
     /// check whether the specified track is actually mapped by the current mappings
     /// if mapped it return the track number in the output file (which is the index in the mappings vector), otherwise returns None
     pub fn is_track_mapped(&self, source_index: u64, track_number: u64) -> Option<u64> {
-        self.mappings.iter().position(|(s_idx, t_num, _)| *s_idx == source_index && *t_num == track_number).map(|idx| idx as u64 +1 ) // output mkv track numbers are 1-based
+        self.mappings
+            .iter()
+            .position(|(s_idx, t_num, _)| *s_idx == source_index && *t_num == track_number)
+            .map(|idx| idx as u64 + 1) // output mkv track numbers are 1-based
     }
 
     pub fn get_track_kind(&self, source_index: u64, track_number: u64) -> Result<TrackKind> {
@@ -59,13 +66,40 @@ impl SourcesMappings {
             .iter()
             .find(|(s_idx, t_num, _)| *s_idx == source_index && *t_num == track_number)
             .map(|(_, _, kind)| *kind)
-            .ok_or_else(|| Error::TrackMappingError(format!(
-                "Track number {} not found in source {}",
-                track_number, source_index
-            )))
+            .ok_or_else(|| {
+                Error::TrackMappingError(format!(
+                    "Track number {} not found in source {}",
+                    track_number, source_index
+                ))
+            })
     }
 
-    
+    /// Look up the [`TrackKind`] of *any* input track (mapped or unmapped) by
+    /// reading the source's track metadata.
+    ///
+    /// Unlike [`get_track_kind`](Self::get_track_kind) (which only knows about
+    /// tracks that have been added to the output mappings), this inspects the
+    /// source directly and is therefore suitable for logging/tracing blocks
+    /// whose track is not part of the output.
+    ///
+    /// Returns `None` if the source index is out of range or the track number
+    /// does not exist in that source.
+    pub fn get_input_track_kind(
+        &self,
+        source_index: u64,
+        track_number: u64,
+    ) -> Result<Option<TrackKind>> {
+        if source_index as usize >= self.sources.len() {
+            return Ok(None);
+        }
+        let tracks = self.sources[source_index as usize].get_tracks()?;
+        Ok(tracks
+            .track_entry
+            .iter()
+            .find(|t| t.track_number.0 == track_number)
+            .map(|t| TrackKind::from_u64(t.track_type.0)))
+    }
+
     /// Add a specific track from a specific source to the mappings
     /// NOTE: source index starts from zero but track number is 1 based as stored in MKV files
     pub fn add_mapping(&mut self, source_index: u64, track_number: u64) -> Result<()> {
@@ -83,10 +117,12 @@ impl SourcesMappings {
             .iter()
             .find(|t| t.track_number.0 == track_number)
             .map(|t| TrackKind::from_u64(t.track_type.0))
-            .ok_or_else(|| Error::TrackMappingError(format!(
-                "Track number {} not found in source {}",
-                track_number, source_index
-            )))?;
+            .ok_or_else(|| {
+                Error::TrackMappingError(format!(
+                    "Track number {} not found in source {}",
+                    track_number, source_index
+                ))
+            })?;
         self.mappings.push((source_index, track_number, track_kind));
         Ok(())
     }
@@ -95,8 +131,13 @@ impl SourcesMappings {
         for (index, source) in self.sources.iter_mut().enumerate() {
             let tracks = source.get_tracks()?;
             for track in tracks.track_entry.iter() {
-                if track.track_type.0 == TrackKind::Video { // Video track type
-                    self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
+                if track.track_type.0 == TrackKind::Video {
+                    // Video track type
+                    self.mappings.push((
+                        index as u64,
+                        track.track_number.0,
+                        TrackKind::from_u64(track.track_type.0),
+                    ));
                     return Ok(());
                 }
             }
@@ -124,16 +165,21 @@ impl SourcesMappings {
         for (index, source) in self.sources.iter_mut().enumerate() {
             let tracks = source.get_tracks()?;
             for track in tracks.track_entry.iter() {
-                if track.track_type.0 == TrackKind::Audio { // Audio track type
+                if track.track_type.0 == TrackKind::Audio {
+                    // Audio track type
                     if track.language.0 == language_code {
-                        self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
+                        self.mappings.push((
+                            index as u64,
+                            track.track_number.0,
+                            TrackKind::from_u64(track.track_type.0),
+                        ));
                     }
                 }
             }
         }
-        Ok(())    
+        Ok(())
     }
-    
+
     /// Add all tracks from all sources to the mappings
     fn add_tracks_by_type(&mut self, track_type: Option<TrackKind>) -> Result<()> {
         for (index, source) in self.sources.iter_mut().enumerate() {
@@ -141,10 +187,18 @@ impl SourcesMappings {
             for track in tracks.track_entry.iter() {
                 if let Some(tt) = track_type {
                     if track.track_type.0 == tt {
-                        self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
+                        self.mappings.push((
+                            index as u64,
+                            track.track_number.0,
+                            TrackKind::from_u64(track.track_type.0),
+                        ));
                     }
                 } else {
-                    self.mappings.push((index as u64, track.track_number.0, TrackKind::from_u64(track.track_type.0)));
+                    self.mappings.push((
+                        index as u64,
+                        track.track_number.0,
+                        TrackKind::from_u64(track.track_type.0),
+                    ));
                 }
             }
         }
@@ -160,10 +214,16 @@ impl SourcesMappings {
 
     pub fn get_output_tracks_metadata(&self) -> Result<Tracks> {
         let mut output_tracks = Vec::new();
-        for (output_index, (source_index, source_track_number, _)) in self.mappings.iter().enumerate() {
+        for (output_index, (source_index, source_track_number, _)) in
+            self.mappings.iter().enumerate()
+        {
             let source = &self.sources[*source_index as usize];
             let tracks = source.get_tracks()?;
-            if let Some(track) = tracks.track_entry.iter().find(|t| t.track_number.0 == *source_track_number) {
+            if let Some(track) = tracks
+                .track_entry
+                .iter()
+                .find(|t| t.track_number.0 == *source_track_number)
+            {
                 let mut output_track = track.clone();
                 // Set the track number to match the output position (1-based)
                 output_track.track_number.0 = (output_index + 1) as u64;
@@ -177,7 +237,9 @@ impl SourcesMappings {
                         let sanitized: String = original.chars().filter(|c| c.is_ascii()).collect();
                         log::warn!(
                             "Track {} Name contains non-ASCII characters, sanitizing: {:?} -> {:?}",
-                            output_track.track_number.0, original, sanitized
+                            output_track.track_number.0,
+                            original,
+                            sanitized
                         );
                         if sanitized.is_empty() {
                             output_track.name = None;
@@ -194,7 +256,9 @@ impl SourcesMappings {
                         let sanitized: String = original.chars().filter(|c| c.is_ascii()).collect();
                         log::warn!(
                             "Track {} CodecName contains non-ASCII characters, sanitizing: {:?} -> {:?}",
-                            output_track.track_number.0, original, sanitized
+                            output_track.track_number.0,
+                            original,
+                            sanitized
                         );
                         if sanitized.is_empty() {
                             output_track.codec_name = None;
@@ -212,11 +276,10 @@ impl SourcesMappings {
                 )));
             }
         }
-        Ok(Tracks { 
+        Ok(Tracks {
             track_entry: output_tracks,
             crc32: None,
             void: None,
         })
     }
-
 }

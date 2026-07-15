@@ -3,7 +3,7 @@ use crate::block_ext::TracksExt;
 use crate::{
     Cluster, ClusterBlockExt, ClusterReadWrapper, ClusterWriteWrapper, Result, SourcesMappings,
 };
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use mkv_element::{ClusterBlock, prelude::*};
 use std::collections::HashMap;
 
@@ -87,7 +87,10 @@ impl MeltingPot {
                         }
                         Err(Error::InvalidBlockData(_)) => {
                             *cluster_wrapper = None; // treat cluster with invalid block data as finished
-                            debug!("Cluster {} reached end", index);
+                            debug!(
+                                "MeltingPot: rejecting source {} cluster: block timestamp could not be read (InvalidBlockData), treating as finished",
+                                index
+                            );
                         }
                         Err(e) => {
                             warn!(
@@ -112,33 +115,53 @@ impl MeltingPot {
                     if let Some(input_cluster) = &mut self.clusters[lowest_index] {
                         if let Some(block) = input_cluster.next() {
                             let input_track_index = block.track_number()?;
-                            // only add the block to the output cluster if its track is mapped to an output track (otherwise we just skip it)
-                            if let Some(output_trackindex) = self
+                            let output_trackindex = self
                                 .sources_mappings
-                                .is_track_mapped(lowest_index as u64, input_track_index)
-                            {
-                                let track_kind = self
+                                .is_track_mapped(lowest_index as u64, input_track_index);
+                            // Resolve the track kind for both the mapped and unmapped case so we
+                            // can log what kind of block we read even when it won't be emitted.
+                            let track_kind: crate::block_ext::TrackKind = match output_trackindex {
+                                Some(_) => self
                                     .sources_mappings
-                                    .get_track_kind(lowest_index as u64, input_track_index)?;
+                                    .get_track_kind(lowest_index as u64, input_track_index)?,
+                                None => self
+                                    .sources_mappings
+                                    .get_input_track_kind(lowest_index as u64, input_track_index)?
+                                    .unwrap_or(crate::block_ext::TrackKind::Metadata),
+                            };
 
+                            trace!(
+                                "MeltingPot: read block from source {} input_track={} kind={:?} ts_ns={}",
+                                lowest_index, input_track_index, track_kind, lowest_timestamp_ns
+                            );
+
+                            // only add the block to the output cluster if its track is mapped to an output track (otherwise we just skip it)
+                            if let Some(output_trackindex) = output_trackindex {
                                 // For audio blocks, snap timestamps to a uniform grid to eliminate
                                 // sub-timescale jitter inherited from the source file.
                                 // Opus encodes exact 20ms frames, but when stored with a 1ms
                                 // timescale, quantization creates alternating 19ms/21ms gaps that
                                 // cause audio cracks and A/V drift in Chrome's strict MSE.
-                                let effective_timestamp_ns = if track_kind == crate::block_ext::TrackKind::Audio {
-                                    let entry = self.audio_grid.entry(output_trackindex).or_insert_with(|| {
-                                        // Initialize: anchor at first audio block, 0 frames seen, 20ms default
-                                        (lowest_timestamp_ns, 0, 20_000_000)
-                                    });
+                                let effective_timestamp_ns = if track_kind
+                                    == crate::block_ext::TrackKind::Audio
+                                {
+                                    let entry = self
+                                        .audio_grid
+                                        .entry(output_trackindex)
+                                        .or_insert_with(|| {
+                                            // Initialize: anchor at first audio block, 0 frames seen, 20ms default
+                                            (lowest_timestamp_ns, 0, 20_000_000)
+                                        });
                                     let (anchor_ns, frame_count, frame_dur_ns) = entry;
                                     // Re-estimate frame duration from the running average
                                     // to handle codecs other than 20ms Opus.
                                     if *frame_count > 0 {
-                                        let elapsed = lowest_timestamp_ns.saturating_sub(*anchor_ns);
+                                        let elapsed =
+                                            lowest_timestamp_ns.saturating_sub(*anchor_ns);
                                         let est = elapsed as f64 / *frame_count as f64;
                                         // Round to nearest 1ms to get a clean grid quantum
-                                        let est_rounded = ((est / 1_000_000.0).round() as u64).max(1) * 1_000_000;
+                                        let est_rounded =
+                                            ((est / 1_000_000.0).round() as u64).max(1) * 1_000_000;
                                         *frame_dur_ns = est_rounded;
                                     }
                                     let corrected = *anchor_ns + *frame_count * *frame_dur_ns;
@@ -148,6 +171,16 @@ impl MeltingPot {
                                     lowest_timestamp_ns
                                 };
 
+                                if effective_timestamp_ns != lowest_timestamp_ns {
+                                    trace!(
+                                        "MeltingPot: audio grid correction for source {} input_track={} ts_ns={} -> {}",
+                                        lowest_index,
+                                        input_track_index,
+                                        lowest_timestamp_ns,
+                                        effective_timestamp_ns
+                                    );
+                                }
+
                                 match o_cluster.add_block(
                                     &block,
                                     effective_timestamp_ns,
@@ -156,12 +189,29 @@ impl MeltingPot {
                                 ) {
                                     Ok(_) => {}
                                     Err(Error::ClusterIsFull(_)) => {
-                                        // Cluster is full, break the inner loop and start a new cluster
+                                        // Cluster is full: finish the current output cluster and
+                                        // reprocess this block at the start of the next one.
+                                        debug!(
+                                            "MeltingPot: splitting output cluster at ts_ns={} (block from source {} input_track={} kind={:?} triggered cluster limit)",
+                                            effective_timestamp_ns,
+                                            lowest_index,
+                                            input_track_index,
+                                            track_kind
+                                        );
                                         input_cluster.step_back(); // step back to reprocess this block in the next cluster
                                         return Ok(Some(o_cluster.finish()));
                                     }
                                     Err(e) => return Err(e),
                                 }
+                            } else {
+                                // Block's track is not mapped to any output track: drop it.
+                                debug!(
+                                    "MeltingPot: dropping block from source {} input_track={} kind={:?} ts_ns={} (track not mapped to output)",
+                                    lowest_index,
+                                    input_track_index,
+                                    track_kind,
+                                    lowest_timestamp_ns
+                                );
                             }
                             if input_cluster.is_empty() {
                                 self.clusters[lowest_index] = None;
