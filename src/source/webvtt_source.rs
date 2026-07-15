@@ -3,9 +3,10 @@ use crate::source::CutInterval;
 use crate::source::util::basic_info::MkvBasicInfo;
 use crate::{Error, Result};
 use bytes::BytesMut;
+use log::trace;
+use mkv_element::ClusterBlock;
 use mkv_element::io::blocking_impl::*;
 use mkv_element::prelude::*;
-use mkv_element::ClusterBlock;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -58,10 +59,10 @@ pub struct WebVttSource {
 }
 
 impl WebVttSource {
-    pub fn new<R : Read + Send>(reader: R, language :String, forced :bool) -> Result<Self> {
+    pub fn new<R: Read + Send>(reader: R, language: String, forced: bool) -> Result<Self> {
         // Parse the VTT file
         let (cues, bytes_read) = Self::parse_vtt_file(reader)?;
-        
+
         Ok(Self {
             cues,
             current_cue_idx: 0,
@@ -107,7 +108,7 @@ impl WebVttSource {
 
     /// Parse a WebVTT file into cues
     fn parse_vtt_file<R: Read>(reader: R) -> Result<(Vec<VttCue>, u64)> {
-        let mut bytes_read :u64 = 0;
+        let mut bytes_read: u64 = 0;
         let reader = BufReader::new(reader);
         let mut lines = reader.lines();
 
@@ -128,7 +129,7 @@ impl WebVttSource {
         let mut in_cue = false;
 
         let mut line_iter = lines.peekable();
-        
+
         while let Some(Ok(line)) = line_iter.next() {
             bytes_read += line.len() as u64 + 1; // +1 for newline
             let trimmed = line.trim();
@@ -155,7 +156,7 @@ impl WebVttSource {
             if trimmed.contains("-->") {
                 in_cue = true;
                 let cue = Self::parse_cue_timing(trimmed, current_id.take())?;
-                
+
                 // Read cue text (may be multiple lines)
                 let mut text_lines = Vec::new();
                 loop {
@@ -169,7 +170,7 @@ impl WebVttSource {
                         _ => break,
                     }
                 }
-                
+
                 let mut cue = cue;
                 cue.text = text_lines.join("\n");
                 cues.push(cue);
@@ -178,7 +179,7 @@ impl WebVttSource {
                 current_id = Some(trimmed.to_string());
             }
         }
-        
+
         Ok((cues, bytes_read))
     }
 
@@ -194,10 +195,13 @@ impl WebVttSource {
 
         let start_str = parts[0].trim();
         let end_part = parts[1].trim();
-        
+
         // End part might have cue settings after the timestamp
         let (end_str, settings) = if let Some(space_idx) = end_part.find(' ') {
-            (&end_part[..space_idx], Some(end_part[space_idx+1..].to_string()))
+            (
+                &end_part[..space_idx],
+                Some(end_part[space_idx + 1..].to_string()),
+            )
         } else {
             (end_part, None)
         };
@@ -217,13 +221,17 @@ impl WebVttSource {
     /// Parse a VTT timestamp like "00:00:10.500" or "00:10.500"
     fn parse_timestamp(timestamp: &str) -> Result<u64> {
         let parts: Vec<&str> = timestamp.split(':').collect();
-        
+
         let (hours, minutes, seconds_str) = match parts.len() {
             2 => {
                 // MM:SS.mmm format
-                (0.0, parts[0].parse::<f64>().map_err(|_| {
-                    Error::InvalidConfig(format!("Invalid minutes in timestamp: {}", timestamp))
-                })?, parts[1])
+                (
+                    0.0,
+                    parts[0].parse::<f64>().map_err(|_| {
+                        Error::InvalidConfig(format!("Invalid minutes in timestamp: {}", timestamp))
+                    })?,
+                    parts[1],
+                )
             }
             3 => {
                 // HH:MM:SS.mmm format
@@ -251,12 +259,12 @@ impl WebVttSource {
         Ok((total_seconds * 1_000_000_000.0) as u64)
     }
 
-
-
     /// Create a cluster containing a batch of cues
     fn create_cluster_from_cues(&self, cues: &[VttCue]) -> Result<Cluster> {
         if cues.is_empty() {
-            return Err(Error::InvalidConfig("No cues to create cluster".to_string()));
+            return Err(Error::InvalidConfig(
+                "No cues to create cluster".to_string(),
+            ));
         }
 
         let shift_ns = self.start_ns.unwrap_or(0);
@@ -276,11 +284,12 @@ impl WebVttSource {
             let block_timestamp_ns = cue.start_ns.saturating_sub(shift_ns);
             let block_timestamp_ticks = block_timestamp_ns / self.output_timecode_scale;
             let relative_timestamp = (block_timestamp_ticks as i64 - cluster_timestamp_ticks as i64)
-                .clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                .clamp(i16::MIN as i64, i16::MAX as i64)
+                as i16;
 
             // Encode block data: track number (vint) + timestamp (2 bytes) + flags (1 byte) + frame data
             let mut block_data = BytesMut::new();
-            
+
             // Track number as VINT — write_to needs std::io::Write; use a small scratch Vec
             let track_vint = VInt64::new(self.track_number);
             let mut vint_bytes = Vec::with_capacity(8);
@@ -344,7 +353,13 @@ impl WebVttSource {
 
 impl fmt::Display for WebVttSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WebVTT: {} forced: {}({} cues)", self.language, self.forced, self.cues.len())
+        write!(
+            f,
+            "WebVTT: {} forced: {}({} cues)",
+            self.language,
+            self.forced,
+            self.cues.len()
+        )
     }
 }
 
@@ -399,7 +414,12 @@ impl Source for WebVttSource {
     fn get_basic_info(&self) -> Result<MkvBasicInfo> {
         let tracks = self.get_tracks()?;
         let info = self.get_info()?;
-        Ok(MkvBasicInfo::new(&tracks, &info, self.bytes_read, self.language.clone()))
+        Ok(MkvBasicInfo::new(
+            &tracks,
+            &info,
+            self.bytes_read,
+            self.language.clone(),
+        ))
     }
 
     fn get_info(&self) -> Result<Info> {
@@ -436,7 +456,7 @@ impl Source for WebVttSource {
         // Collect cues for this cluster
         let mut batch = Vec::new();
         let start_idx = self.current_cue_idx;
-        
+
         for i in 0..self.cluster_batch_size {
             let idx = start_idx + i;
             if idx >= self.cues.len() {
@@ -448,6 +468,10 @@ impl Source for WebVttSource {
             // Apply cut filters
             if let Some(start) = self.start_ns {
                 if cue.end_ns <= start {
+                    trace!(
+                        "dropping Subtitle cue (track {}) at {}-{} ns: ends before cut start ({} ns)",
+                        self.track_number, cue.start_ns, cue.end_ns, start
+                    );
                     self.current_cue_idx += 1;
                     continue;
                 }
@@ -455,6 +479,10 @@ impl Source for WebVttSource {
 
             if let Some(end) = self.end_ns {
                 if cue.start_ns >= end {
+                    trace!(
+                        "dropping Subtitle cue (track {}) at {}-{} ns: starts at/after cut end ({} ns)",
+                        self.track_number, cue.start_ns, cue.end_ns, end
+                    );
                     self.finished = true;
                     break;
                 }
@@ -499,11 +527,7 @@ impl Source for WebVttSource {
         Ok(self.output_interval.clone())
     }
 
-    fn cut(
-        &mut self,
-        _seek_type: SeekType,
-        cut_interval: CutInterval,
-    ) -> Result<CutInterval> {
+    fn cut(&mut self, _seek_type: SeekType, cut_interval: CutInterval) -> Result<CutInterval> {
         self.start_ns = cut_interval.start_ns;
         self.end_ns = cut_interval.end_ns;
         // WebVTT has no keyframes — return the interval unchanged.

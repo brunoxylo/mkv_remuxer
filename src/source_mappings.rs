@@ -74,32 +74,6 @@ impl SourcesMappings {
             })
     }
 
-    /// Look up the [`TrackKind`] of *any* input track (mapped or unmapped) by
-    /// reading the source's track metadata.
-    ///
-    /// Unlike [`get_track_kind`](Self::get_track_kind) (which only knows about
-    /// tracks that have been added to the output mappings), this inspects the
-    /// source directly and is therefore suitable for logging/tracing blocks
-    /// whose track is not part of the output.
-    ///
-    /// Returns `None` if the source index is out of range or the track number
-    /// does not exist in that source.
-    pub fn get_input_track_kind(
-        &self,
-        source_index: u64,
-        track_number: u64,
-    ) -> Result<Option<TrackKind>> {
-        if source_index as usize >= self.sources.len() {
-            return Ok(None);
-        }
-        let tracks = self.sources[source_index as usize].get_tracks()?;
-        Ok(tracks
-            .track_entry
-            .iter()
-            .find(|t| t.track_number.0 == track_number)
-            .map(|t| TrackKind::from_u64(t.track_type.0)))
-    }
-
     /// Add a specific track from a specific source to the mappings
     /// NOTE: source index starts from zero but track number is 1 based as stored in MKV files
     pub fn add_mapping(&mut self, source_index: u64, track_number: u64) -> Result<()> {

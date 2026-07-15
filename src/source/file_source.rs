@@ -269,7 +269,8 @@ impl<T: MkvReader> FileSource<T> {
             None => None,
         };
         let shifted_ns = orig_cluster_ns - shift_reference as i64;
-        cluster.timestamp.0 = ((shifted_ns as f64 / self.output_timecode_scale as f64).round()).max(0.0) as u64;
+        cluster.timestamp.0 =
+            ((shifted_ns as f64 / self.output_timecode_scale as f64).round()).max(0.0) as u64;
         let shifted_cluster_ticks = cluster.timestamp.0;
 
         let mut filtered = Vec::with_capacity(orig_block_count);
@@ -285,13 +286,28 @@ impl<T: MkvReader> FileSource<T> {
                         block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
                     if let Some(end) = actual_end_pos {
                         if abs_ns > end {
-                            //print!("Block at {} ns is after cut end {} ns, dropping", abs_ns, end);
+                            let tn = block.track_number()?;
+                            trace!(
+                                "dropping {:?} block (track {}) at {} ns: after cut end ({} ns)",
+                                self.tracks.get_track_kind(tn),
+                                tn,
+                                abs_ns,
+                                end
+                            );
                             continue;
                         }
                     }
 
                     // only output after desired keyframe
                     if abs_ns < shift_reference {
+                        let tn = block.track_number()?;
+                        trace!(
+                            "dropping {:?} block (track {}) at {} ns: before cut start/keyframe reference ({} ns)",
+                            self.tracks.get_track_kind(tn),
+                            tn,
+                            abs_ns,
+                            shift_reference
+                        );
                         continue;
                     }
                     block.set_timestamp_ns(
@@ -299,8 +315,11 @@ impl<T: MkvReader> FileSource<T> {
                         cluster.timestamp.0,
                         self.output_timecode_scale,
                     )?;
+                    let tn = block.track_number()?;
                     trace!(
-                        "pushing block with: {}, abs_ns {}, end_ns {:?}, shift_ref {}",
+                        "pushing {:?} block (track {}): ts_ns {}, abs_ns {}, end_ns {:?}, shift_ref {}",
+                        self.tracks.get_track_kind(tn),
+                        tn,
                         block
                             .timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?,
                         abs_ns,
@@ -319,11 +338,27 @@ impl<T: MkvReader> FileSource<T> {
                         block.timestamp_ns(orig_cluster_ticks as i64, self.timecode_scale)?;
                     let start = self.initial_cluster_pos.get_timestamp_ns();
                     if abs_ns < start {
+                        let tn = block.track_number()?;
+                        trace!(
+                            "dropping {:?} block (track {}) at {} ns: before cut start ({} ns)",
+                            self.tracks.get_track_kind(tn),
+                            tn,
+                            abs_ns,
+                            start
+                        );
                         continue;
                     }
                     if let Some(end) = &self.end_cluster_pos {
                         let end = end.get_timestamp_ns();
                         if abs_ns > end {
+                            let tn = block.track_number()?;
+                            trace!(
+                                "dropping {:?} block (track {}) at {} ns: after cut end ({} ns)",
+                                self.tracks.get_track_kind(tn),
+                                tn,
+                                abs_ns,
+                                end
+                            );
                             continue;
                         }
                     }
@@ -333,6 +368,16 @@ impl<T: MkvReader> FileSource<T> {
                         cluster.timestamp.0,
                         self.output_timecode_scale,
                     )?;
+                    let tn = block.track_number()?;
+                    trace!(
+                        "pushing {:?} block (track {}): ts_ns {}, abs_ns {}, start_ns {}",
+                        self.tracks.get_track_kind(tn),
+                        tn,
+                        block
+                            .timestamp_ns(cluster.timestamp.0 as i64, self.output_timecode_scale,)?,
+                        abs_ns,
+                        start
+                    );
                     filtered.push(block);
                 }
                 cluster.blocks = filtered;
@@ -386,12 +431,23 @@ impl<T: MkvReader> FileSource<T> {
 
                     // drop before last keyframe before start (before pre-roll is video-only)
                     if abs_ns < last_keyframe_before_start_timestamp as i64 {
+                        trace!(
+                            "dropping {:?} block (track {}) at {} ns: before last keyframe before cut start ({} ns)",
+                            kind, track_num, abs_ns, last_keyframe_before_start_timestamp
+                        );
                         continue;
                     }
 
                     // Drop after end
                     if let Some(end_pos) = &self.end_cluster_pos {
                         if abs_ns > end_pos.get_timestamp_ns() as i64 {
+                            trace!(
+                                "dropping {:?} block (track {}) at {} ns: after cut end ({} ns)",
+                                kind,
+                                track_num,
+                                abs_ns,
+                                end_pos.get_timestamp_ns()
+                            );
                             continue;
                         }
                     }
@@ -417,8 +473,8 @@ impl<T: MkvReader> FileSource<T> {
                         )?;
                         block.set_invisible(true)?;
                         trace!(
-                            "Set block duration to 0 for pre-roll block at {} ns",
-                            abs_ns
+                            "pushing {:?} block (track {}): pre-roll squeezed to ts_ns 0 (abs_ns {}, was in pre-roll window before cut start {})",
+                            kind, track_num, abs_ns, start
                         );
                     } else {
                         // No end: just shift by squeeze window
@@ -428,6 +484,10 @@ impl<T: MkvReader> FileSource<T> {
                             shifted_cluster_ticks,
                             self.output_timecode_scale,
                         )?;
+                        trace!(
+                            "pushing {:?} block (track {}): ts_ns {}, abs_ns {}, start_ns {}",
+                            kind, track_num, offset, abs_ns, start
+                        );
                     }
                 }
                 _ => {
@@ -435,6 +495,13 @@ impl<T: MkvReader> FileSource<T> {
                     // Drop after end
                     if let Some(end_pos) = &self.end_cluster_pos {
                         if abs_ns > end_pos.get_timestamp_ns() as i64 {
+                            trace!(
+                                "dropping {:?} block (track {}) at {} ns: after cut end ({} ns)",
+                                kind,
+                                track_num,
+                                abs_ns,
+                                end_pos.get_timestamp_ns()
+                            );
                             continue;
                         }
                     }
@@ -442,6 +509,10 @@ impl<T: MkvReader> FileSource<T> {
                     {
                         // Drop  before start (pre-roll is video-only)
                         if abs_ns < start as i64 {
+                            trace!(
+                                "dropping {:?} block (track {}) at {} ns: before cut start ({} ns)",
+                                kind, track_num, abs_ns, start
+                            );
                             continue;
                         }
                         // Shift to start after squeeze window
@@ -451,6 +522,10 @@ impl<T: MkvReader> FileSource<T> {
                             shifted_cluster_ticks,
                             self.output_timecode_scale,
                         )?;
+                        trace!(
+                            "pushing {:?} block (track {}): ts_ns {}, abs_ns {}, start_ns {}",
+                            kind, track_num, offset, abs_ns, start
+                        );
                     }
                 }
             }
