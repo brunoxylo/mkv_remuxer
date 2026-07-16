@@ -610,27 +610,49 @@ impl<T: MkvReader> Source for FileSource<T> {
                 }
 
                 if log::log_enabled!(log::Level::Trace) {
-                    let (mut video, mut audio, mut subtitle, mut other) = (0u32, 0u32, 0u32, 0u32);
+                    // Tally per-kind block counts and min/max absolute timestamps.
+                    // min/max immediately reveal timestamp gaps (e.g. a cluster whose
+                    // audio starts well after its video) without having to scan the
+                    // storage-ordered per-block push/drop logs.
+                    let cluster_ticks = cluster.timestamp.0 as i64;
+                    // [video, audio, subtitle, other]
+                    let mut counts = [0u32; 4];
+                    let mut min_ns = [u64::MAX; 4];
+                    let mut max_ns = [0u64; 4];
                     for b in &cluster.blocks {
-                        match b
+                        let idx = match b
                             .track_number()
                             .ok()
                             .and_then(|tn| self.tracks.get_track_kind(tn))
                         {
-                            Some(TrackKind::Video) => video += 1,
-                            Some(TrackKind::Audio) => audio += 1,
-                            Some(TrackKind::Subtitle) => subtitle += 1,
-                            _ => other += 1,
+                            Some(TrackKind::Video) => 0,
+                            Some(TrackKind::Audio) => 1,
+                            Some(TrackKind::Subtitle) => 2,
+                            _ => 3,
+                        };
+                        let abs_ns = b
+                            .timestamp_ns(cluster_ticks, self.timecode_scale)
+                            .unwrap_or(0)
+                            .max(0) as u64;
+                        counts[idx] += 1;
+                        if abs_ns < min_ns[idx] {
+                            min_ns[idx] = abs_ns;
+                        }
+                        if abs_ns > max_ns[idx] {
+                            max_ns[idx] = abs_ns;
                         }
                     }
                     trace!(
-                        "reading source cluster at {} ns: {} blocks (video={}, audio={}, subtitle={}, other={})",
+                        "reading source cluster at {} ns: video={} ({}-{} ns), audio={} ({}-{} ns), subtitle={}, other={}",
                         cluster_ts_ns,
-                        cluster.blocks.len(),
-                        video,
-                        audio,
-                        subtitle,
-                        other
+                        counts[0],
+                        min_ns[0],
+                        max_ns[0],
+                        counts[1],
+                        min_ns[1],
+                        max_ns[1],
+                        counts[2],
+                        counts[3]
                     );
                 }
 
