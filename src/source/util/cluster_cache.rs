@@ -245,7 +245,7 @@ impl KeyframePositionCache {
             Chapters::ID,
             Tags::ID,
         ];
-        const MIN_MAINING_BUFFER_SIZE: u64 = 7; // max 1 byte id (0xE7 for Timestamp)  + max 8 bytes lenght 
+        const MIN_MAINING_BUFFER_SIZE: u64 = 7; // max 1 byte id (0xE7 for Timestamp)  + max 8 bytes lenght
         let cluster_payload_start = buf_reader.position();
         loop {
             if buf_reader.position() >= buf.len() as u64 - MIN_MAINING_BUFFER_SIZE {
@@ -442,7 +442,7 @@ impl KeyframePositionCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
+pub enum Direction {
     /// scan to next cluster but ignore the current
     Next,
     /// scan to previous cluster but ignore the current
@@ -458,7 +458,7 @@ enum Direction {
 /// IF the pos points to a valid cluster header, this cluster will be skipped if the direction is Next or Previous
 /// (next/previous one will be returned). For Forward and Backward directions the cluster at pos will be included in the search.
 /// The files seek position is preserved after this operation
-fn scan_cluster_in_direction(
+pub fn scan_cluster_in_direction(
     file: &mut dyn MkvReader,
     pos: u64,
     direction: Direction,

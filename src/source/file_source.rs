@@ -1,3 +1,4 @@
+use super::util::cluster_cache::{Direction, scan_cluster_in_direction};
 use super::{KeyframePositionCache, MkvReader, SeekType, Source};
 use crate::block_ext::{ClusterBlockExt, ClusterExt, TrackKind, TracksExt};
 use crate::source::CutInterval;
@@ -692,9 +693,8 @@ impl<T: MkvReader> Source for FileSource<T> {
         if let Some(ts) = time_scale {
             self.output_timecode_scale = ts;
         }
-
-        self.file
-            .seek(SeekFrom::Start(self.initial_cluster_pos.position))?;
+        let start_pos = self.initial_cluster_pos.position;
+        self.file.seek(SeekFrom::Start(start_pos))?;
         let duration = self
             .info
             .duration
@@ -778,6 +778,15 @@ impl<T: MkvReader> Source for FileSource<T> {
                 let actual_start_ns = self
                     .initial_cluster_pos
                     .get_keyframe_timestamp_ns(video_track_num, true)?;
+                // seek to cluster of the next keyframe to start reading from there
+                let keyframe_cluster_pos = self
+                    .initial_cluster_pos
+                    .get_keyframe_cluster_position(video_track_num, true)?;
+                self.file.seek(SeekFrom::Start(keyframe_cluster_pos))?;
+                trace!(
+                    "SnapNextKeyframe: seeking to keyframe cluster at byte {} (ts {} ns); clusters before this point will NOT be read",
+                    keyframe_cluster_pos, actual_start_ns
+                );
                 let actual_end_ns = if let Some(end_pos) = &mut self.end_cluster_pos {
                     Some(end_pos.get_keyframe_timestamp_ns(video_track_num, true)? as u64)
                 } else {
@@ -819,7 +828,24 @@ impl<T: MkvReader> Source for FileSource<T> {
     }
 
     fn start_remuxing(&mut self) -> Result<()> {
-        // dont seek here bc we already seeked to the correct position in initialize() or cut()
+        // cut() left the cursor at the keyframe cluster. Back up one cluster so we
+        // also read audio that was batched into the preceding cluster; the timestamp
+        // filter in process_cluster_for_cut() will drop anything before shift_reference.
+        let cur = self.file.stream_position()?;
+        let read_start = match scan_cluster_in_direction(
+            &mut self.file,
+            cur,
+            Direction::Previous,
+            self.output_timecode_scale,
+        ) {
+            Ok(Some((pos, _ts))) => pos,
+            Ok(None) => cur,
+            Err(e) => {
+                debug!("no previous cluster found: {} ", e);
+                cur
+            }
+        };
+        self.file.seek(SeekFrom::Start(read_start))?;
         Ok(())
     }
 }
