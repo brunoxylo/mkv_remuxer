@@ -1,17 +1,16 @@
-# rust mkv_remuxer
+# mkv_remuxer
 
-A Rust-based MKV/WebM remuxer with advanced seeking, cutting, and multi-source track merging.  
-Still highly buggy and in experimental state.
+Rust-based MKV/WebM remuxer with cutting, multi-source track merging, and WebVTT support. Experimental.
 
 ## Features
 
-- **Multiple Seek Modes** for precise video cutting
-- **Lossless Remuxing**: No re-encoding, preserves original quality
-- **Multi-source Support**: Merge tracks from multiple input files into one output
-- **WebVTT Subtitle Merging**: Add `.vtt`/`.webvtt` subtitle files as tracks
-- **Flexible Track Mapping**: Select specific tracks from any input source
-- **Cue-accelerated Seeking**: Uses MKV Cues index for fast cluster location when available
-- **Library API**: Use as a library with the `Remuxer` struct or the `remux()` convenience function
+- **Multiple seek modes** for precise cutting
+- **Lossless remuxing** — no re-encoding
+- **Multi-source support** — merge tracks from multiple inputs
+- **WebVTT subtitles** — read and write `.vtt`/`.webvtt` tracks
+- **Track mapping** — select specific tracks from any input
+- **Session streaming** — chunked, retry-safe HTTP segment delivery (see `examples/advanced_server.rs`)
+- **Library API** — `remux()` convenience fn + `Remuxer` struct for streaming
 
 ## Installation
 
@@ -21,65 +20,20 @@ cargo build --release
 
 ## Usage
 
-### Basic Cut
-
-Extract from 5s to 15s:
-
 ```bash
+# Basic cut (5s to 15s)
 mkv_remuxer -i input.webm -s 5s --to 15s output.webm
-```
 
-Or specify a duration instead of an end point:
-
-```bash
+# Cut with duration instead
 mkv_remuxer -i input.webm -s 5s -t 10s output.webm
-```
 
-### Seek Modes
-
-Controlled with `--seek-mode`. Default is `snap`.
-
-**Snap nearest keyframe** — fast, output starts at the keyframe closest to the requested time:
-```bash
-mkv_remuxer -i input.webm -s 10s --to 20s --seek-mode snap output.webm
-```
-
-**Snap previous keyframe** — like `snap` but always chooses the keyframe *before* the target:
-```bash
-mkv_remuxer -i input.webm -s 10s --to 20s --seek-mode snap_prev output.webm
-```
-
-**Squeeze** — keeps all frames but compresses pre-roll into invisible frames at t=0 so playback starts exactly at the requested time:
-```bash
-mkv_remuxer -i input.webm -s 10s --to 20s --seek-mode squeeze output.webm
-```
-
-**Dirty cut** — hard cut at the exact timestamp; may cause decoding issues near the cut:
-```bash
-mkv_remuxer -i input.webm -s 10s --to 20s --seek-mode dirty output.webm
-```
-
-### Multiple Inputs and Track Mapping
-
-Merge video from one file with audio from another:
-
-```bash
+# Multi-source track mapping: video from file 0, audio from file 1
 mkv_remuxer -i video.webm -i audio.webm -m 0:0 -m 1:1 output.webm
-```
 
-Mapping format is `source_index:track_index` (both 0-based). If no mappings are given, all tracks from all sources are included.
-
-### Add WebVTT Subtitles
-
-Merge an MKV with a WebVTT subtitle file:
-
-```bash
+# Add WebVTT subtitles as a track
 mkv_remuxer -i video.webm -i subtitles.vtt output.mkv
-```
 
-### Verbose Output
-
-```bash
+# Verbose logging
 mkv_remuxer -v -i input.webm -s 10s --to 20s output.webm
 ```
 
@@ -87,69 +41,64 @@ mkv_remuxer -v -i input.webm -s 10s --to 20s output.webm
 
 | Flag | Description |
 |------|-------------|
-| `-i <file>` | Input file (repeatable). Supports `.mkv`, `.webm`, `.vtt`, `.webvtt` |
-| `-s <time>` / `--ss` | Start position (e.g. `5s`, `1m30s`, `1:30`, `90`) |
-| `-t <time>` / `--duration` | Duration from start. Mutually exclusive with `--to` |
-| `--to <time>` | End position. Mutually exclusive with `-t` |
-| `--seek-mode <mode>` | `snap` (default), `snap_prev`, `squeeze`, `dirty` |
-| `-m <src:track>` | Track mapping (repeatable, 0-based indices) |
-| `-o <file>` | Output file (positional, required). Extension determines format |
-| `-v` / `--verbose` | Enable debug logging |
+| `-i <file>` | Input file (repeatable). `.mkv`, `.webm`, `.vtt`, `.webvtt` |
+| `-s` / `--ss <time>` | Start position |
+| `-t` / `--duration <time>` | Duration (mutually exclusive with `--to`) |
+| `--to <time>` | End position (mutually exclusive with `-t`) |
+| `--seek-mode <mode>` | `snap` (default), `snap_prev`, `snap_next`, `squeeze`, `dirty` |
+| `-m` / `--map <src:track>` | Track mapping (repeatable, 0-based). Default: all tracks |
+| `-v` / `--verbose` | Debug logging |
 
-### Time Formats
+Time formats: `5s`, `1m30s`, `2h15m`, `1:30`, `1:30:00`, or plain seconds.
 
-All time arguments accept: `5s`, `1m30s`, `2h15m`, `1:30` (MM:SS), `1:30:00` (HH:MM:SS), or a plain number of seconds (`90`).
+## Seek Modes
 
-## Seek Modes Explained
-
-- **`snap`** (`SnapNearestKeyframe`): Seeks to whichever keyframe is closest (before or after) to the requested time. Fast — relies on the Cues index when available.
-
-- **`snap_prev`** (`SnapPreviousKeyframe`): Always seeks to the keyframe *before* the requested time. Useful when you need the output to begin no later than the requested position.
-
-- **`squeeze`** (`Squeeze`): Includes the pre-roll frames from the previous keyframe up to the cut point, marking them invisible and compressing them to t=0. The player sees a seamless start at exactly the requested time.
-
-- **`dirty`** (`DirtyCut`): Cuts strictly at the requested timestamps, discarding frames outside the range regardless of keyframe boundaries. Fast but may produce decoding artifacts near the cut point.
+- **`snap`** — nearest keyframe (before or after), uses Cues index when available
+- **`snap_prev`** — always the keyframe *before* the target
+- **`snap_next`** — always the keyframe *after* the target
+- **`squeeze`** — keeps pre-roll frames as invisible at t=0; starts exactly at requested time
+- **`dirty`** — hard cut at exact timestamp; may cause decode artifacts near the cut
 
 ## Library API
 
-The crate exposes a `Remuxer` struct for streaming, cluster-by-cluster processing, plus a `remux()` convenience function for one-shot use:
+One-shot:
 
 ```rust
-use mkv_remuxer::{remux, CutInterval, TrackMapping};
-use mkv_remuxer::source::{FileSource, InputSource, SeekType};
+use mkv_remuxer::{remux, CutInterval, RemuxerCutMode};
+use mkv_remuxer::source::{FileSource, InputSource};
 use mkv_remuxer::sink::{FileSink, OutputSink};
 
 let source = InputSource::from(FileSource::new("input.webm")?);
 let sink = OutputSink::from(FileSink::new("output.webm")?);
 let cut = CutInterval::new().with_start(10_000_000_000).with_end(20_000_000_000);
 
-let stats = remux(vec![source], sink, Some(cut), Some(SeekType::SnapNearestKeyframe), None)?;
-println!("Processed {} blocks in {:.2}s", stats.blocks_processed, stats.duration_ns as f64 / 1e9);
+let stats = remux(vec![source], sink, Some(cut), Some(RemuxerCutMode::SnapNearestKeyframe), None, true)?;
 ```
 
-For streaming use cases (e.g. HTTP), use `StreamSink` with `Remuxer::new()` + `Remuxer::process()` — see `examples/stream_server.rs`.
+Streaming: use `Remuxer::new()` + `Remuxer::process()` with `StreamSink` — see `examples/stream_server.rs`. Chunked sessions: `ChunkedRemuxer` + `SessionStreamer` — see `examples/advanced_server.rs`.
 
 ## Architecture
 
 ```
 InputSource<Uninitialized>  →  initialize_with_cut()  →  InputSource<Initialized>
-                                                                    ↓
-                                                            SourcesMappings
-                                                                    ↓
-                                                              MeltingPot
-                                                           (cluster ordering,
-                                                            timestamp merging)
-                                                                    ↓
-OutputSink<Uninitialized>   →    initialize()          →   OutputSink<Initialized>
-                                                                    ↓
-                                                          FileSink / StreamSink / VttSink
+                                                              ↓
+                                                        SourcesMappings → MeltingPot
+                                                              ↓
+OutputSink<Uninitialized> → initialize() → FileSink / StreamSink / ChunkedStreamSink / VttSink
 ```
+
+## Examples
+
+| Example | Description |
+|---------|-------------|
+| `stream_server` | Simple HTTP streaming server (port 3030) |
+| `advanced_server` | Full frontend + session-based chunked streaming (port 3031) |
 
 ## Requirements
 
-- Rust 1.80 or higher (uses `if let` chains)
-- Input files must be valid MKV/WebM containers
+- Rust 1.80+
+- Valid MKV/WebM input files
 
 ## License
 
-This project is provided as-is for educational and research purposes.
+Provided as-is for educational and research purposes.

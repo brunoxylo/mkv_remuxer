@@ -93,11 +93,26 @@ class DidiPlayer {
         return allVideo;
     }
 
+    /**
+     * Set the video track and auto-select a matching audio track,
+     * then trigger a seek to maintain playback position.
+     */
     setVideoTrack(trackId, fileIndex) {
         const currentAbsTime = this.activeFileIndex === -1
             ? 0
             : (this.video.currentTime + (this.currentSeekOffset || 0));
 
+        this.setVideoTrackNoSeek(trackId, fileIndex);
+        this._onVideoTrackSet(currentAbsTime);
+    }
+
+    /**
+     * Set the video track and auto-select a matching audio track
+     * WITHOUT triggering a seek.  Use this when the caller will
+     * issue its own seek/changeStream afterwards to avoid a
+     * double-seek race (NS_BINDING_ABORTED in Firefox).
+     */
+    setVideoTrackNoSeek(trackId, fileIndex) {
         let prevAudioLanguage = null;
         if (this.activeAudioTrackId !== -1 && this.activeAudioFileIndex !== undefined) {
             const prevFile = this.files[this.activeAudioFileIndex];
@@ -123,8 +138,6 @@ class DidiPlayer {
             this.activeAudioTrackId = -1;
             this.activeAudioFileIndex = -1;
         }
-
-        this._onVideoTrackSet(currentAbsTime);
     }
 
     /** Override in subclass */

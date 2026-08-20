@@ -1,94 +1,60 @@
-# Stream Server Example
+# Examples
 
-This example demonstrates how to use `StreamSink` to serve MKV/WebM video content over HTTP with on-the-fly remuxing and keyframe-aligned seeking.
+## stream_server
 
-## Features
-
-- **Dynamic cutting**: Specify start and end positions in seconds
-- **Seek mode selection**: Choose seek behaviour per request
-- **Track selection**: Choose specific tracks from the source file
-- **True streaming**: Uses `StreamSink` and `Remuxer` for chunk-by-chunk cluster streaming — no full-file buffering
-- **Custom headers**: `X-Media-Start-Sec` / `X-Media-End-Sec` report the actual cut point after snapping
-
-## Usage
-
-### 1. Start the server
+Simple HTTP server that streams remuxed MKV/WebM via `StreamSink`. No full-file buffering.
 
 ```bash
 cargo run --example stream_server
+# → http://localhost:3030
 ```
 
-The server will start on `http://localhost:3030`
-
-### 2. Make requests
-
-**Full video:**
-```
-http://localhost:3030/video
-```
-
-**Cut from 5s to 15s:**
-```
-http://localhost:3030/video?file=myvideo.webm&start=5&end=15
-```
-
-**Specific tracks:**
-```
-http://localhost:3030/video?file=myvideo.webm&start=10&tracks=1,2
-```
-
-**With seek mode:**
-```
-http://localhost:3030/video?file=myvideo.webm&start=10&end=20&seek=squeeze
-```
-
-## Query Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `file` | Basename of the file to serve (path traversal is rejected) | required |
-| `start` | Start position in seconds | `0` |
-| `end` | End position in seconds | full duration |
-| `tracks` | Comma-separated track numbers to include (e.g. `1,2`) | all tracks |
-| `seek` | Seek mode: `snap_prev`, `squeeze`, `dirty` | `snap` (nearest keyframe) |
-
-## Response Headers
-
-| Header | Description |
-|--------|-------------|
-| `Content-Type` | `video/webm` |
-| `X-Media-Start-Sec` | Actual start after keyframe snapping (seconds) |
-| `X-Media-End-Sec` | Actual end after keyframe snapping (seconds), if known |
-
-## How It Works
-
-1. **Request handling**: Warp web server receives request with query parameters
-2. **Parameter parsing**: Extracts file name, start/end times, track list, and seek mode
-3. **Source setup**: Creates `FileSource` from the requested file
-4. **Cut + seek init**: Initialises `Remuxer` with `CutInterval` and chosen `SeekType`
-5. **Streaming**: `Remuxer::process()` is called in a `spawn_blocking` loop, writing clusters one at a time into a `tokio::sync::mpsc` channel via `StreamSink`
-6. **Response**: Warp wraps the channel receiver as a `Body::wrap_stream`
-
-## Architecture
+**Requests:**
 
 ```
-HTTP Request
-    ↓
-Warp Handler  (parse params, build CutInterval + SeekType + TrackMappings)
-    ↓
-FileSource → InputSource<Uninitialized>
-    ↓
-Remuxer::new()  →  InputSource<Initialized>  +  actual CutInterval
-    ↓
-tokio::task::spawn_blocking loop
-    │   Remuxer::process() → writes cluster to StreamSink
-    │                                    ↓
-    │                             mpsc::Sender<Bytes>
-    ↓
-mpsc::Receiver  →  Body::wrap_stream  →  HTTP Response (video/webm)
+/video?file=myvideo.webm&start=5&end=15&seek=squeeze&tracks=1,2
 ```
 
-## Requirements
+| Param | Description | Default |
+|-------|-------------|---------|
+| `file` | Basename of file (traversal rejected) | required |
+| `start` | Start seconds | `0` |
+| `end` | End seconds | full duration |
+| `tracks` | Track numbers, comma-separated | all |
+| `seek` | `snap`, `snap_prev`, `squeeze`, `dirty` | `snap` |
 
-- Input files must be placed where the server can read them (path is configurable in `stream_server.rs`)
-- Dependencies: `warp`, `tokio`, `bytes`, `env_logger`
+Response headers: `X-Media-Start-Sec`, `X-Media-End-Sec` report actual cut points after snapping.
+
+---
+
+## advanced_server
+
+Full-featured server: static frontend, file listing, direct (Range) serving, and **session-based chunked streaming** for retry-safe segment delivery.
+
+```bash
+cargo run --example advanced_server
+# → http://localhost:3031/  (open in browser)
+```
+
+**Session API:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/my_video` | List media files |
+| `GET` | `/my_video/direct/:index` | Direct file serve (Range support) |
+| `GET` | `/my_video/start_stream_session?mappings=0_1,1_2&start=10&end=20&seek=squeeze` | Create session |
+| `GET` | `/sessions/{id}/segment` | Current segment (idempotent, retry-safe) |
+| `POST` | `/sessions/{id}/next` | Advance to next segment |
+| `GET` | `/sessions/{id}/step` | Current step index |
+| `DELETE` | `/sessions/{id}` | Destroy session |
+
+Mappings format: `source_track` pairs, comma-separated (e.g. `0_1,1_2`).
+
+**Flow:**
+
+```
+HTTP → FileSource → InputSource<Uninit>
+    → Remuxer::new() → InputSource<Init> + actual CutInterval
+    → spawn_blocking loop: Remuxer::process() → StreamSink → mpsc channel
+    → Body::wrap_stream → HTTP response (video/webm)
+```

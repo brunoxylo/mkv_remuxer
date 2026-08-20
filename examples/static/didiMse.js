@@ -7,6 +7,10 @@
  * Direct src assignment causes the browser to manage its own media loading
  * and retry logic, which we cannot control (stale URLs, no backoff, wrong
  * seek parameters on reconnect).
+ *
+ * Logging policy: only log when something goes wrong (explicit errors) or
+ * when playback stalls. Happy-path state dumps were removed — see
+ * DIDIMSE_CLEANUP.md for what was deleted.
  */
 
 // Resolve the MSE constructor: prefer ManagedMediaSource (iOS Safari 17+), fall back to standard
@@ -25,12 +29,38 @@ function _ebmlVintLength(byte) {
     return 0;
 }
 
+// ── Tunables ─────────────────────────────────────────────────────────────
+
+/**
+ * EARLY_APPEND — stream the FIRST media segment into the SourceBuffer in
+ * chunks as its bytes arrive, instead of waiting for the whole segment.
+ *
+ * Rationale: the first cluster after a seek can be very large (~10s of
+ * video). Buffering it fully before appending adds that whole download to
+ * seek latency. Because segments are cluster-aligned and MSE's WebM parser
+ * buffers partial clusters internally, appending large contiguous chunks
+ * mid-cluster is safe and lets playback start much sooner.
+ *
+ * Set to false to fall back to whole-segment appends everywhere if this
+ * ever causes problems.
+ */
+const EARLY_APPEND_ENABLED = true;
+
+/** Minimum bytes accumulated before an early (partial) append is issued. */
+const EARLY_APPEND_CHUNK_SIZE = 256 * 1024;
+
+/** Buffer-ahead cap: pump pauses while we have more than this buffered. */
+const BUFFER_AHEAD_LIMIT_SEC = 30;
+
+/** Seek distance above which we snap to the NEAREST keyframe server-side
+ *  and adopt whatever time the server returns (no client-side correction). */
+const FAR_SEEK_THRESHOLD_SEC = 60;
+
 class DidiMse extends DidiPlayer {
     constructor(videoElement, endpointPath, sessionBase = null) {
         super(videoElement, endpointPath, sessionBase);
         this._seekAbort = null;
         this._activeMediaSource = null;
-        this._firstSeek = true;  // auto-play on first canplay (replaces HTML autoplay attr)
 
         // Session state
         this._sessionId = null;
@@ -40,7 +70,9 @@ class DidiMse extends DidiPlayer {
         // Inline subtitle state
         this._inlineSubTrackId = -1;       // original track ID (for mappings request)
         this._inlineSubOutputTrack = -1;   // track number in the OUTPUT stream (for EBML scanner)
-        this._inlineSubCues = [];
+
+        // Stall logging: track playback position so we only warn on real stalls
+        this._stallTimer = null;
     }
 
     static _getOrCreateClientId() {
@@ -54,6 +86,7 @@ class DidiMse extends DidiPlayer {
 
     destroy() {
         this._stopKeepalive();
+        this._stopStallWatch();
         if (this._seekAbort) this._seekAbort.abort();
         if (this._sessionId) {
             // Fire-and-forget DELETE
@@ -93,6 +126,51 @@ class DidiMse extends DidiPlayer {
         }
     }
 
+    /**
+     * Stall watch: warn when the video element is stuck (not advancing while
+     * it should be playing). This replaces the old always-on diagnostic
+     * watchdog — we only speak up when playback actually stalls.
+     */
+    _startStallWatch() {
+        this._stopStallWatch();
+        let lastTime = this.video.currentTime;
+        let stalledSince = null;
+        this._stallTimer = setInterval(() => {
+            const v = this.video;
+            if (v.paused || v.ended || v.readyState >= 4) {
+                stalledSince = null;
+                lastTime = v.currentTime;
+                return;
+            }
+            if (Math.abs(v.currentTime - lastTime) < 0.05) {
+                if (stalledSince === null) {
+                    stalledSince = Date.now();
+                } else if (Date.now() - stalledSince > 3000) {
+                    const buf = v.buffered.length > 0
+                        ? `${v.buffered.start(0).toFixed(1)}-${v.buffered.end(v.buffered.length - 1).toFixed(1)}s`
+                        : 'empty';
+                    console.warn('[DidiMse] Playback stalled —',
+                        'currentTime:', v.currentTime.toFixed(2),
+                        'readyState:', v.readyState,
+                        'networkState:', v.networkState,
+                        'buffered:', buf,
+                        'error:', v.error ? `code=${v.error.code} "${v.error.message}"` : 'null');
+                    stalledSince = Date.now(); // re-warn every 3s while stalled
+                }
+            } else {
+                stalledSince = null;
+            }
+            lastTime = v.currentTime;
+        }, 1000);
+    }
+
+    _stopStallWatch() {
+        if (this._stallTimer) {
+            clearInterval(this._stallTimer);
+            this._stallTimer = null;
+        }
+    }
+
     _onVideoTrackSet(currentAbsTime) {
         this.seek(currentAbsTime);
     }
@@ -100,14 +178,18 @@ class DidiMse extends DidiPlayer {
     setInlineSubtitleTrack(trackId) {
         this._inlineSubTrackId = trackId;
         this._inlineSubOutputTrack = -1; // will be set in seek() based on mapping position
-        this._inlineSubCues = [];
     }
 
     async seek(seconds) {
-        console.debug(`[DidiMse] seek() called with seconds=${seconds}`);
-        const wasPlaying = !this.video.paused;
+        // ── Choose server cut mode based on seek distance ──────────────
+        // Far jump (>60s): snap to NEAREST keyframe server-side and adopt
+        //   whatever start_sec the server returns — no client-side correction,
+        //   the timeline simply snaps to the keyframe.
+        // Near jump (≤60s): snap to the PREVIOUS keyframe server-side, then
+        //   seek forward inside the MSE pipeline to the exact requested time.
+        const distance = Math.abs(seconds - this.getAbsoluteTime());
+        const seekMode = distance > FAR_SEEK_THRESHOLD_SEC ? 'snap' : 'snap_prev';
 
-        let seekMode = 'snap_prev';
         let mappings = `${this.activeFileIndex}_${this.activeVideoTrackId}`;
         if (this.activeAudioFileIndex === undefined) this.activeAudioFileIndex = this.activeFileIndex;
         mappings += `,${this.activeAudioFileIndex}_${this.activeAudioTrackId}`;
@@ -148,7 +230,6 @@ class DidiMse extends DidiPlayer {
             this._sessionId = session.session_id;
             const mimeType = session.mime_type;
             this.currentSeekOffset = session.start_sec || seconds;
-            console.info(`[DidiMse] Session created: ${session.session_id}, mime: ${mimeType}`);
             this._startKeepalive();
 
             // 2. Get init segment (step 0)
@@ -157,12 +238,17 @@ class DidiMse extends DidiPlayer {
                 cache: 'no-store',
             });
             if (!initRes.ok) {
-                this._emitError(DidiErrorType.NETWORK, 'Failed to fetch init segment');
+                this._emitError(DidiErrorType.NETWORK, `Failed to fetch init segment (HTTP ${initRes.status})`);
                 return;
             }
             const initData = new Uint8Array(await initRes.arrayBuffer());
+            // WebM must start with 0x1A 0x45 0xDF 0xA3 (EBML header)
+            if (initData.length < 4 || initData[0] !== 0x1A || initData[1] !== 0x45 || initData[2] !== 0xDF || initData[3] !== 0xA3) {
+                console.error('[DidiMse] Init segment does NOT start with WebM/EBML magic bytes');
+                this._emitError(DidiErrorType.DECODE, 'Server returned a malformed init segment (no EBML header)');
+                return;
+            }
 
-            this._inlineSubCues = [];
             this.video.querySelectorAll('track').forEach(t => {
                 if (t === this._dynamicTrackEl) return;
                 if (t.track && t.track.mode !== 'hidden') t.track.mode = 'hidden';
@@ -186,18 +272,33 @@ class DidiMse extends DidiPlayer {
             this._activeMediaSource = ms;
             const objectUrl = URL.createObjectURL(ms);
 
+            // In snap_prev mode the server started at the PREVIOUS keyframe, so we
+            // must seek forward inside the pipeline to the exact requested time.
+            // In snap mode we adopt the server's start_sec as-is (timeline snaps).
             const seekOffsetInStream = (seekMode === 'snap_prev' && !isNaN(session.start_sec))
                 ? Math.max(0, seconds - session.start_sec) : 0;
 
             const onCanPlay = () => {
                 this.video.removeEventListener('canplay', onCanPlay);
-                if (seekOffsetInStream > 0.1) this.video.currentTime = seekOffsetInStream;
-                this._firstSeek = false;
-                this.video.play().catch(() => { });
+                if (seekOffsetInStream > 0.1) {
+                    this.video.currentTime = seekOffsetInStream;
+                }
+                this.video.play().catch((err) => {
+                    console.error('[DidiMse] play() rejected:', err.name, err.message,
+                        'readyState:', this.video.readyState,
+                        'error:', this.video.error ? `code=${this.video.error.code}` : 'null');
+                });
                 if (this._inlineSubTrackId <= 0) this.reloadSubtitles();
             };
+            const onVideoError = () => {
+                const e = this.video.error;
+                console.error('[DidiMse] video element error:', e ? `code=${e.code} message="${e.message}"` : 'null');
+            };
+            this.video.addEventListener('error', onVideoError, { once: true });
             this.video.addEventListener('canplay', onCanPlay);
             this.video.src = objectUrl;
+
+            this._startStallWatch();
 
             ms.addEventListener('sourceopen', async () => {
                 URL.revokeObjectURL(objectUrl);
@@ -205,13 +306,16 @@ class DidiMse extends DidiPlayer {
                 try {
                     sb = ms.addSourceBuffer(mimeType);
                 } catch (e) {
+                    console.error('[DidiMse] addSourceBuffer failed:', e.name, e.message);
                     this._emitError(DidiErrorType.DECODE, 'addSourceBuffer failed: ' + e.message);
                     ms.endOfStream('decode');
                     return;
                 }
 
-                sb.addEventListener('error', (e) => {
-                    console.error('[DidiMse] SourceBuffer error:', e);
+                sb.addEventListener('error', () => {
+                    console.error('[DidiMse] SourceBuffer error —',
+                        'ms.readyState:', ms.readyState,
+                        'video.error:', this.video.error ? `code=${this.video.error.code}` : 'null');
                 });
 
                 const useInlineSubs = this._inlineSubTrackId > 0;
@@ -231,11 +335,30 @@ class DidiMse extends DidiPlayer {
                     }
                 }
 
-                let scanner = useInlineSubs
+                const scanner = useInlineSubs
                     ? new EbmlSubtitleScanner(this._inlineSubOutputTrack)
                     : null;
+                let processedCuesCount = 0;
+                const flushScannerCues = () => {
+                    if (!scanner) return;
+                    const cues = scanner.getCues();
+                    const delaySec = (this.subtitleDelayMs || 0) / 1000;
+                    for (let i = processedCuesCount; i < cues.length; i++) {
+                        const cue = cues[i];
+                        const startSec = (cue.startMs / 1000) + delaySec;
+                        const endSec = startSec + (cue.durationMs / 1000);
+                        if (endSec > 0) {
+                            try {
+                                const vttCue = new VTTCue(Math.max(0, startSec), endSec, cue.text);
+                                if (this._dynamicTrack) this._dynamicTrack.addCue(vttCue);
+                            } catch (e) { /* ignore invalid cue */ }
+                        }
+                    }
+                    processedCuesCount = cues.length;
+                };
 
-                // Helper: append data to SourceBuffer and wait
+                // Helper: append data to SourceBuffer and wait for completion.
+                // On QuotaExceededError, evict buffer behind the playhead and retry once.
                 const appendToSb = async (data) => {
                     try {
                         if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
@@ -244,7 +367,6 @@ class DidiMse extends DidiPlayer {
                             sb.appendBuffer(data);
                         } catch (e) {
                             if (e.name === 'QuotaExceededError') {
-                                console.warn('[DidiMse] QuotaExceededError — evicting old buffer');
                                 const ct = this.video.currentTime;
                                 if (ct > 1 && sb.buffered.length > 0) {
                                     const evictEnd = Math.max(0, ct - 1);
@@ -262,36 +384,155 @@ class DidiMse extends DidiPlayer {
                         await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
                         return true;
                     } catch (e) {
-                        // SourceBuffer invalidated by a concurrent seek
-                        console.debug('[DidiMse] appendToSb failed (sb invalidated):', e.message);
+                        // SourceBuffer invalidated by a concurrent seek — not an error
                         return false;
                     }
                 };
 
                 // 4. Append init segment
-                if (!(await appendToSb(initData))) return;
-                console.info('[DidiMse] Init segment appended');
+                if (!(await appendToSb(initData))) {
+                    console.error('[DidiMse] Init segment append failed —',
+                        'ms.readyState:', ms.readyState,
+                        'video.error:', this.video.error ? `code=${this.video.error.code} "${this.video.error.message}"` : 'null');
+                    this._emitError(DidiErrorType.DECODE,
+                        `Init segment rejected for "${mimeType}". The browser cannot decode this stream.`);
+                    return;
+                }
 
-                // 5. Session pump: POST /next → GET /segment → appendBuffer
-                let step = 0;
+                // Give the browser a tick to process the init segment and surface any SB errors
+                await new Promise(r => setTimeout(r, 0));
+                if (ms.readyState !== 'open') {
+                    console.error('[DidiMse] MediaSource closed after init segment —',
+                        'ms.readyState:', ms.readyState,
+                        'video.error:', this.video.error ? `code=${this.video.error.code} "${this.video.error.message}"` : 'null');
+                    this._emitError(DidiErrorType.DECODE,
+                        `Init segment rejected for "${mimeType}". The browser cannot decode this stream.`);
+                    return;
+                }
+
+                /**
+                 * Fetch the current segment and append it to the SourceBuffer.
+                 *
+                 * - streamEarly=true (first segment, if EARLY_APPEND_ENABLED):
+                 *   appends in EARLY_APPEND_CHUNK_SIZE pieces as bytes arrive so
+                 *   playback can start before the (potentially huge) first
+                 *   cluster has fully downloaded.
+                 * - On mid-stream failure: the /segment endpoint is idempotent,
+                 *   so we simply re-fetch it and discard the bytes we already
+                 *   appended, resuming the append from where we stopped.
+                 *   Scanner data is fed in lockstep with appends, so the EBML
+                 *   subtitle scanner never sees a gap or duplicate.
+                 *
+                 * Returns true when the segment was fully appended.
+                 */
+                const fetchAndAppendSegment = async (streamEarly) => {
+                    let appended = 0; // bytes of THIS segment already in the SourceBuffer
+                    let backoff = 500;
+                    for (;;) {
+                        if (controller.signal.aborted || ms.readyState !== 'open') return false;
+                        let segRes;
+                        try {
+                            segRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
+                                signal: controller.signal,
+                                cache: 'no-store',
+                            });
+                        } catch (e) {
+                            if (e.name === 'AbortError') return false;
+                            console.warn(`[DidiMse] /segment fetch failed (appended ${appended} bytes so far), retrying in ${backoff}ms:`, e.message);
+                            await new Promise(r => setTimeout(r, backoff));
+                            backoff = Math.min(backoff * 2, 10000);
+                            continue;
+                        }
+                        if (!segRes.ok) {
+                            console.warn(`[DidiMse] /segment error ${segRes.status}, retrying in ${backoff}ms`);
+                            await new Promise(r => setTimeout(r, backoff));
+                            backoff = Math.min(backoff * 2, 10000);
+                            continue;
+                        }
+                        backoff = 500;
+
+                        // Read the body; skip `appended` bytes already in the SB
+                        // (non-zero only when resuming after an interrupted stream).
+                        let skip = appended;
+                        let pending = new Uint8Array(0); // early-append accumulator
+                        const chunks = [];               // whole-segment accumulator
+                        let streamFailed = false;
+
+                        try {
+                            const reader = segRes.body.getReader();
+                            for (;;) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                let chunk = value;
+                                if (skip > 0) {
+                                    if (chunk.length <= skip) { skip -= chunk.length; continue; }
+                                    chunk = chunk.subarray(skip);
+                                    skip = 0;
+                                }
+                                if (streamEarly) {
+                                    // Accumulate and append in large contiguous pieces.
+                                    // MSE's WebM parser buffers partial clusters internally,
+                                    // so mid-cluster appends are safe (segments are cluster-aligned).
+                                    const merged = new Uint8Array(pending.length + chunk.length);
+                                    merged.set(pending, 0);
+                                    merged.set(chunk, pending.length);
+                                    pending = merged;
+                                    if (pending.length >= EARLY_APPEND_CHUNK_SIZE) {
+                                        if (!(await appendToSb(pending))) return false;
+                                        if (scanner) { scanner.feed(pending); flushScannerCues(); }
+                                        appended += pending.length;
+                                        pending = new Uint8Array(0);
+                                    }
+                                } else {
+                                    chunks.push(chunk);
+                                }
+                            }
+                        } catch (e) {
+                            if (e.name === 'AbortError') return false;
+                            // Stream broke mid-segment — re-request and resume from `appended`
+                            console.warn(`[DidiMse] /segment stream interrupted after ${appended} bytes, resuming:`, e.message);
+                            streamFailed = true;
+                        }
+                        if (streamFailed) {
+                            await new Promise(r => setTimeout(r, backoff));
+                            backoff = Math.min(backoff * 2, 10000);
+                            continue;
+                        }
+
+                        // Flush remainder
+                        if (streamEarly) {
+                            if (pending.length > 0) {
+                                if (!(await appendToSb(pending))) return false;
+                                if (scanner) { scanner.feed(pending); flushScannerCues(); }
+                                appended += pending.length;
+                            }
+                        } else {
+                            let total = 0;
+                            for (const c of chunks) total += c.length;
+                            const segData = new Uint8Array(total);
+                            let off = 0;
+                            for (const c of chunks) { segData.set(c, off); off += c.length; }
+                            if (scanner) { scanner.feed(segData); flushScannerCues(); }
+                            if (!(await appendToSb(segData))) return false;
+                        }
+                        return true;
+                    }
+                };
+
+                // 5. Session pump: POST /next → GET /segment → append
                 let backoff = 500;
-                let processedCuesCount = 0;
+                let firstSegment = true;
 
                 while (!controller.signal.aborted && ms.readyState === 'open') {
-                    // Throttle: wait if buffer is >30s ahead
+                    // Throttle: wait while buffer is far ahead of the playhead
                     try {
-                        if (sb.buffered.length > 0) {
-                            const ahead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
-                            while (ahead > 30 && !controller.signal.aborted && ms.readyState === 'open') {
-                                await new Promise(r => setTimeout(r, 1000));
-                                if (sb.buffered.length === 0) break;
-                                const newAhead = sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime;
-                                if (newAhead <= 30) break;
-                            }
+                        while (sb.buffered.length > 0
+                            && sb.buffered.end(sb.buffered.length - 1) - this.video.currentTime > BUFFER_AHEAD_LIMIT_SEC
+                            && !controller.signal.aborted && ms.readyState === 'open') {
+                            await new Promise(r => setTimeout(r, 500));
                         }
                     } catch (e) {
-                        // SourceBuffer became invalid (new seek destroyed the MediaSource)
-                        console.debug('[DidiMse] SourceBuffer invalidated during throttle, exiting pump');
+                        // SourceBuffer invalidated by a concurrent seek
                         break;
                     }
 
@@ -311,78 +552,24 @@ class DidiMse extends DidiPlayer {
                         continue;
                     }
 
-                    if (nextRes.status === 410) {
-                        // Session finished — no more segments
-                        console.info('[DidiMse] Session finished (410 Gone)');
-                        break;
-                    }
+                    if (nextRes.status === 410) break; // session finished — no more segments
                     if (!nextRes.ok) {
-                        console.warn(`[DidiMse] /next error ${nextRes.status}, retrying...`);
+                        console.warn(`[DidiMse] /next error ${nextRes.status}, retrying in ${backoff}ms`);
                         await new Promise(r => setTimeout(r, backoff));
                         backoff = Math.min(backoff * 2, 10000);
                         continue;
                     }
                     backoff = 500; // reset on success
 
-                    const stepData = await nextRes.json();
-                    step = stepData.step;
+                    await nextRes.json(); // { step } — sequential, nothing to do with it client-side
 
-                    // Fetch the segment data
-                    let segRes;
-                    try {
-                        segRes = await fetch(`${this.sessionBase}/session/${this._sessionId}/segment`, {
-                            signal: controller.signal,
-                            cache: 'no-store',
-                        });
-                    } catch (e) {
-                        if (e.name === 'AbortError') break;
-                        console.warn(`[DidiMse] /segment failed, retrying...`);
-                        await new Promise(r => setTimeout(r, 1000));
-                        continue;
-                    }
-                    if (!segRes.ok) {
-                        console.warn(`[DidiMse] /segment error ${segRes.status}`);
-                        continue;
-                    }
-
-                    const segData = new Uint8Array(await segRes.arrayBuffer());
-
-                    // Feed to subtitle scanner
-                    if (scanner) {
-                        scanner.feed(segData);
-                        const cues = scanner.getCues();
-                        for (let i = processedCuesCount; i < cues.length; i++) {
-                            const cue = cues[i];
-                            const delaySec = (this.subtitleDelayMs || 0) / 1000;
-                            const startSec = (cue.startMs / 1000) + delaySec;
-                            const endSec = startSec + (cue.durationMs / 1000);
-                            if (endSec > 0) {
-                                try {
-                                    const vttCue = new VTTCue(Math.max(0, startSec), endSec, cue.text);
-                                    if (this._dynamicTrack) this._dynamicTrack.addCue(vttCue);
-                                } catch (e) { /* ignore invalid cue */ }
-                            }
-                        }
-                        processedCuesCount = cues.length;
-                    }
-
-                    // Append to SourceBuffer
-                    if (!(await appendToSb(segData))) break;
-
-                    if (step <= 3) {
-                        try {
-                            const bufInfo = sb.buffered.length > 0
-                                ? sb.buffered.end(sb.buffered.length - 1).toFixed(1) + 's' : 'none';
-                            console.debug(`[DidiMse] Step ${step}: ${segData.byteLength} bytes, buffered: ${bufInfo}`);
-                        } catch (e) { /* sb invalidated */ }
-                    }
+                    if (!(await fetchAndAppendSegment(firstSegment && EARLY_APPEND_ENABLED))) break;
+                    firstSegment = false;
                 }
 
-                // End of stream
                 if (ms.readyState === 'open') {
                     try { ms.endOfStream(); } catch (e) { }
                 }
-                console.info(`[DidiMse] Session pump finished at step ${step}`);
             }, { once: true });
 
         } catch (e) {
@@ -417,9 +604,6 @@ class DidiMse extends DidiPlayer {
             this.reloadSubtitles();
         }
     }
-
-
-
 }
 
 
